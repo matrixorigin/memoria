@@ -18,7 +18,7 @@
   [![MatrixOne](https://img.shields.io/badge/Powered%20by-MatrixOne-00ADD8?style=flat-square&logo=database)](https://github.com/matrixorigin/matrixone)
   [![Paper](https://img.shields.io/badge/arXiv-2604.03927-b31b1b?style=flat-square)](https://arxiv.org/abs/2604.03927)
 
-  [Quick Start](#-quick-start) · [Why Memoria](#-why-memoria) · [Research](#-research-foundation) · [See It in Action](#-see-git-for-data-in-action) · [API Reference](#-api-reference) · [Architecture](#-architecture) · [Development](#-development) · [Citation](#-citation)
+  [Quick Start](#-quick-start) · [Memoria in Astra](#-memoria-in-astra) · [Why Memoria](#-why-memoria) · [Research](#-research-foundation) · [See It in Action](#-see-git-for-data-in-action) · [API Reference](#-api-reference) · [Architecture](#-architecture) · [Development](#-development) · [Citation](#-citation)
 
 </div>
 
@@ -28,6 +28,12 @@
 
 Memoria is a **persistent memory layer** for AI agents with Git-level version control.
 Every memory change is tracked, auditable, and reversible — snapshots, branches, merges, and time-travel rollback, all powered by [MatrixOne](https://github.com/matrixorigin/matrixone)'s native Copy-on-Write engine.
+
+> **A core memory component of [MatrixOrigin's Astra](https://github.com/matrixorigin/Astra).**
+>
+> Astra runs the agent. Memoria helps it remember across sessions. [MatrixOne](https://github.com/matrixorigin/matrixone) powers the data storage and search.
+>
+> [Using Astra?](#-memoria-in-astra) · [Use Memoria with another agent](#-quick-start)
 
 <table>
 <tr>
@@ -93,6 +99,24 @@ Every memory mutation has a snapshot + provenance chain
 </p>
 
 <p align="center"><i>Works with any MCP-compatible agent</i></p>
+
+---
+
+## 🧩 Memoria in Astra
+
+In [Astra](https://github.com/matrixorigin/Astra), Memoria stores and retrieves facts, preferences, decisions, and session summaries so agents can reuse knowledge across conversations. Memory changes can be reviewed and rolled back.
+
+| How you use it | Where to start |
+|----------------|----------------|
+| **Hosted Astra** | Memoria is already running for you. Follow the [Astra quick start](https://github.com/matrixorigin/Astra#quick-start). |
+| **Self-hosted Astra** | Astra's deployment includes compatible Memoria and MatrixOne services. Follow [Astra's Docker setup](https://github.com/matrixorigin/Astra#self-host-with-docker). |
+| **Memoria with other agents** | Use Memoria independently via MCP. Follow the [Memoria quick start](#-quick-start) below. |
+
+For example, search your memories from Astra:
+
+```bash
+astra memory search "deployment preferences"
+```
 
 ---
 
