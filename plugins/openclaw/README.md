@@ -204,7 +204,72 @@ Removes the plugin entry, tool policy additions, managed skills, and the default
 - `memory_stats` is derived from available MCP outputs (inactive-memory and entity totals not currently available)
 - `memory_entities` is not exposed (no matching Rust MCP tool)
 - Old `mysql+pymysql://...` DSNs are normalized to `mysql://...` automatically
-- Schema drift from older Memoria stacks can cause runtime errors — use a fresh DB name to avoid
+- Schema drift from older Memoria stacks can cause runtime errors, use a fresh DB name to avoid
+
+### Success Criteria
+
+| Level | Check | Command | Pass |
+|---|---|---|---|
+| 1. Plugin loaded | OpenClaw recognizes plugin | `openclaw plugins list` | `memory-memoria` is listed and enabled |
+| 2. Backend reachable | Memoria can reach configured backend | `openclaw memoria health` | returns `status: ok` |
+| 3. Memory persisted | Store -> retrieve round-trip works | `openclaw memoria stats` + `openclaw ltm list --limit 10` | non-zero memory appears after a write |
+
+Before the smoke check, confirm the CLIs you are about to use are the ones you expect:
+
+```bash
+openclaw --version
+openclaw memoria --help
+```
+
+After install:
+
+```bash
+openclaw memoria capabilities
+openclaw memoria stats
+openclaw ltm list --limit 10
+```
+
+Notes:
+
+- `openclaw memoria capabilities` is a config/plugin check and does not require a live Memoria backend
+- `openclaw memoria stats` and `openclaw ltm list` require the configured backend to be reachable, in embedded mode that means MatrixOne must be up and the embedding config must be valid
+- OpenClaw reserves `openclaw memory` for its built-in file memory, so this plugin uses `openclaw memoria` and the compatibility alias `openclaw ltm`
+- `openclaw memoria setup` is the recommended onboarding command for cloud/local setup
+- `openclaw memoria connect` remains available as the lower-level config-only entrypoint (no `--install-memoria` support)
+- `setup/connect` will merge `memory-memoria` into `plugins.allow` to satisfy OpenClaw allow-list policy
+- on fresh install without explicit backend config, `openclaw plugins enable` logs a one-time hint with cloud (recommended), local (optional), and `openclaw memoria setup --help`
+- OpenClaw may print "Restart the gateway" after `plugins install` or `plugins enable`, this is unnecessary for CLI commands like `setup` and `health`, but harmless if you do restart
+- `openclaw memoria install` is optional local bootstrap/repair (runtime + config rewrite)
+- `openclaw memoria health` is the primary quick connectivity check
+- Some released OpenClaw builds may not expose `openclaw memoria verify` yet even if the plugin source or README mentions it. If `verify` is unavailable, use `openclaw memoria health`, `openclaw memoria capabilities`, `openclaw memoria stats`, and `openclaw ltm list --limit 10` instead.
+
+If `openclaw memoria setup` (or `connect`) is missing:
+
+```bash
+openclaw plugins update memory-memoria
+openclaw plugins enable memory-memoria
+openclaw memoria --help
+```
+
+If OpenClaw `status` shows memory as unavailable but the plugin appears installed, verify the plugin directly before assuming Memoria is broken:
+
+```bash
+openclaw plugins list
+openclaw memoria health
+openclaw memoria capabilities
+openclaw ltm stats
+openclaw ltm list --limit 10
+```
+
+If `openclaw memoria health` returns `status: ok` and `openclaw ltm list` returns memories, the Memoria backend is healthy. In that situation, a stale or mismatched OpenClaw gateway memory probe may be the source of the status warning rather than the Memoria plugin itself.
+
+Low-level fallback:
+
+```bash
+node scripts/verify_plugin_install.mjs \
+  --openclaw-bin "$(which openclaw)" \
+  --memoria-bin "$(which memoria)"
+```
 
 ## Development
 
