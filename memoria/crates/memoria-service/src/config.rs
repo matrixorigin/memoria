@@ -95,7 +95,7 @@ impl Config {
         let embedding_dim = std::env::var("EMBEDDING_DIM")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(1024usize);
+            .unwrap_or(0usize); // 0 = auto-infer from embedding service at startup
 
         let llm_api_key = std::env::var("LLM_API_KEY").ok().filter(|s| !s.is_empty());
 
