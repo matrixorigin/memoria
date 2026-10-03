@@ -102,9 +102,51 @@ static VALUE_REFERENCE: Lazy<Regex> = Lazy::new(|| {
 });
 
 static VALUE_LOOKUP: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*(?:\.get[ \t]*\(|\[)")
+    Regex::new(r#"^(?:[A-Za-z_][A-Za-z0-9_]*\.)*[A-Za-z_][A-Za-z0-9_]*(?:\.get\(\s*(?:'[^'\r\n]*'|"[^"\r\n]*")\s*\)|\[\s*(?:'[^'\r\n]*'|"[^"\r\n]*")\s*\])$"#)
         .expect("valid value lookup regex")
 });
+
+static NUMERIC_LITERAL: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?:^|[^A-Za-z0-9_])[0-9]").expect("valid numeric literal regex"));
+static COLUMN_TYPE_LENGTH: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\bdb\.String\(\s*[0-9]+\s*\)").expect("valid column type regex"));
+
+// Inspect the entire RHS expression, not the credential pattern's first
+// whitespace-delimited token. Defaults and multiline call arguments can hold
+// credentials even when the expression starts with a variable lookup.
+fn value_expression(rhs: &str) -> Option<&str> {
+    let mut closing = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in rhs.char_indices() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' => closing.push(')'),
+            '[' => closing.push(']'),
+            '{' => closing.push('}'),
+            ')' | ']' | '}' => match closing.pop() {
+                Some(expected) if expected == ch => (),
+                None => return Some(rhs[..index].trim_end()),
+                _ => return None,
+            },
+            ',' | ';' | '\n' | '\r' if closing.is_empty() => {
+                return Some(rhs[..index].trim_end());
+            }
+            _ => (),
+        }
+    }
+    (closing.is_empty() && quote.is_none()).then_some(rhs.trim_end())
+}
 
 fn is_credential_match(label: &str, text: &str, matched: regex::Match<'_>) -> bool {
     let prefix = &text[..matched.start()];
@@ -126,12 +168,15 @@ fn is_credential_match(label: &str, text: &str, matched: regex::Match<'_>) -> bo
     if label == "password_assign" {
         let (name, rhs) = value.split_once([':', '=']).expect("assignment match");
         let line_prefix = prefix.rsplit('\n').next().unwrap_or("").trim_start();
-        if value.contains(':') && rhs.starts_with(['\n', '\r'])
-            && ["if ", "elif ", "while "].iter().any(|start| line_prefix.starts_with(start))
+        if value.contains(':')
+            && rhs.starts_with(['\n', '\r'])
+            && ["if ", "elif ", "while "]
+                .iter()
+                .any(|start| line_prefix.starts_with(start))
         {
             return false;
         }
-        let rhs = rhs.trim_start();
+        let rhs = text[matched.start() + name.len() + 1..].trim_start();
         // Natural-language "share a secret: ..." is not a config field.
         if name.trim().eq_ignore_ascii_case("secret") && value.contains(':') {
             let previous = prefix.split_whitespace().next_back().unwrap_or("");
@@ -140,19 +185,42 @@ fn is_credential_match(label: &str, text: &str, matched: regex::Match<'_>) -> bo
             }
         }
         let reference = VALUE_REFERENCE.is_match(rhs)
-            && (!rhs.contains(['\'', '"']) || VALUE_LOOKUP.is_match(rhs));
+            && value_expression(rhs).is_some_and(|expression| {
+                if VALUE_LOOKUP.is_match(expression) {
+                    return true;
+                }
+                // A schema type's length is not a password value. Other
+                // numeric call arguments/defaults must not bypass the filter.
+                let value = if expression.starts_with("db.Column(") {
+                    COLUMN_TYPE_LENGTH.replace_all(expression, "db.String()")
+                } else {
+                    Cow::Borrowed(expression)
+                };
+                !value.contains(['\'', '"']) && !NUMERIC_LITERAL.is_match(&value)
+            });
         return !reference;
     }
     true
+}
+
+fn has_credential_match(label: &str, re: &Regex, text: &str) -> bool {
+    let mut offset = 0;
+    while let Some(matched) = re.find_at(text, offset) {
+        if is_credential_match(label, text, matched) {
+            return true;
+        }
+        // A benign match can consume a nested assignment, e.g.
+        // "if password:\n password='literal'". Check overlapping matches too.
+        offset = matched.start() + text[matched.start()..].chars().next().unwrap().len_utf8();
+    }
+    false
 }
 
 /// Check content for PII/credentials. Returns a `SensitivityResult`.
 pub fn check_sensitivity(text: &str) -> SensitivityResult {
     // HIGH tier — any match blocks immediately
     for (p, re) in COMPILED.iter() {
-        if p.tier == SensitivityTier::High
-            && re.find_iter(text).any(|m| is_credential_match(p.label, text, m))
-        {
+        if p.tier == SensitivityTier::High && has_credential_match(p.label, re, text) {
             return SensitivityResult {
                 blocked: true,
                 redacted_content: None,
@@ -250,6 +318,23 @@ mod tests {
             "password = data.get('password')\npassword = 'hunter2'",
             "a secret: cooking\nsecret: abc123",
             "a bearer of responsibility; Authorization: Bearer abc123",
+        ] {
+            assert!(check_sensitivity(text).blocked, "missed credential: {text}");
+        }
+    }
+
+    #[test]
+    fn credential_exceptions_do_not_hide_literal_arguments() {
+        for text in [
+            "if password:\n    password='hunter2'",
+            "password = str(123456)",
+            "password = data.get('password', 123456)",
+            "password = db.Column(db.String(120), default=123456)",
+            "password = data.get('password', 'hunter2')",
+            "password = data.get('password','hunter2')",
+            "password = str( 'hunter2')",
+            "password = str(\n    'hunter2'\n)",
+            "password = os.environ['PASSWORD'] or 'hunter2'",
         ] {
             assert!(check_sensitivity(text).blocked, "missed credential: {text}");
         }
