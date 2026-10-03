@@ -268,6 +268,23 @@ mod tests {
     }
 
     #[test]
+    fn credential_exceptions_do_not_hide_literal_arguments() {
+        for text in [
+            "if password:\n    password='hunter2'",
+            "password = str(123456)",
+            "password = data.get('password', 123456)",
+            "password = db.Column(db.String(120), default=123456)",
+            "password = data.get('password', 'hunter2')",
+            "password = data.get('password','hunter2')",
+            "password = str( 'hunter2')",
+            "password = str(\n    'hunter2'\n)",
+            "password = os.environ['PASSWORD'] or 'hunter2'",
+        ] {
+            assert!(check_sensitivity(text).blocked, "missed credential: {text}");
+        }
+    }
+
+    #[test]
     fn test_email_redacted() {
         let r = check_sensitivity("contact me at alice@example.com please");
         assert!(!r.blocked);
