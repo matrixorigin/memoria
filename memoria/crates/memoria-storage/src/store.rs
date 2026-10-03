@@ -798,8 +798,20 @@ fn sanitize_fulltext_query(s: &str) -> String {
         })
         .collect::<String>()
         .split_whitespace()
+        // MatrixOne rejects the entire OR query if even one term tokenizes
+        // to nothing (for example a code diagnostic's "________" underline).
+        .filter(|word| word.chars().any(char::is_alphanumeric))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Keep generated full-text SQL bounded without discarding the tail of a
+/// long context query. Duplicate terms need only be searched once.
+fn fulltext_query_batches(query: &str) -> Vec<String> {
+    let safe = sanitize_fulltext_query(query).to_lowercase();
+    let mut seen = std::collections::HashSet::new();
+    let words: Vec<_> = safe.split_whitespace().filter(|word| seen.insert(*word)).collect();
+    words.chunks(64).map(|batch| batch.join(" ")).collect()
 }
 
 /// Validate the public full-text query contract. Stopword-only queries remain
@@ -5811,10 +5823,62 @@ impl SqlMemoryStore {
         subject_id: Option<&str>,
         memory_types: Option<&[MemoryType]>,
     ) -> Result<Vec<Memory>, MemoriaError> {
-        let safe = sanitize_fulltext_query(query);
-        if safe.is_empty() {
-            return Ok(vec![]);
+        let batches = fulltext_query_batches(query);
+        if batches.is_empty() || limit <= 0 {
+            return Ok(Vec::new());
         }
+        if batches.len() == 1 {
+            return self.search_fulltext_batch(
+                table, user_id, &batches[0], limit, session_id, subject_id, memory_types,
+            ).await;
+        }
+        // An empty owner scope must not run a large full-text plan over the
+        // index. This also covers search-only benchmark tasks before any Add.
+        let exists: Option<i32> = sqlx::query_scalar(&format!(
+            "SELECT 1 FROM {table} WHERE user_id = ? AND is_active = 1 LIMIT 1"
+        ))
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if exists.is_none() {
+            return Ok(Vec::new());
+        }
+        // Sum lexical scores from bounded OR batches, deduplicate by memory,
+        // and apply the requested limit after fusion. Each batch is scoped in
+        // SQL and contributes at most limit candidates; no query terms are lost.
+        let mut merged = std::collections::HashMap::<String, Memory>::new();
+        for batch in batches {
+            for memory in self.search_fulltext_batch(
+                table, user_id, &batch, limit, session_id, subject_id, memory_types,
+            ).await? {
+                if let Some(existing) = merged.get_mut(&memory.memory_id) {
+                    existing.retrieval_score = Some(existing.retrieval_score.unwrap_or(0.0)
+                        + memory.retrieval_score.unwrap_or(0.0));
+                } else {
+                    merged.insert(memory.memory_id.clone(), memory);
+                }
+            }
+        }
+        let mut results: Vec<_> = merged.into_values().collect();
+        results.sort_by(|a, b| b.retrieval_score.unwrap_or(0.0)
+            .total_cmp(&a.retrieval_score.unwrap_or(0.0))
+            .then_with(|| a.memory_id.cmp(&b.memory_id)));
+        results.truncate(limit as usize);
+        Ok(results)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn search_fulltext_batch(
+        &self,
+        table: &str,
+        user_id: &str,
+        safe: &str,
+        limit: i64,
+        session_id: Option<&str>,
+        subject_id: Option<&str>,
+        memory_types: Option<&[MemoryType]>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
         let session_clause = if session_id.is_some() {
             " AND (session_id = ? OR session_id IS NULL)"
         } else {
@@ -6490,6 +6554,21 @@ mod tests {
     use std::sync::{Arc, Mutex, OnceLock};
 
     static LOG_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn fulltext_code_underline_does_not_poison_other_terms() {
+        assert_eq!(super::sanitize_fulltext_query("ruff |_______________^ UP028"), "ruff UP028");
+        assert!(super::fulltext_query_batches("____ !@").is_empty());
+    }
+
+    #[test]
+    fn long_fulltext_queries_preserve_all_distinct_terms_in_bounded_batches() {
+        let words: Vec<_> = (0..3000).map(|i| format!("term{i}")).collect();
+        let query = format!("{} TERM0 term2999", words.join(" "));
+        let batches = super::fulltext_query_batches(&query);
+        assert!(batches.iter().all(|b| b.split_whitespace().count() <= 64));
+        assert_eq!(batches.join(" "), words.join(" "));
+    }
 
     #[test]
     fn hybrid_merge_keeps_fulltext_scores_out_of_vector_score() {

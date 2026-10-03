@@ -94,11 +94,65 @@ static COMPILED: Lazy<Vec<(&'static Pattern, Regex)>> = Lazy::new(|| {
         .collect()
 });
 
+// A reference to a value in source code is not itself a credential. Only
+// recognize expressions with explicit code syntax, not arbitrary bare words.
+static VALUE_REFERENCE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^(?:[A-Za-z_][A-Za-z0-9_]*\.)*[A-Za-z_][A-Za-z0-9_]*[ \t]*[\[(]|^(?:hashed_password|password_hash|password|passwd)[ \t]*[,)]")
+        .expect("valid value reference regex")
+});
+
+static VALUE_LOOKUP: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*(?:\.get[ \t]*\(|\[)")
+        .expect("valid value lookup regex")
+});
+
+fn is_credential_match(label: &str, text: &str, matched: regex::Match<'_>) -> bool {
+    let prefix = &text[..matched.start()];
+    let value = matched.as_str();
+    if label == "bearer_token" {
+        // "a bearer of responsibility" is prose. An explicit Authorization
+        // header still treats even a short token such as "of" as a credential.
+        let token = value.split_whitespace().nth(1).unwrap_or("");
+        let header = prefix.trim_end().to_ascii_lowercase();
+        if header.ends_with("authorization:") {
+            return true;
+        }
+        // Ordinary compound nouns, including prose split across lines, do not
+        // introduce the HTTP authentication scheme.
+        let previous = header.split_whitespace().next_back().unwrap_or("");
+        return !token.eq_ignore_ascii_case("of")
+            && !matches!(previous, "standard" | "flag" | "torch" | "pall");
+    }
+    if label == "password_assign" {
+        let (name, rhs) = value.split_once([':', '=']).expect("assignment match");
+        let line_prefix = prefix.rsplit('\n').next().unwrap_or("").trim_start();
+        if value.contains(':') && rhs.starts_with(['\n', '\r'])
+            && ["if ", "elif ", "while "].iter().any(|start| line_prefix.starts_with(start))
+        {
+            return false;
+        }
+        let rhs = rhs.trim_start();
+        // Natural-language "share a secret: ..." is not a config field.
+        if name.trim().eq_ignore_ascii_case("secret") && value.contains(':') {
+            let previous = prefix.split_whitespace().next_back().unwrap_or("");
+            if matches!(previous.to_ascii_lowercase().as_str(), "a" | "the") {
+                return false;
+            }
+        }
+        let reference = VALUE_REFERENCE.is_match(rhs)
+            && (!rhs.contains(['\'', '"']) || VALUE_LOOKUP.is_match(rhs));
+        return !reference;
+    }
+    true
+}
+
 /// Check content for PII/credentials. Returns a `SensitivityResult`.
 pub fn check_sensitivity(text: &str) -> SensitivityResult {
     // HIGH tier — any match blocks immediately
     for (p, re) in COMPILED.iter() {
-        if p.tier == SensitivityTier::High && re.is_match(text) {
+        if p.tier == SensitivityTier::High
+            && re.find_iter(text).any(|m| is_credential_match(p.label, text, m))
+        {
             return SensitivityResult {
                 blocked: true,
                 redacted_content: None,
@@ -158,6 +212,47 @@ mod tests {
         let r = check_sensitivity("password=supersecret123");
         assert!(r.blocked);
         assert_eq!(r.matched_labels, vec!["password_assign"]);
+    }
+
+    #[test]
+    fn prose_and_code_references_are_not_credentials() {
+        for text in [
+            "I'll share a secret: **dry brining**.",
+            "a bearer of certain responsibilities",
+            "The regiment's Standard Bearer grants the Unstoppable rule.",
+            "STANDARD BEARER\nA Regiment gains a rule.",
+            "password = db.Column(db.String(120), nullable=False)",
+            "password = data.get('password')",
+            "password = os.environ['PASSWORD']",
+            "if not username or not password:\n    return error",
+            "hashed_password = generate_password_hash(password)",
+            "User(username=username, password=hashed_password)",
+        ] {
+            assert!(!check_sensitivity(text).blocked, "false positive: {text}");
+        }
+    }
+
+    #[test]
+    fn credential_literals_still_block_after_benign_matches() {
+        for text in [
+            "password=hunter2",
+            "password = 'hunter2'",
+            "password: hunter2",
+            "password:\n  hunter2",
+            "db_password='hunter2'",
+            "password = str('hunter2')",
+            "password = utils.hash('hunter2')",
+            "secret=abc123",
+            "secret: abc123",
+            "passwd=abc123",
+            "Authorization: Bearer of",
+            "Bearer abc123",
+            "password = data.get('password')\npassword = 'hunter2'",
+            "a secret: cooking\nsecret: abc123",
+            "a bearer of responsibility; Authorization: Bearer abc123",
+        ] {
+            assert!(check_sensitivity(text).blocked, "missed credential: {text}");
+        }
     }
 
     #[test]
