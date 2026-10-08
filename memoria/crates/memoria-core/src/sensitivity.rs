@@ -268,7 +268,9 @@ mod tests {
     }
 
     #[test]
-    fn credential_exceptions_do_not_hide_literal_arguments() {
+    fn current_policy_blocks_password_literal_expressions() {
+        // The current HIGH-tier rule matches the assignment prefix without
+        // parsing the RHS. Pin its blocking behavior for these literal forms.
         for text in [
             "if password:\n    password='hunter2'",
             "password = str(123456)",
@@ -280,7 +282,34 @@ mod tests {
             "password = str(\n    'hunter2'\n)",
             "password = os.environ['PASSWORD'] or 'hunter2'",
         ] {
-            assert!(check_sensitivity(text).blocked, "missed credential: {text}");
+            let result = check_sensitivity(text);
+            assert!(result.blocked, "credential assignment allowed: {text}");
+            assert_eq!(result.matched_labels, vec!["password_assign"]);
+            assert!(result.redacted_content.is_none());
+        }
+    }
+
+    #[test]
+    fn current_policy_documents_password_reference_false_positives() {
+        // Known false positives under the broad assignment rule. A future
+        // policy/detector change should revise these expectations explicitly.
+        for text in [
+            "password = None",
+            "password: str",
+            "def login(username, password=None):",
+            "password = self.password",
+            "password = getpass.getpass(\"Enter password: \")",
+            "password = data.get('password')",
+            "password = os.environ['PASSWORD']  # default was hunter2",
+            "password = db.Column(db.String(120))",
+            "password = models.CharField(max_length=128)",
+            "password = mapped_column(String(255))",
+            "password = sa.Column(String(120))",
+        ] {
+            let result = check_sensitivity(text);
+            assert!(result.blocked, "false-positive baseline changed: {text}");
+            assert_eq!(result.matched_labels, vec!["password_assign"]);
+            assert!(result.redacted_content.is_none());
         }
     }
 
