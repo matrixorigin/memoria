@@ -96,6 +96,7 @@ Every memory mutation has a snapshot + provenance chain
   <a href="https://openai.com/index/introducing-codex/"><img src="https://img.shields.io/badge/Codex-412991?style=for-the-badge&logo=openai&logoColor=white" alt="Codex"/></a>
   <a href="https://geminicli.com"><img src="https://img.shields.io/badge/Gemini_CLI-4285F4?style=for-the-badge&logo=google&logoColor=white" alt="Gemini CLI"/></a>
   <a href="plugins/openclaw/README.md"><img src="https://img.shields.io/badge/OpenClaw-FF6B6B?style=for-the-badge" alt="OpenClaw"/></a>
+  <a href="plugins/hermes/README.md"><img src="https://img.shields.io/badge/Hermes-8B5CF6?style=for-the-badge" alt="Hermes"/></a>
 </p>
 
 <p align="center"><i>Works with any MCP-compatible agent</i></p>
