@@ -127,8 +127,8 @@ const UI_HINTS: Record<
     placeholder: String(DEFAULTS.timeoutMs),
   },
   maxListPages: {
-    label: "List Scan Limit",
-    help: "Used by OpenClaw-side fallback scans for memory_get and derived stats.",
+    label: "List Page Limit",
+    help: "Maximum number of API pages (up to 500 memories each) fetched per memory_list call, which also bounds derived stats and client-side type filtering.",
     advanced: true,
     placeholder: String(DEFAULTS.maxListPages),
   },

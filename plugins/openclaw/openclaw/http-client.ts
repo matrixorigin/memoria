@@ -7,10 +7,14 @@
 
 import type { MemoriaPluginConfig } from "./config.js";
 
+/** Server-side cap on GET /v1/memories page size (see list_memories in memoria-api). */
+const API_LIST_PAGE_MAX = 500;
+
 export class MemoriaHttpTransport {
   private readonly apiUrl: string;
   private readonly apiKey: string;
   private readonly timeoutMs: number;
+  private readonly maxListPages: number;
 
   constructor(config: MemoriaPluginConfig, private readonly userId: string) {
     if (!config.apiUrl) {
@@ -22,6 +26,7 @@ export class MemoriaHttpTransport {
     this.apiUrl = config.apiUrl.replace(/\/+$/, "");
     this.apiKey = config.apiKey;
     this.timeoutMs = config.timeoutMs;
+    this.maxListPages = config.maxListPages;
   }
 
   /** Matches MemoriaMcpSession.isAlive() — HTTP transport is always "alive". */
@@ -55,6 +60,8 @@ export class MemoriaHttpTransport {
         return this.search(args);
       case "memory_list":
         return this.list(args);
+      case "memory_get":
+        return this.getOne(args);
       case "memory_profile":
         return this.profile();
       case "memory_correct":
@@ -131,12 +138,43 @@ export class MemoriaHttpTransport {
     return this.formatMemoryList(data);
   }
 
+  /**
+   * Follows next_cursor until `limit` items are collected, the server reports no
+   * more rows, or maxListPages is reached. Returns `{ items, has_more }` so the
+   * client can tell a truncated scan from a complete one.
+   */
   private async list(args: Record<string, unknown>) {
     const limit = typeof args.limit === "number" ? args.limit : 100;
-    const data = await this.get(`/v1/memories?limit=${limit}`);
-    const rec = this.asRecord(data);
-    const items = Array.isArray(rec?.items) ? rec!.items : Array.isArray(data) ? data : [];
-    return this.formatMemoryItems(items);
+    const items: unknown[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < this.maxListPages && items.length < limit; page++) {
+      const pageSize = Math.min(limit - items.length, API_LIST_PAGE_MAX);
+      const query = cursor
+        ? `limit=${pageSize}&cursor=${encodeURIComponent(cursor)}`
+        : `limit=${pageSize}`;
+      const data = await this.get(`/v1/memories?${query}`);
+      const rec = this.asRecord(data);
+      const pageItems = Array.isArray(rec?.items) ? rec!.items : Array.isArray(data) ? data : [];
+      const next = typeof rec?.next_cursor === "string" && rec.next_cursor ? rec.next_cursor : null;
+      // A cursor that does not advance means the server repeated a page: drop it
+      // so rows are not counted twice, and stop so a misbehaving server cannot
+      // loop us. The leftover cursor still marks the result as incomplete.
+      if (next !== null && next === cursor) {
+        break;
+      }
+      items.push(...pageItems);
+      cursor = next;
+      if (!next || pageItems.length === 0) {
+        break;
+      }
+    }
+    return { items: items.slice(0, limit), has_more: cursor !== null || items.length > limit };
+  }
+
+  /** Returns the active memory or null; the API answers `null` for unknown IDs. */
+  private async getOne(args: Record<string, unknown>) {
+    const data = await this.get(`/v1/memories/${encodeURIComponent(String(args.memory_id))}`);
+    return this.asRecord(data) ?? null;
   }
 
   private async profile() {

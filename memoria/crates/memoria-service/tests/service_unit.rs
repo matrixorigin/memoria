@@ -30,6 +30,18 @@ impl MemoryStore for MockStore {
             .find(|m| m.memory_id == memory_id && m.is_active)
             .cloned())
     }
+    async fn get_including_inactive(
+        &self,
+        memory_id: &str,
+    ) -> Result<Option<Memory>, MemoriaError> {
+        Ok(self
+            .memories
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|m| m.memory_id == memory_id)
+            .cloned())
+    }
     async fn update(&self, memory: &Memory) -> Result<(), MemoriaError> {
         let mut store = self.memories.lock().unwrap();
         if let Some(m) = store.iter_mut().find(|m| m.memory_id == memory.memory_id) {
@@ -101,6 +113,300 @@ fn make_service() -> MemoryService {
         Some(Arc::new(MockEmbedder)),
         None,
     )
+}
+
+#[tokio::test]
+async fn test_observe_exclusions_keep_explicit_fact_and_capture_other_fact() {
+    let (llm, _shutdown) = memoria_test_utils::spawn_fake_llm(vec![(
+        "already_saved_memories",
+        serde_json::json!([
+            {"type": "profile", "content": "User likes rainy days", "confidence": 1.0},
+            {"type": "profile", "content": "用户喝无糖咖啡", "confidence": 1.0}
+        ]),
+    )])
+    .await;
+    let mut svc = make_service();
+    svc.llm = Some(llm);
+    let saved = svc
+        .store_memory(
+            "u1",
+            "User likes rainy days",
+            MemoryType::Profile,
+            Some("session".into()),
+            None,
+            None,
+            None,
+            None,
+            Some("subject".into()),
+        )
+        .await
+        .unwrap();
+    let (captured, has_llm) = svc
+        .observe_turn_excluding_on_branch(
+            "u1",
+            None,
+            &[serde_json::json!({"role": "user", "content": "我喜欢下雨天，也喝无糖咖啡"})],
+            Some("session".into()),
+            Some("subject".into()),
+            std::slice::from_ref(&saved.memory_id),
+        )
+        .await
+        .unwrap();
+    assert!(has_llm);
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].content, "用户喝无糖咖啡");
+    assert_eq!(captured[0].trust_tier, TrustTier::T3Inferred);
+    let original = svc.get(&saved.memory_id).await.unwrap().unwrap();
+    assert_eq!(original.trust_tier, TrustTier::T1Verified);
+    assert!(original.is_active);
+    assert_eq!(svc.list_active("u1", 20).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn test_observe_exclusions_never_fall_back_to_raw_storage() {
+    for malformed_llm in [false, true] {
+        let mut svc = make_service();
+        let saved = svc
+            .store_memory(
+                "u1",
+                "User likes rainy days",
+                MemoryType::Profile,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("subject".into()),
+            )
+            .await
+            .unwrap();
+        let mut shutdown = None;
+        if malformed_llm {
+            let (llm, handle) = memoria_test_utils::spawn_fake_llm(vec![(
+                "already_saved_memories",
+                serde_json::json!({"invalid": "not an array"}),
+            )])
+            .await;
+            svc.llm = Some(llm);
+            shutdown = Some(handle);
+        }
+        assert!(svc
+            .observe_turn_excluding_on_branch(
+                "u1",
+                None,
+                &[serde_json::json!({"role": "user", "content": "我喜欢下雨天"})],
+                None,
+                Some("subject".into()),
+                &[saved.memory_id],
+            )
+            .await
+            .is_err());
+        assert_eq!(svc.list_active("u1", 20).await.unwrap().len(), 1);
+        drop(shutdown);
+    }
+}
+
+#[tokio::test]
+async fn test_observe_exclusions_ignore_out_of_scope_ids_without_sending_private_content() {
+    let (llm, _shutdown) = memoria_test_utils::spawn_fake_llm(vec![
+        (
+            "private preference",
+            serde_json::json!([{"content": "scope leaked"}]),
+        ),
+        (
+            "public other fact",
+            serde_json::json!([{"content": "public other fact"}]),
+        ),
+    ])
+    .await;
+    let mut svc = make_service();
+    svc.llm = Some(llm);
+    let saved = svc
+        .store_memory(
+            "u1",
+            "private preference",
+            MemoryType::Profile,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("alice".into()),
+        )
+        .await
+        .unwrap();
+    for (user, subject) in [("u2", "alice"), ("u1", "bob")] {
+        let (captured, _) = svc
+            .observe_turn_excluding_on_branch(
+                user,
+                None,
+                &[serde_json::json!({"role": "user", "content": "public other fact"})],
+                None,
+                Some(subject.into()),
+                std::slice::from_ref(&saved.memory_id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].content, "public other fact");
+    }
+    assert_eq!(
+        svc.get(&saved.memory_id).await.unwrap().unwrap().content,
+        "private preference"
+    );
+}
+
+#[tokio::test]
+async fn test_observe_exclusions_retain_inactive_facts_after_correct_or_purge() {
+    for corrected in [true, false] {
+        let mut items = vec![
+            serde_json::json!({"content": "User likes rainy days"}),
+            serde_json::json!({"content": "用户喝无糖咖啡"}),
+        ];
+        if corrected {
+            items.push(serde_json::json!({"content": "User likes sunny days"}));
+        }
+        let (llm, _shutdown) = memoria_test_utils::spawn_fake_llm(vec![(
+            "already_saved_memories",
+            serde_json::json!(items),
+        )])
+        .await;
+        let mut svc = make_service();
+        svc.llm = Some(llm);
+        let saved = svc
+            .store_memory(
+                "u1",
+                "User likes rainy days",
+                MemoryType::Profile,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("subject".into()),
+            )
+            .await
+            .unwrap();
+        let mut excluded = vec![saved.memory_id.clone()];
+        if corrected {
+            let updated = svc
+                .correct("u1", &saved.memory_id, "User likes sunny days")
+                .await
+                .unwrap();
+            excluded.push(updated.memory_id);
+        } else {
+            svc.purge("u1", &saved.memory_id).await.unwrap();
+        }
+        assert!(svc.get(&saved.memory_id).await.unwrap().is_none());
+        let (captured, _) = svc
+            .observe_turn_excluding_on_branch(
+                "u1",
+                None,
+                &[],
+                None,
+                Some("subject".into()),
+                &excluded,
+            )
+            .await
+            .unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].content, "用户喝无糖咖啡");
+        assert!(svc.get(&saved.memory_id).await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn test_observe_missing_exclusions_still_forbid_raw_fallback() {
+    let (llm, _shutdown) = memoria_test_utils::spawn_fake_llm(vec![(
+        "new fact",
+        serde_json::json!({"invalid": "not an array"}),
+    )])
+    .await;
+    let mut svc = make_service();
+    svc.llm = Some(llm);
+    let error = svc
+        .observe_turn_excluding_on_branch(
+            "u1",
+            None,
+            &[serde_json::json!({"role": "user", "content": "new fact"})],
+            None,
+            None,
+            &["physically-purged-id".into()],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MemoriaError::ObserveExtractionUnavailable(_)
+    ));
+    assert!(svc.list_active("u1", 20).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_observe_exclusions_empty_extraction_does_not_store_raw_chinese_messages() {
+    let (llm, _shutdown) =
+        memoria_test_utils::spawn_fake_llm(vec![("already_saved_memories", serde_json::json!([]))])
+            .await;
+    let mut svc = make_service();
+    svc.llm = Some(llm);
+    let saved = svc
+        .store_memory(
+            "u1",
+            "User likes rainy days",
+            MemoryType::Profile,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("subject".into()),
+        )
+        .await
+        .unwrap();
+    let messages = vec![serde_json::json!({"role": "user", "content": "雨".repeat(500)}); 20];
+    let (captured, _) = svc
+        .observe_turn_excluding_on_branch(
+            "u1",
+            None,
+            &messages,
+            None,
+            Some("subject".into()),
+            &[saved.memory_id],
+        )
+        .await
+        .unwrap();
+    assert!(captured.is_empty());
+    assert_eq!(svc.list_active("u1", 20).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_observe_exclusions_reject_invalid_or_excessive_ids_before_writes() {
+    let svc = make_service();
+    for ids in [vec!["../bad".into()], vec!["a".repeat(32); 101]] {
+        assert!(svc
+            .observe_turn_excluding_on_branch("u1", None, &[], None, None, &ids,)
+            .await
+            .is_err());
+    }
+    assert!(svc.list_active("u1", 20).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_observe_without_exclusions_preserves_existing_raw_fallback() {
+    let svc = make_service();
+    let (captured, has_llm) = svc
+        .observe_turn_on_branch(
+            "u1",
+            None,
+            &[serde_json::json!({"role": "user", "content": "I like rainy days"})],
+            None,
+            Some("subject".into()),
+        )
+        .await
+        .unwrap();
+    assert!(!has_llm);
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].content, "I like rainy days");
 }
 
 fn make_service_with_entries() -> (MemoryService, Arc<Mutex<Vec<OwnedEditLogEntry>>>) {

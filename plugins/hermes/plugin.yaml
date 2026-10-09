@@ -1,0 +1,4 @@
+name: memoria
+version: 0.1.1
+description: "Memoria Cloud memory: scoped recall, explicit memory tools and durable background capture."
+requires_hermes: ">=0.21.5"

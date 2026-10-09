@@ -6,6 +6,12 @@ use async_trait::async_trait;
 pub trait MemoryStore: Send + Sync {
     async fn insert(&self, memory: &Memory) -> Result<(), MemoriaError>;
     async fn get(&self, memory_id: &str) -> Result<Option<Memory>, MemoriaError>;
+    /// Internal history lookup, including soft-deleted/superseded records.
+    /// The SQL implementation reads only the main `mem_memories` table, not
+    /// branch tables. Use branch-aware store methods for branch history.
+    /// Callers must enforce user/subject scope before using the returned content.
+    async fn get_including_inactive(&self, memory_id: &str)
+        -> Result<Option<Memory>, MemoriaError>;
     async fn update(&self, memory: &Memory) -> Result<(), MemoriaError>;
     async fn soft_delete(&self, memory_id: &str) -> Result<(), MemoriaError>;
     async fn list_active(&self, user_id: &str, limit: i64) -> Result<Vec<Memory>, MemoriaError>;

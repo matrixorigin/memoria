@@ -29,6 +29,15 @@ impl MemoryStore for MockStore {
             .find(|m| m.memory_id == id && m.is_active)
             .cloned())
     }
+    async fn get_including_inactive(&self, id: &str) -> Result<Option<Memory>, MemoriaError> {
+        Ok(self
+            .memories
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|m| m.memory_id == id)
+            .cloned())
+    }
     async fn update(&self, memory: &Memory) -> Result<(), MemoriaError> {
         let mut s = self.memories.lock().unwrap();
         if let Some(m) = s.iter_mut().find(|m| m.memory_id == memory.memory_id) {

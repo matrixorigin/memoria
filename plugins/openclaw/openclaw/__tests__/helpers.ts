@@ -58,6 +58,7 @@ export function mockFetch() {
     status: 200,
     body: { ok: true },
   };
+  let handler: ((url: string) => { status: number; body: unknown }) | null = null;
 
   const mock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
     const urlStr = typeof url === "string" ? url : url instanceof URL ? url.toString() : url.url;
@@ -77,6 +78,9 @@ export function mockFetch() {
       try { body = JSON.parse(init.body); } catch { body = init.body; }
     }
     calls.push({ url: urlStr, method, headers: hdrs, body });
+    if (handler) {
+      nextResponse = handler(urlStr);
+    }
 
     const responseBody = typeof nextResponse.body === "string"
       ? nextResponse.body
@@ -95,7 +99,12 @@ export function mockFetch() {
     mock,
     /** Set what the next fetch call will return */
     respondWith(status: number, body: unknown) {
+      handler = null;
       nextResponse = { status, body };
+    },
+    /** Compute each response from the request URL (e.g. to serve paginated pages) */
+    respondWithHandler(fn: (url: string) => { status: number; body: unknown }) {
+      handler = fn;
     },
     /** Get the last recorded call */
     lastCall(): MockFetchCall | undefined {

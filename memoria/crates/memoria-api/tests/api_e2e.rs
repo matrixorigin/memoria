@@ -2076,6 +2076,105 @@ async fn test_mcp_tool_outcomes_persist_and_remain_queryable_by_tool() {
     assert_eq!(backend["tool_backend_error_count"], 1);
 }
 
+#[tokio::test]
+async fn test_call_log_repair_failure_keeps_memory_api_available_and_background_recovers() {
+    let master = "log-repair-test-master";
+    let (base, client, server) = spawn_server_with_master_key(master).await;
+    let user = uid();
+    server.user_store(&user).await;
+    let pool = server.user_db_pool(&user).await;
+    // Simulate a version-2 database whose optional logging table is unavailable.
+    for column in ["tool_success", "tool_error_kind"] {
+        sqlx::query(&format!(
+            "ALTER TABLE mem_api_call_log DROP COLUMN {column}"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query("ALTER TABLE mem_api_call_log RENAME TO saved_call_log")
+        .execute(&pool)
+        .await
+        .unwrap();
+    server.router().invalidate_user(&user).await;
+    let response = client
+        .post(format!("{base}/v1/memories"))
+        .bearer_auth(master)
+        .header("X-User-Id", &user)
+        .json(&json!({"content":"A durable preference during a logging outage"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    let memory: Value = response.json().await.unwrap();
+    let memory_id = memory["memory_id"].as_str().expect("stored memory id");
+    let response = client
+        .get(format!("{base}/v1/memories/{memory_id}"))
+        .bearer_auth(master)
+        .header("X-User-Id", &user)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let cached_store = server.service().user_sql_store(&user).await.unwrap();
+    server
+        .state()
+        .call_log_batcher
+        .flush(&server.service())
+        .await;
+
+    // Restore the legacy table without invalidating the cached user store.
+    sqlx::query("ALTER TABLE saved_call_log RENAME TO mem_api_call_log")
+        .execute(&pool)
+        .await
+        .unwrap();
+    server.state().call_log_batcher.record_rpc(
+        user.clone(),
+        "POST".into(),
+        "/mcp/memory_retrieve".into(),
+        200,
+        1,
+        memoria_api::auth::RpcMeta {
+            success: true,
+            error_code: None,
+            tool_success: Some(false),
+            tool_error_kind: Some("backend"),
+        },
+    );
+    server
+        .state()
+        .call_log_batcher
+        .flush(&server.service())
+        .await;
+    let store = server.service().user_sql_store(&user).await.unwrap();
+    assert!(Arc::ptr_eq(&cached_store, &store));
+    let outcome: (Option<i8>, Option<String>) = sqlx::query_as(
+        "SELECT tool_success, tool_error_kind FROM mem_api_call_log
+         WHERE user_id = ? AND path = '/mcp/memory_retrieve'",
+    )
+    .bind(&user)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(outcome, (Some(0), Some("backend".into())));
+    let response = client
+        .get(format!("{base}/admin/users/{user}/call-stats"))
+        .bearer_auth(master)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let stats: Value = response.json().await.unwrap();
+    let entry = stats["by_path"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "/mcp/memory_retrieve")
+        .expect("recovered tool statistics");
+    assert_eq!(entry["tool_backend_error_count"], 1);
+    pool.close().await;
+}
+
 async fn assert_scoped_user_has_no_database(server: &support::multi_db::ApiTestServer, user: &str) {
     let registry: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM mem_user_registry WHERE user_id = ?")

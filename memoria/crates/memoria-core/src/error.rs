@@ -23,6 +23,10 @@ pub enum MemoriaError {
     #[error("Internal error: {0}")]
     Internal(String),
 
+    /// Observe extraction failed before any memory persistence was attempted.
+    #[error("Observe extraction unavailable: {0}")]
+    ObserveExtractionUnavailable(String),
+
     #[error("Validation error: {0}")]
     Validation(String),
 

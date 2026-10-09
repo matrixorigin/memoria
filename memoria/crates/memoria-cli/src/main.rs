@@ -3531,6 +3531,10 @@ mod tests {
             Ok(None)
         }
 
+        async fn get_including_inactive(&self, _: &str) -> Result<Option<Memory>, MemoriaError> {
+            Ok(None)
+        }
+
         async fn update(&self, _: &Memory) -> Result<(), MemoriaError> {
             Ok(())
         }

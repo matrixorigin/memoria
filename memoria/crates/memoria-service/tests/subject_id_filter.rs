@@ -55,6 +55,10 @@ mod mock_support {
             Ok(self.data.lock().unwrap().get(id).cloned())
         }
 
+        async fn get_including_inactive(&self, id: &str) -> Result<Option<Memory>, MemoriaError> {
+            Ok(self.data.lock().unwrap().get(id).cloned())
+        }
+
         async fn update(&self, m: &Memory) -> Result<(), MemoriaError> {
             self.data
                 .lock()

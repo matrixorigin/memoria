@@ -8,7 +8,7 @@ use memoria_core::{
 use sqlx::{mysql::MySqlPool, MySql, QueryBuilder, Row};
 use std::borrow::Cow;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,6 +18,12 @@ pub const EXTRA_METADATA_FILTER_MAX_VALUE_BYTES: usize = 1024;
 pub const FULLTEXT_SEARCH_DEFAULT_LIMIT: i64 = 20;
 pub const FULLTEXT_SEARCH_MAX_LIMIT: i64 = 100;
 pub const FULLTEXT_QUERY_MAX_BYTES: usize = 4096;
+
+const FULLTEXT_MEMORY_COLUMNS: &str =
+    "memory_id, user_id, author_id, subject_id, memory_type, content, \
+    embedding AS emb_str, session_id, CAST(source_event_ids AS CHAR) AS src_ids, \
+    CAST(extra_metadata AS CHAR) AS extra_meta, is_active, superseded_by, trust_tier, \
+    initial_confidence, observed_at, created_at, updated_at";
 
 /// Validate the public structured-query metadata contract at the storage boundary.
 /// Keys become JSON paths, so the first character must be an ASCII letter or
@@ -107,12 +113,14 @@ pub(crate) fn fulltext_rows_or_empty(
     }
 }
 
+fn fulltext_score(row: &sqlx::mysql::MySqlRow) -> Option<f64> {
+    row.try_get::<f64, _>("ft_score")
+        .or_else(|_| row.try_get::<f32, _>("ft_score").map(f64::from))
+        .ok()
+}
+
 fn apply_fulltext_score(row: &sqlx::mysql::MySqlRow, memory: &mut Memory) {
-    if let Ok(score) = row.try_get::<f64, _>("ft_score") {
-        memory.retrieval_score = Some(score);
-    } else if let Ok(score) = row.try_get::<f32, _>("ft_score") {
-        memory.retrieval_score = Some(score as f64);
-    }
+    memory.retrieval_score = fulltext_score(row);
 }
 
 fn merge_hybrid_results(
@@ -798,8 +806,23 @@ fn sanitize_fulltext_query(s: &str) -> String {
         })
         .collect::<String>()
         .split_whitespace()
+        // MatrixOne rejects the entire OR query if even one term tokenizes
+        // to nothing (for example a code diagnostic's "________" underline).
+        .filter(|word| word.chars().any(char::is_alphanumeric))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Keep generated full-text SQL bounded without discarding the tail of a
+/// long context query. Duplicate terms need only be searched once.
+fn fulltext_query_batches(query: &str) -> Vec<String> {
+    let safe = sanitize_fulltext_query(query).to_lowercase();
+    let mut seen = std::collections::HashSet::new();
+    let words: Vec<_> = safe
+        .split_whitespace()
+        .filter(|word| seen.insert(*word))
+        .collect();
+    words.chunks(64).map(|batch| batch.join(" ")).collect()
 }
 
 /// Validate the public full-text query contract. Stopword-only queries remain
@@ -841,20 +864,8 @@ fn vec_to_mo(v: &[f32]) -> String {
     )
 }
 
-/// Build an SQL `AND memory_type IN (?, ?)` clause using bind parameter placeholders (`?`).
-/// Returns an empty string when `memory_types` is `None` or empty.
-fn build_memory_types_in_clause(memory_types: Option<&[MemoryType]>) -> String {
-    match memory_types {
-        Some(types) if !types.is_empty() => {
-            let placeholders = types.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-            format!(" AND memory_type IN ({placeholders})")
-        }
-        _ => String::new(),
-    }
-}
-
 /// Build an SQL `AND memory_type IN ('a', 'b')` clause with inlined literals.
-/// Used for vector search paths that cannot use bind parameters (MatrixOne bug workaround).
+/// Used for search paths that cannot use bind parameters (MatrixOne bug workaround).
 /// Values are enum variants serialised via `Display` — no user-supplied input.
 fn build_memory_types_in_clause_inline(memory_types: Option<&[MemoryType]>) -> String {
     match memory_types {
@@ -889,6 +900,8 @@ fn mo_to_vec(s: &str) -> Result<Vec<f32>, MemoriaError> {
 pub struct SqlMemoryStore {
     pool: MySqlPool,
     branch_alter_capability: Arc<crate::branch_capability::BranchAlterCapability>,
+    /// Successful optional log-schema checks are shared by clones of this store.
+    call_log_tool_outcomes_ready: Arc<AtomicBool>,
     embedding_dim: usize,
     instance_id: String,
     database_url: Option<String>,
@@ -987,6 +1000,7 @@ impl SqlMemoryStore {
             branch_alter_capability: Arc::new(
                 crate::branch_capability::BranchAlterCapability::default(),
             ),
+            call_log_tool_outcomes_ready: Arc::new(AtomicBool::new(false)),
             embedding_dim,
             instance_id,
             database_url: None,
@@ -1079,12 +1093,14 @@ impl SqlMemoryStore {
     pub fn set_db_name(&mut self, name: String) {
         self.branch_alter_capability =
             Arc::new(crate::branch_capability::BranchAlterCapability::default());
+        self.call_log_tool_outcomes_ready = Arc::new(AtomicBool::new(false));
         self.db_name = Some(name);
     }
 
     pub fn set_database_url(&mut self, url: String) {
         self.branch_alter_capability =
             Arc::new(crate::branch_capability::BranchAlterCapability::default());
+        self.call_log_tool_outcomes_ready = Arc::new(AtomicBool::new(false));
         self.database_url = Some(url);
     }
 
@@ -1709,24 +1725,8 @@ impl SqlMemoryStore {
             }
         }
 
-        // Nullable fields distinguish historical/non-tool calls from actual tool
-        // success. Keep additive migrations compatible with older writers.
-        for column in [
-            "tool_success TINYINT(1) NULL",
-            "tool_error_kind VARCHAR(32) NULL",
-        ] {
-            if let Err(error) = sqlx::query(&format!(
-                "ALTER TABLE {api_call_log_table} ADD COLUMN {column}"
-            ))
-            .execute(pool)
-            .await
-            {
-                if !is_duplicate_column(&error) {
-                    tracing::error!(%error, column, "Cannot migrate tool outcome call-log columns");
-                    return Err(db_err(error));
-                }
-            }
-        }
+        self.ensure_call_log_tool_outcome_columns(pool, schema_name)
+            .await?;
 
         let has_feedback_memory_user_idx = info_schema_index_exists(
             pool,
@@ -2253,6 +2253,59 @@ impl SqlMemoryStore {
         }
     }
 
+    /// Retry optional call-log repairs from the background writer, even when the
+    /// router has already cached an otherwise usable user schema. Failed checks
+    /// are not cached; successful checks avoid metadata queries on later batches.
+    pub async fn ensure_call_log_tool_outcome_schema(&self) -> Result<(), MemoriaError> {
+        if self.call_log_tool_outcomes_ready.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let schema_name = self.current_schema_name().await?;
+        self.ensure_call_log_tool_outcome_columns(&self.pool, schema_name.as_ref())
+            .await
+    }
+
+    /// Tool outcomes were added after version 2 was introduced, without a version
+    /// bump. Repair just these additive columns, without replaying historical
+    /// memory/branch migrations or changing the version marker during a rollout.
+    async fn ensure_call_log_tool_outcome_columns(
+        &self,
+        pool: &MySqlPool,
+        schema_name: &str,
+    ) -> Result<(), MemoriaError> {
+        if self.call_log_tool_outcomes_ready.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let table = self.t("mem_api_call_log");
+        // NULL preserves historical/non-tool outcomes and permits older API
+        // instances to continue inserting their original column list.
+        for (name, definition) in [
+            ("tool_success", "tool_success TINYINT(1) NULL"),
+            ("tool_error_kind", "tool_error_kind VARCHAR(32) NULL"),
+        ] {
+            if info_schema_column_exists(pool, schema_name, "mem_api_call_log", name).await {
+                continue;
+            }
+            let sql = format!("ALTER TABLE {table} ADD COLUMN {definition}");
+            if let Err(error) = exec_ddl_with_retry(pool, &sql).await {
+                // Another instance can win between the metadata read and ALTER.
+                // MatrixOne may also report a stale secondary-index table; accept
+                // that race only when the requested column actually exists.
+                let repaired_by_other_instance = is_duplicate_column(&error)
+                    || (is_mo_concurrent_ddl_race(&error)
+                        && info_schema_column_exists(pool, schema_name, "mem_api_call_log", name)
+                            .await);
+                if !repaired_by_other_instance {
+                    tracing::error!(%error, column = name, "Cannot migrate tool outcome call-log columns");
+                    return Err(db_err(error));
+                }
+            }
+        }
+        self.call_log_tool_outcomes_ready
+            .store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
     pub async fn migrate_user(&self) -> Result<(), MemoriaError> {
         let pool = &self.pool;
         let meta_table = self.t("mem_schema_meta");
@@ -2282,6 +2335,14 @@ impl SqlMemoryStore {
         if load_user_schema_version(pool, &meta_table).await? == Some(CURRENT_USER_SCHEMA_VERSION)
             && info_schema_table_exists(pool, schema_name, "mem_memories").await
         {
+            // Monitoring failures must not make an existing user's memories
+            // unavailable. The background log writer retries this optional repair.
+            if let Err(error) = self
+                .ensure_call_log_tool_outcome_columns(pool, schema_name)
+                .await
+            {
+                tracing::warn!(%error, schema_name, "Optional call-log schema repair deferred to background writer");
+            }
             return Ok(());
         }
 
@@ -5310,6 +5371,28 @@ impl SqlMemoryStore {
         row.map(|r| row_to_memory(&r)).transpose()
     }
 
+    /// Internal observe lookup: inactive facts still need to be excluded after
+    /// correction/deletion. Scope predicates apply before content leaves storage.
+    pub async fn observe_exclusion_content_from(
+        &self,
+        table: &str,
+        user_id: &str,
+        subject_id: Option<&str>,
+        memory_id: &str,
+    ) -> Result<Option<String>, MemoriaError> {
+        sqlx::query_scalar(&format!(
+            "SELECT content FROM {table} WHERE memory_id = ? AND user_id = ? \
+             AND (subject_id = ? OR (subject_id IS NULL AND ? IS NULL))"
+        ))
+        .bind(memory_id)
+        .bind(user_id)
+        .bind(subject_id)
+        .bind(subject_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)
+    }
+
     pub async fn supersede_memory(
         &self,
         table: &str,
@@ -5800,6 +5883,9 @@ impl SqlMemoryStore {
             .await
     }
 
+    /// Search all distinct terms in bounded batches. Fusion is approximate:
+    /// only each batch's top `limit` candidates contribute scores, so a memory
+    /// below every batch's cutoff can be absent even with a high total score.
     #[allow(clippy::too_many_arguments)]
     pub async fn search_fulltext_from_scoped(
         &self,
@@ -5811,57 +5897,165 @@ impl SqlMemoryStore {
         subject_id: Option<&str>,
         memory_types: Option<&[MemoryType]>,
     ) -> Result<Vec<Memory>, MemoriaError> {
-        let safe = sanitize_fulltext_query(query);
-        if safe.is_empty() {
-            return Ok(vec![]);
+        let batches = fulltext_query_batches(query);
+        if batches.is_empty() || limit <= 0 {
+            return Ok(Vec::new());
         }
-        let session_clause = if session_id.is_some() {
-            " AND (session_id = ? OR session_id IS NULL)"
-        } else {
-            ""
+        if batches.len() == 1 {
+            let rows = self
+                .search_fulltext_batch(
+                    table,
+                    user_id,
+                    &batches[0],
+                    limit,
+                    session_id,
+                    subject_id,
+                    memory_types,
+                    true,
+                )
+                .await?;
+            return rows
+                .iter()
+                .map(|row| {
+                    let mut memory = row_to_memory(row)?;
+                    apply_fulltext_score(row, &mut memory);
+                    Ok(memory)
+                })
+                .collect();
+        }
+        // An empty owner scope must not run a large full-text plan over the
+        // index. This also covers search-only benchmark tasks before any Add.
+        let exists: Option<i32> = sqlx::query_scalar(&format!(
+            "SELECT 1 FROM {table} WHERE user_id = ? AND is_active = 1 LIMIT 1"
+        ))
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if exists.is_none() {
+            return Ok(Vec::new());
+        }
+        // Fetch only IDs and scores until fusion determines the final winners.
+        // Keep concurrency bounded and consume in query order so floating-point
+        // score summation is deterministic regardless of completion order.
+        use futures::{stream, StreamExt};
+        let mut pending = stream::iter(batches.into_iter().map(|batch| async move {
+            self.search_fulltext_batch(
+                table,
+                user_id,
+                &batch,
+                limit,
+                session_id,
+                subject_id,
+                memory_types,
+                false,
+            )
+            .await
+        }))
+        .buffered(4);
+        let mut merged = std::collections::HashMap::<String, f64>::new();
+        while let Some(rows) = pending.next().await {
+            for row in rows? {
+                let id: String = row.try_get("memory_id").map_err(db_err)?;
+                *merged.entry(id).or_default() += fulltext_score(&row).unwrap_or(0.0);
+            }
+        }
+        let mut ranked: Vec<_> = merged.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.truncate(limit as usize);
+
+        // Reapply the same scopes when hydrating, in case a row was updated or
+        // deactivated between candidate selection and this read. Use the caller's
+        // table (which can be a branch), not the default memories table.
+        let mut memories = std::collections::HashMap::new();
+        for chunk in ranked.chunks(500) {
+            let mut stmt = QueryBuilder::<MySql>::new(format!(
+                "SELECT {FULLTEXT_MEMORY_COLUMNS} FROM {table} WHERE user_id = "
+            ));
+            stmt.push_bind(user_id).push(" AND is_active = 1");
+            if let Some(session) = session_id {
+                stmt.push(" AND (session_id = ")
+                    .push_bind(session)
+                    .push(" OR session_id IS NULL)");
+            }
+            if let Some(subject) = subject_id {
+                stmt.push(" AND subject_id = ").push_bind(subject);
+            }
+            if let Some(types) = memory_types.filter(|types| !types.is_empty()) {
+                stmt.push(" AND memory_type IN (");
+                let mut separated = stmt.separated(", ");
+                for memory_type in types {
+                    separated.push_bind(memory_type.to_string());
+                }
+                stmt.push(")");
+            }
+            stmt.push(" AND memory_id IN (");
+            let mut separated = stmt.separated(", ");
+            for (id, _) in chunk {
+                separated.push_bind(id);
+            }
+            stmt.push(")");
+            for row in stmt.build().fetch_all(&self.pool).await.map_err(db_err)? {
+                let memory = row_to_memory(&row)?;
+                memories.insert(memory.memory_id.clone(), memory);
+            }
+        }
+        let results = ranked
+            .into_iter()
+            .filter_map(|(id, score)| {
+                memories.remove(&id).map(|mut memory| {
+                    memory.retrieval_score = Some(score);
+                    memory
+                })
+            })
+            .collect();
+        Ok(results)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn search_fulltext_batch(
+        &self,
+        table: &str,
+        user_id: &str,
+        safe: &str,
+        limit: i64,
+        session_id: Option<&str>,
+        subject_id: Option<&str>,
+        memory_types: Option<&[MemoryType]>,
+        include_memory: bool,
+    ) -> Result<Vec<sqlx::mysql::MySqlRow>, MemoriaError> {
+        let session_clause = match session_id {
+            Some(session) => format!(
+                " AND (session_id = '{}' OR session_id IS NULL)",
+                sanitize_sql_literal(session)
+            ),
+            None => String::new(),
         };
-        let subject_clause = if subject_id.is_some() {
-            " AND subject_id = ?"
-        } else {
-            ""
+        let subject_clause = match subject_id {
+            Some(subject) => format!(" AND subject_id = '{}'", sanitize_sql_literal(subject)),
+            None => String::new(),
         };
-        let types_clause = build_memory_types_in_clause(memory_types);
+        let types_clause = build_memory_types_in_clause_inline(memory_types);
+        let columns = if include_memory {
+            FULLTEXT_MEMORY_COLUMNS
+        } else {
+            "memory_id"
+        };
         // Use OR semantics (no + prefix) — AND is too strict for natural language queries
         // because stopwords are removed from the index but +stopword still requires a match.
         let sql = format!(
-            "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
-             embedding AS emb_str, session_id, \
-             CAST(source_event_ids AS CHAR) AS src_ids, \
-             CAST(extra_metadata AS CHAR) AS extra_meta, \
-             is_active, superseded_by, trust_tier, initial_confidence, \
-             observed_at, created_at, updated_at, \
+            "SELECT {columns}, \
              MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) AS ft_score \
              FROM {table} \
-             WHERE user_id = ? AND is_active = 1{session_clause}{subject_clause}{types_clause} \
+             WHERE user_id = '{}' AND is_active = 1{session_clause}{subject_clause}{types_clause} \
                AND MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) \
-             ORDER BY ft_score DESC LIMIT ?"
+             ORDER BY ft_score DESC, memory_id ASC LIMIT {limit}",
+            sanitize_sql_literal(user_id),
         );
-        let mut stmt = sqlx::query(&sql).bind(user_id);
-        if let Some(session_id) = session_id {
-            stmt = stmt.bind(session_id);
-        }
-        if let Some(sid) = subject_id {
-            stmt = stmt.bind(sid);
-        }
-        // Bind each memory_type for the IN clause generated by build_memory_types_in_clause.
-        if let Some(types) = memory_types.filter(|t| !t.is_empty()) {
-            for mt in types {
-                stmt = stmt.bind(mt.to_string());
-            }
-        }
-        let rows = fulltext_rows_or_empty(stmt.bind(limit).fetch_all(&self.pool).await)?;
-        rows.iter()
-            .map(|r| {
-                let mut m = row_to_memory(r)?;
-                apply_fulltext_score(r, &mut m);
-                Ok(m)
-            })
-            .collect()
+        // MatrixOne 4.1.2 can return no rows when re-executing a prepared MATCH
+        // query. Use the text protocol, as in vector search, with escaped scope
+        // literals and an already-sanitized query. Hydration still uses binds.
+        fulltext_rows_or_empty(sqlx::raw_sql(&sql).fetch_all(&self.pool).await)
     }
 
     /// Pure MatrixOne full-text search with exact structured SQL pre-filters.
@@ -6492,6 +6686,24 @@ mod tests {
     static LOG_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[test]
+    fn fulltext_code_underline_does_not_poison_other_terms() {
+        assert_eq!(
+            super::sanitize_fulltext_query("ruff |_______________^ UP028"),
+            "ruff UP028"
+        );
+        assert!(super::fulltext_query_batches("____ !@").is_empty());
+    }
+
+    #[test]
+    fn long_fulltext_queries_preserve_all_distinct_terms_in_bounded_batches() {
+        let words: Vec<_> = (0..3000).map(|i| format!("term{i}")).collect();
+        let query = format!("{} TERM0 term2999", words.join(" "));
+        let batches = super::fulltext_query_batches(&query);
+        assert!(batches.iter().all(|b| b.split_whitespace().count() <= 64));
+        assert_eq!(batches.join(" "), words.join(" "));
+    }
+
+    #[test]
     fn hybrid_merge_keeps_fulltext_scores_out_of_vector_score() {
         let scored_memory = |memory_id: &str, score: f64| Memory {
             memory_id: memory_id.to_string(),
@@ -6741,6 +6953,26 @@ impl MemoryStore for SqlMemoryStore {
              is_active, superseded_by, trust_tier, initial_confidence, \
              observed_at, created_at, updated_at \
              FROM {table} WHERE memory_id = ? AND is_active = 1"
+        ))
+        .bind(memory_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| row_to_memory(&r)).transpose()
+    }
+
+    /// Reads inactive history from main (`mem_memories`) only. For branch-scoped
+    /// observe exclusions, use `observe_exclusion_content_from` with that table.
+    async fn get_including_inactive(&self, memory_id: &str) -> Result<Option<Memory>, MemoriaError> {
+        let table = self.t("mem_memories");
+        let row = sqlx::query(&format!(
+            "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
+             embedding AS emb_str, session_id, \
+             CAST(source_event_ids AS CHAR) AS src_ids, \
+             CAST(extra_metadata AS CHAR) AS extra_meta, \
+             is_active, superseded_by, trust_tier, initial_confidence, \
+             observed_at, created_at, updated_at \
+             FROM {table} WHERE memory_id = ?"
         ))
         .bind(memory_id)
         .fetch_optional(&self.pool)

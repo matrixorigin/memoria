@@ -357,6 +357,7 @@ pub async fn group_main_write_guard(
                                 | "/v1/memories/correct"
                                 | "/v1/memories/purge"
                                 | "/v1/observe"
+                                | "/v1/observe/deduplicated"
                         ) || (path.starts_with("/v1/memories/")
                             && path.ends_with("/correct"));
                         if !branch_aware_body_route {
@@ -1046,6 +1047,10 @@ impl CallLogBatcher {
                         continue;
                     }
                 };
+                if let Err(e) = user_store.ensure_call_log_tool_outcome_schema().await {
+                    warn!("call_log schema repair failed for user {user_id}: {e}");
+                    continue;
+                }
                 let table = user_store.t("mem_api_call_log");
                 if let Err(e) = flush_call_log_chunked(user_store.pool(), &table, &entries).await {
                     warn!("call_log batch flush failed for user {user_id}: {e}");
@@ -1056,6 +1061,10 @@ impl CallLogBatcher {
                     pending.extend(retry_entries);
                 }
             }
+            return;
+        }
+        if let Err(e) = sql.ensure_call_log_tool_outcome_schema().await {
+            warn!("call_log schema repair failed: {e}");
             return;
         }
         if let Err(e) = flush_call_log_chunked(sql.pool(), "mem_api_call_log", &entries).await {
@@ -1413,6 +1422,15 @@ mod tests {
 
     #[test]
     fn classifies_memory_read_and_write_routes() {
+        assert_eq!(
+            required_scope_for_request(&axum::http::Method::POST, "/v1/observe/deduplicated"),
+            Some(SCOPE_MEMORY_WRITE)
+        );
+        assert!(authorize_api_key_route(
+            &axum::http::Method::POST,
+            "/v1/observe/deduplicated",
+            &parse_scopes("memory:read")
+        ).is_err());
         assert_eq!(
             required_scope_for_request(&axum::http::Method::POST, "/v1/memories/retrieve"),
             Some(SCOPE_MEMORY_READ)

@@ -200,7 +200,7 @@ Removes the plugin entry, tool policy additions, managed skills, and the default
 
 ## Compatibility Notes
 
-- `memory_get` is resolved from recent tool results plus a bounded scan (Rust MCP has no direct get-by-id)
+- `memory_get` is served from recent tool results, or looked up by ID (`GET /v1/memories/{id}`) on a cache miss; only active memories are returned
 - `memory_stats` is derived from available MCP outputs (inactive-memory and entity totals not currently available)
 - `memory_entities` is not exposed (no matching Rust MCP tool)
 - Old `mysql+pymysql://...` DSNs are normalized to `mysql://...` automatically

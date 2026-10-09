@@ -170,6 +170,221 @@ async fn test_search_fulltext() {
 }
 
 #[tokio::test]
+async fn test_fulltext_batches_merge_scores_limit_and_scopes() {
+    let (store, uid) = setup().await;
+    // Exercise escaping in the text-protocol candidate query and bind-based
+    // hydration with the same owner, session, and subject scopes.
+    let uid = format!("{uid}'\\owner");
+    let session = "sess-'\\1";
+    let subject = "batch-'\\subject";
+    let terms: Vec<_> = (0..130).map(|i| format!("batchprobe{i:03}")).collect();
+    let query = terms.join(" ");
+    let all_matches = format!("{} {} {}", terms[0], terms[64], terms[129]);
+    let mut overlap = make_memory(&format!("ft-overlap-{uid}"), &all_matches, &uid);
+    overlap.session_id = Some(session.into());
+    overlap.subject_id = Some(subject.into());
+    overlap.extra_metadata = Some(std::collections::HashMap::from([(
+        "source".into(),
+        serde_json::json!("batch-test"),
+    )]));
+    let mut first = overlap.clone();
+    first.memory_id = format!("ft-first-{uid}");
+    first.content = format!("{} irrelevant padding", terms[0]);
+    let mut tail = overlap.clone();
+    tail.memory_id = format!("ft-tail-{uid}");
+    tail.content = format!("{} irrelevant padding", terms[129]);
+    // Session-scoped retrieval must also include global memories, and an IN
+    // filter must accept every requested type.
+    tail.session_id = None;
+    tail.memory_type = MemoryType::Profile;
+    for memory in [&overlap, &first, &tail] {
+        store.insert(memory).await.expect("insert matching memory");
+    }
+    for excluded in [
+        "owner",
+        "session",
+        "subject",
+        "null-subject",
+        "type",
+        "inactive",
+    ] {
+        let mut memory = overlap.clone();
+        memory.memory_id = format!("ft-x-{excluded}-{uid}");
+        match excluded {
+            "owner" => memory.user_id = format!("other-{uid}"),
+            "session" => memory.session_id = Some("other-session".into()),
+            "subject" => memory.subject_id = Some("other-subject".into()),
+            "null-subject" => memory.subject_id = None,
+            "type" => memory.memory_type = MemoryType::Working,
+            "inactive" => {}
+            _ => unreachable!(),
+        }
+        store.insert(&memory).await.expect("insert excluded memory");
+        if excluded == "inactive" {
+            store
+                .soft_delete(&memory.memory_id)
+                .await
+                .expect("deactivate memory");
+        }
+    }
+
+    let types = [MemoryType::Semantic, MemoryType::Profile];
+    // Obtain actual DB scores from the individual batches. This avoids assuming
+    // a particular full-text scoring algorithm or a fixed corpus-wide IDF.
+    let mut expected = std::collections::HashMap::<String, f64>::new();
+    let mut overlap_scores = Vec::new();
+    for batch in terms.chunks(64) {
+        let rows = store
+            .search_fulltext_from_scoped(
+                "mem_memories",
+                &uid,
+                &batch.join(" "),
+                2,
+                Some(session),
+                Some(subject),
+                Some(&types),
+            )
+            .await
+            .expect("single batch");
+        for memory in rows {
+            let score = memory.retrieval_score.expect("lexical score");
+            assert!(score > 0.0);
+            if memory.memory_id == overlap.memory_id {
+                overlap_scores.push(score);
+            }
+            *expected.entry(memory.memory_id).or_default() += score;
+        }
+    }
+    assert_eq!(overlap_scores.len(), 3, "one memory must match all batches");
+    assert_eq!(expected.len(), 3, "candidate union must exceed final limit");
+    let mut expected: Vec<_> = expected.into_iter().collect();
+    expected.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    expected.truncate(2);
+
+    let results = store
+        .search_fulltext_from_scoped(
+            "mem_memories",
+            &uid,
+            &query,
+            2,
+            Some(session),
+            Some(subject),
+            Some(&types),
+        )
+        .await
+        .expect("merged fulltext search");
+    assert_eq!(
+        results.len(),
+        2,
+        "limit applies after merging and deduplication"
+    );
+    assert_eq!(results[0].memory_id, overlap.memory_id);
+    for (memory, (id, score)) in results.iter().zip(&expected) {
+        assert_eq!(&memory.memory_id, id);
+        assert!((memory.retrieval_score.unwrap() - score).abs() < 1e-6);
+        assert_eq!(memory.user_id, uid);
+        assert_eq!(memory.subject_id.as_deref(), Some(subject));
+        assert!(memory.session_id.is_none() || memory.session_id.as_deref() == Some(session));
+        assert!(types.contains(&memory.memory_type));
+        assert!(memory.is_active);
+        assert_eq!(memory.source_event_ids, overlap.source_event_ids);
+        assert_eq!(memory.extra_metadata, overlap.extra_metadata);
+        let embedding = memory
+            .embedding
+            .as_ref()
+            .expect("final rows include embeddings");
+        assert_eq!(embedding.len(), test_dim());
+        assert!((embedding[0] - 0.1).abs() < 1e-4);
+    }
+    assert_eq!(results[0].content, all_matches);
+
+    // Without optional filters, the multi-batch hydration must retain the
+    // session/subject/type variants while still excluding other owners/deletes.
+    let unscoped = store
+        .search_fulltext(&uid, &query, 20)
+        .await
+        .expect("unscoped merge");
+    assert_eq!(unscoped.len(), 7);
+    assert!(unscoped.iter().all(|m| m.user_id == uid && m.is_active));
+    assert!(store
+        .search_fulltext(&uid, &query, 0)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .search_fulltext(&uid, "____ !@", 2)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn test_fulltext_batches_empty_owner_short_circuits() {
+    let (store, uid) = setup().await;
+    let table = format!("ft_empty_{}", Uuid::new_v4().simple());
+    // Deliberately omit content and the full-text index: any attempted batch
+    // query fails, so this verifies the early return rather than just no hits.
+    sqlx::query(&format!(
+        "CREATE TABLE {table} (user_id VARCHAR(128), is_active BOOLEAN)"
+    ))
+    .execute(store.pool())
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "INSERT INTO {table} (user_id, is_active) VALUES (?, 0), (?, 1)"
+    ))
+    .bind(&uid)
+    .bind(format!("other-{uid}"))
+    .execute(store.pool())
+    .await
+    .unwrap();
+    let query = (0..65)
+        .map(|i| format!("emptyprobe{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let result = store.search_fulltext_from(&table, &uid, &query, 5).await;
+    sqlx::query(&format!("DROP TABLE {table}"))
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert!(result
+        .expect("empty owner must skip full-text SQL")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn test_fulltext_case_insensitive_single_batch() {
+    let (store, uid) = setup().await;
+    let store = store
+        .spawn_background_store(1)
+        .await
+        .expect("single-connection store");
+    let memory = make_memory(&format!("ft-case-{uid}"), "MiXeDCaSePrObE", &uid);
+    store.insert(&memory).await.unwrap();
+    // Query MatrixOne directly as well as the public path: the latter lowercases
+    // its input and alone cannot prove the database's own matching semantics.
+    for query in ["mixedcaseprobe", "MIXEDCASEPROBE", "MiXeDCaSePrObE"] {
+        let ids: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT memory_id FROM mem_memories WHERE user_id = ? \
+             AND MATCH(content) AGAINST('{query}' IN BOOLEAN MODE)"
+        ))
+        .bind(&uid)
+        .fetch_all(store.pool())
+        .await
+        .expect("raw MATCH");
+        assert_eq!(ids, vec![memory.memory_id.clone()]);
+        let results = store.search_fulltext(&uid, query, 5).await.unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "public search for {query}; raw IDs: {ids:?}"
+        );
+        assert_eq!(results[0].memory_id, memory.memory_id);
+        assert!(results[0].retrieval_score.unwrap() > 0.0);
+    }
+}
+
+#[tokio::test]
 async fn test_search_vector() {
     let (store, uid) = setup().await;
 

@@ -331,7 +331,7 @@ function buildMemoryStatsPayload(
 function buildCapabilitiesPayload(config: MemoriaPluginConfig): Record<string, unknown> {
   const limitations = [
     "OpenClaw reserves `openclaw memory` for built-in file-memory commands; compatibility CLI is exposed as `openclaw ltm`.",
-    "memory_get is resolved from recent tool results plus a bounded Rust MCP scan; if an older memory is missing, rerun memory_search or memory_list first.",
+    "memory_get is served from recent tool results, or looked up by ID through the Memoria API on a cache miss; only active memories are returned.",
   ];
 
   return {
