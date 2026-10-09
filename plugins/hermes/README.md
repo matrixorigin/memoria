@@ -72,14 +72,26 @@ Do not overwrite an existing `plugins/memoria` directory without checking its co
 After installing with any of the methods above:
 
 ```sh
-hermes memory setup memoria
+hermes memory setup
+```
+
+In the interactive provider picker, select **memoria**. At the Memoria API Key
+prompt, paste your key; the input is masked. If a key is already configured,
+press Enter to keep it or paste a replacement. Then choose `true` or `false`
+for automatic capture and check the resulting configuration:
+
+```sh
 hermes memory status
 ```
 
 Log in at [Memoria](https://thememoria.ai), create/copy a memory-service API Key,
-and paste it into setup. The website login session token
+and paste it into the interactive setup prompt. The website login session token
 is not the API Key. Hermes stores `MEMORIA_API_KEY` in the active profile's secret
 store; never put it in `memoria.json` or in a shell command.
+
+Use the interactive command above for initial configuration. In the tested Hermes
+CLI, `hermes memory setup memoria` only prepares dependencies and activates the
+provider; it does **not** prompt for the API key or automatic capture.
 
 Setup also asks whether to upload completed user/assistant turns for background
 fact extraction. This is **off until opted in**. Auto recall and explicit memory
@@ -92,7 +104,7 @@ For example, install and configure the plugin in `memoria-acceptance`:
 hermes -p memoria-acceptance plugins install 'https://github.com/matrixorigin/memoria#plugins/hermes' \
   --ref 3a5c5065b2820d56dd3d8ac8bb259a9424b1476e \
   --yes-deps --enable
-hermes -p memoria-acceptance memory setup memoria
+hermes -p memoria-acceptance memory setup
 hermes -p memoria-acceptance memory status
 ```
 
