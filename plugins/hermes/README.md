@@ -18,10 +18,21 @@ Requires Hermes ≥ 0.21.5 and its Python ≥ 3.11. The tested Hermes checkout i
 Hermes releases sharing a version number may have different plugin APIs; run
 `hermes plugins validate` on the actual target installation.
 
-Choose one of the following installation methods, then complete the shared
+Choose one of the following installation methods. The GitHub guide below includes
+configuration and a first conversation; the other methods use the shared
 [setup steps](#configure-memoria).
 
 ### 1. Install from GitHub
+
+These steps use the default Hermes profile. For an existing named profile, add
+`-p <profile-name>` to **every** Hermes command below.
+
+**Step 1: Get a Memoria API key.**
+
+Log in at [Memoria](https://thememoria.ai) and create/copy a memory-service API Key.
+Keep it ready for the setup prompt; the website login session token is not the API Key.
+
+**Step 2: Install the plugin.**
 
 Install the commit verified in the October 9, 2026 local CLI acceptance:
 
@@ -33,7 +44,53 @@ hermes plugins install 'https://github.com/matrixorigin/memoria#plugins/hermes' 
 
 The `#plugins/hermes` suffix selects the plugin directory inside the Memoria
 repository. `--yes-deps` authorizes preparation of its declared Python dependencies;
-`--enable` selects Memoria as the memory provider. Configure your API key next.
+`--enable` selects Memoria as the memory provider.
+
+**Step 3: Configure the API key and automatic capture.**
+
+Run the interactive setup wizard:
+
+```sh
+hermes memory setup
+```
+
+Select **memoria** in the provider picker, then paste your API key at the
+Memoria API Key prompt. Input is masked. If a key is already configured, press
+Enter to keep it or paste a replacement.
+
+At the automatic capture prompt, enter `true` to upload completed user/assistant
+turns for background fact extraction, or `false` to use recall and explicit
+memory tools without automatic uploads. Tool results are excluded from capture.
+
+Use `hermes memory setup` for this step. In the tested Hermes CLI,
+`hermes memory setup memoria` only activates the provider and does not prompt for
+the key or capture setting.
+
+**Step 4: Check the configuration.**
+
+```sh
+hermes memory status
+```
+
+Check that the provider is `memoria`, the plugin is installed, and its status is
+`available`. If `MEMORIA_API_KEY` is listed as missing, repeat Step 3 in the same
+profile. This checks local readiness; it does not verify a request to Memoria Cloud.
+
+**Step 5: Start a new conversation.**
+
+Exit any existing Hermes conversation and start a new one:
+
+```sh
+hermes
+```
+
+Hermes also needs a configured chat-model provider and its credentials. The
+Memoria API key authenticates memory operations only.
+
+To check a real memory write, say: "Remember that I prefer unsweetened coffee."
+Confirm that `memoria_store` succeeds, then exit and start another conversation
+with `hermes`. Ask: "How do I like my coffee?" Check that the answer recalls the
+saved preference. You can then ask Hermes to forget that test preference.
 
 ### 2. Install from the Hermes catalog (after acceptance)
 
