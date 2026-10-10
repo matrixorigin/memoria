@@ -533,6 +533,46 @@ async fn test_purge_by_topic_special_chars_verify_db() {
 
 #[tokio::test]
 #[serial]
+async fn test_purge_by_topic_treats_like_wildcards_literally_verify_db() {
+    let (base, client, server) = spawn_server().await;
+    let uid = uid();
+
+    // `_` and `%` in a topic are literal: purging "cfg_key" must not delete
+    // "cfgXkey", and "50%" must not delete "500 units".
+    for content in [
+        "rotate cfg_key monthly",
+        "rotate cfgXkey monthly",
+        "discount 50% applied",
+        "discount 500 units applied",
+    ] {
+        client
+            .post(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"content": content}))
+            .send()
+            .await
+            .unwrap();
+    }
+    assert_eq!(db_count_active(&server, &uid).await, 4);
+
+    for topic in ["cfg_key", "50%"] {
+        let r = client
+            .post(format!("{base}/v1/memories/purge"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"topic": topic}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body: Value = r.json().await.unwrap();
+        assert_eq!(body["purged"], 1, "topic {topic:?} must match literally");
+    }
+
+    assert_eq!(db_count_active(&server, &uid).await, 2);
+}
+
+#[tokio::test]
+#[serial]
 async fn test_purge_by_topic_batch_perf_verify_db() {
     let (base, client, server) = spawn_server().await;
     let uid = uid();
