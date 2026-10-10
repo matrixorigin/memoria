@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import builtins
+from typing import TYPE_CHECKING, Any, cast
 
 from ..models import ApplyResult, Branch
 
@@ -39,7 +40,7 @@ class BranchesResource:
 
     def diff(self, name: str) -> dict[str, Any]:
         """Return high-level diff statistics (no pagination)."""
-        return self._client._request("GET", f"/v1/branches/{name}/diff")  # type: ignore[return-value]
+        return cast(dict[str, Any], self._client._request("GET", f"/v1/branches/{name}/diff"))
 
     def diff_items(
         self,
@@ -50,8 +51,9 @@ class BranchesResource:
     ) -> dict[str, Any]:
         """Return per-entry diff with optional pagination."""
         params = _strip_none({"limit": limit, "cursor": cursor})
-        return self._client._request(  # type: ignore[return-value]
-            "GET", f"/v1/branches/{name}/diff-items", params=params
+        return cast(
+            dict[str, Any],
+            self._client._request("GET", f"/v1/branches/{name}/diff-items", params=params),
         )
 
     def merge(self, name: str, *, strategy: str = "accept") -> None:
@@ -64,10 +66,10 @@ class BranchesResource:
         self,
         name: str,
         *,
-        adds: list[str] | None = None,
-        removes: list[str] | None = None,
-        updates: list[dict[str, str]] | None = None,
-        accept_branch_conflicts: list[str] | None = None,
+        adds: builtins.list[str] | None = None,
+        removes: builtins.list[str] | None = None,
+        updates: builtins.list[dict[str, str]] | None = None,
+        accept_branch_conflicts: builtins.list[str] | None = None,
     ) -> ApplyResult:
         body = _strip_none(
             {
@@ -97,8 +99,9 @@ class BranchesResource:
                 "dry_run": dry_run,
             }
         )
-        return self._client._request(  # type: ignore[return-value]
-            "POST", f"/v1/branches/{name}/pick", json=body
+        return cast(
+            dict[str, Any],
+            self._client._request("POST", f"/v1/branches/{name}/pick", json=body),
         )
 
 
@@ -125,7 +128,9 @@ class AsyncBranchesResource:
         await self._client._arequest("POST", f"/v1/branches/{name}/checkout", json={})
 
     async def diff(self, name: str) -> dict[str, Any]:
-        return await self._client._arequest("GET", f"/v1/branches/{name}/diff")  # type: ignore[return-value]
+        return cast(
+            dict[str, Any], await self._client._arequest("GET", f"/v1/branches/{name}/diff")
+        )
 
     async def diff_items(
         self,
@@ -135,8 +140,9 @@ class AsyncBranchesResource:
         cursor: str | None = None,
     ) -> dict[str, Any]:
         params = _strip_none({"limit": limit, "cursor": cursor})
-        return await self._client._arequest(  # type: ignore[return-value]
-            "GET", f"/v1/branches/{name}/diff-items", params=params
+        return cast(
+            dict[str, Any],
+            await self._client._arequest("GET", f"/v1/branches/{name}/diff-items", params=params),
         )
 
     async def merge(self, name: str, *, strategy: str = "accept") -> None:
@@ -151,10 +157,10 @@ class AsyncBranchesResource:
         self,
         name: str,
         *,
-        adds: list[str] | None = None,
-        removes: list[str] | None = None,
-        updates: list[dict[str, str]] | None = None,
-        accept_branch_conflicts: list[str] | None = None,
+        adds: builtins.list[str] | None = None,
+        removes: builtins.list[str] | None = None,
+        updates: builtins.list[dict[str, str]] | None = None,
+        accept_branch_conflicts: builtins.list[str] | None = None,
     ) -> ApplyResult:
         body = _strip_none(
             {
@@ -184,6 +190,7 @@ class AsyncBranchesResource:
                 "dry_run": dry_run,
             }
         )
-        return await self._client._arequest(  # type: ignore[return-value]
-            "POST", f"/v1/branches/{name}/pick", json=body
+        return cast(
+            dict[str, Any],
+            await self._client._arequest("POST", f"/v1/branches/{name}/pick", json=body),
         )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 from typing import TYPE_CHECKING, Any
 
 from ..exceptions import MemoriaValidationError
@@ -28,10 +29,14 @@ class SnapshotsResource:
         params = {"limit": limit, "offset": offset}
         data = self._client._request("GET", "/v1/snapshots", params=params)
         # Server may return {"snapshots": [...], "has_more": bool} or a plain list
+        # An empty body (204) or a null field would otherwise be iterated as None.
+        items: builtins.list[Any]
         if isinstance(data, dict):
-            items = data.get("snapshots", data.get("items", []))
-        else:
+            items = data.get("snapshots") or data.get("items") or []
+        elif isinstance(data, builtins.list):
             items = data
+        else:
+            items = []
         return [Snapshot.from_dict(s) for s in items]
 
     def rollback(self, name: str) -> None:
@@ -41,7 +46,7 @@ class SnapshotsResource:
         self,
         name: str | None = None,
         *,
-        names: list[str] | None = None,
+        names: builtins.list[str] | None = None,
         prefix: str | None = None,
         older_than: str | None = None,
     ) -> None:
@@ -85,10 +90,14 @@ class AsyncSnapshotsResource:
     async def list(self, *, limit: int = 20, offset: int = 0) -> list[Snapshot]:
         params = {"limit": limit, "offset": offset}
         data = await self._client._arequest("GET", "/v1/snapshots", params=params)
+        # An empty body (204) or a null field would otherwise be iterated as None.
+        items: builtins.list[Any]
         if isinstance(data, dict):
-            items = data.get("snapshots", data.get("items", []))
-        else:
+            items = data.get("snapshots") or data.get("items") or []
+        elif isinstance(data, builtins.list):
             items = data
+        else:
+            items = []
         return [Snapshot.from_dict(s) for s in items]
 
     async def rollback(self, name: str) -> None:
@@ -98,7 +107,7 @@ class AsyncSnapshotsResource:
         self,
         name: str | None = None,
         *,
-        names: list[str] | None = None,
+        names: builtins.list[str] | None = None,
         prefix: str | None = None,
         older_than: str | None = None,
     ) -> None:

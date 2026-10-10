@@ -149,7 +149,7 @@ def _map_error(resp: httpx.Response) -> MemoriaAPIError:
 
 def _backoff(attempt: int) -> float:
     """Exponential backoff: 0.5s, 1s, 2s, …"""
-    return 0.5 * (2 ** attempt)
+    return 0.5 * float(2**attempt)
 
 
 class _HttpTransport:
