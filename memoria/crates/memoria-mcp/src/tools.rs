@@ -165,7 +165,11 @@ enum ToolCallName {
 }
 
 const MEMORY_STORE_DESCRIPTION: &str = concat!(
-    "Store a new memory. Set trust_tier explicitly when certainty matters: ",
+    "Store a new memory. Prefer a distilled, durable fact over information that is only true ",
+    "in the moment (e.g. extract the fact behind a live query, not the live answer itself), and ",
+    "extract the relevant fact from raw or structured content (JSON, logs, tool output) rather ",
+    "than storing it verbatim. ",
+    "Set trust_tier explicitly when certainty matters: ",
     "T1 for directly stated or explicitly confirmed facts/preferences/decisions, ",
     "T2 for curated or corrected records, T3 for inferred summaries or soft conclusions ",
     "(prefer T3 if unsure), T4 for speculative or unverified hypotheses."
