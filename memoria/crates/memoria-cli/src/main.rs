@@ -1591,24 +1591,86 @@ fn write_rule(path: &Path, content: &str, force: bool, project_dir: &Path) -> St
     format!("  ✓ {}{}", relative.display(), ver)
 }
 
-fn write_mcp_json(path: &Path, entry: &serde_json::Value, project_dir: &Path) -> String {
-    let relative = path.strip_prefix(project_dir).unwrap_or(path);
-    let wrapper = serde_json::json!({ "mcpServers": { MCP_KEY: entry } });
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
 
+/// Load an existing MCP config the memoria entry can be merged into.
+/// `Err` carries a human-readable reason the file is not mergeable.
+fn load_mergeable_mcp_json(path: &Path) -> Result<serde_json::Value, String> {
+    let content = std::fs::read_to_string(path).map_err(|e| format!("unreadable: {e}"))?;
+    let existing: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("invalid JSON: {e}"))?;
+    if !existing.is_object() {
+        return Err(format!(
+            "expected a JSON object, found {}",
+            json_kind(&existing)
+        ));
+    }
+    // `existing["mcpServers"][MCP_KEY] = …` panics unless both levels are objects;
+    // an absent or null `mcpServers` is turned into one by the assignment itself.
+    match existing.get("mcpServers") {
+        None | Some(serde_json::Value::Null) | Some(serde_json::Value::Object(_)) => Ok(existing),
+        Some(other) => Err(format!(
+            "\"mcpServers\" must be a JSON object, found {}",
+            json_kind(other)
+        )),
+    }
+}
+
+fn write_mcp_json(
+    path: &Path,
+    entry: &serde_json::Value,
+    project_dir: &Path,
+    force: bool,
+) -> String {
+    let relative = path.strip_prefix(project_dir).unwrap_or(path);
+
+    let mut replaced: Option<String> = None;
     if path.exists() {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            if let Ok(mut existing) = serde_json::from_str::<serde_json::Value>(&content) {
+        match load_mergeable_mcp_json(path) {
+            Ok(mut existing) => {
                 existing["mcpServers"][MCP_KEY] = entry.clone();
-                std::fs::write(path, serde_json::to_string_pretty(&existing).unwrap()).ok();
-                return format!("  ✓ {} (updated memoria entry)", relative.display());
+                let json = serde_json::to_string_pretty(&existing).unwrap();
+                return match std::fs::write(path, json) {
+                    Ok(()) => format!("  ✓ {} (updated memoria entry)", relative.display()),
+                    Err(e) => format!("  ⚠ {} (write failed: {e})", relative.display()),
+                };
             }
+            // A file we cannot read or parse is a configuration error, not a missing
+            // file. Replacing it would silently discard the user's other MCP servers,
+            // so keep the original bytes untouched unless the caller insists.
+            Err(reason) if !force => {
+                return format!(
+                    "  ⚠ {} ({reason}) — left unchanged; fix the file or re-run with --force",
+                    relative.display()
+                );
+            }
+            Err(reason) => replaced = Some(reason),
         }
     }
+
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return format!("  ⚠ {} (cannot create directory: {e})", relative.display());
+        }
     }
-    std::fs::write(path, serde_json::to_string_pretty(&wrapper).unwrap()).ok();
-    format!("  ✓ {} (created)", relative.display())
+    let wrapper = serde_json::json!({ "mcpServers": { MCP_KEY: entry } });
+    let json = serde_json::to_string_pretty(&wrapper).unwrap();
+    match std::fs::write(path, json) {
+        Ok(()) => match replaced {
+            Some(reason) => format!("  ✓ {} (replaced — was {reason})", relative.display()),
+            None => format!("  ✓ {} (created)", relative.display()),
+        },
+        Err(e) => format!("  ⚠ {} (write failed: {e})", relative.display()),
+    }
 }
 
 fn configure_kiro(project_dir: &Path, entry: &serde_json::Value, force: bool) -> Vec<String> {
@@ -1618,6 +1680,7 @@ fn configure_kiro(project_dir: &Path, entry: &serde_json::Value, force: bool) ->
             &project_dir.join(".kiro/settings/mcp.json"),
             entry,
             project_dir,
+            force,
         ),
         write_rule(
             &steering.join("memory.md"),
@@ -1655,7 +1718,7 @@ fn configure_kiro(project_dir: &Path, entry: &serde_json::Value, force: bool) ->
 fn configure_cursor(project_dir: &Path, entry: &serde_json::Value, force: bool) -> Vec<String> {
     let rules = project_dir.join(".cursor/rules");
     vec![
-        write_mcp_json(&project_dir.join(".cursor/mcp.json"), entry, project_dir),
+        write_mcp_json(&project_dir.join(".cursor/mcp.json"), entry, project_dir, force),
         write_rule(&rules.join("memory.mdc"), CURSOR_RULE, force, project_dir),
         write_rule(
             &rules.join("session-lifecycle.mdc"),
@@ -1690,6 +1753,7 @@ fn configure_claude(project_dir: &Path, entry: &serde_json::Value, force: bool) 
         &project_dir.join(".mcp.json"),
         entry,
         project_dir,
+        force,
     )];
     results.push(write_rule(
         &rules.join("memory.md"),
@@ -3928,5 +3992,89 @@ mod tests {
             entry_embedded["autoApprove"].is_array(),
             "autoApprove must be present in embedded mode too"
         );
+    }
+
+    // ── write_mcp_json: never discard a config we failed to parse ────────────
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("memoria-mcp-json-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_entry(dir: &std::path::Path, force: bool) -> (String, String) {
+        let path = dir.join("mcp.json");
+        let message =
+            super::write_mcp_json(&path, &serde_json::json!({"command": "memoria"}), dir, force);
+        (message, std::fs::read_to_string(&path).unwrap())
+    }
+
+    #[test]
+    fn write_mcp_json_keeps_unparseable_config_without_force() {
+        let dir = scratch_dir("invalid");
+        let original = r#"{"mcpServers":{"existing":{"command":"keep-me"}},"custom":"keep",}"#;
+        std::fs::write(dir.join("mcp.json"), original).unwrap();
+
+        let (message, after) = write_entry(&dir, false);
+        assert_eq!(after, original, "original bytes must be preserved");
+        assert!(message.contains("invalid JSON"), "{message}");
+        assert!(message.contains("left unchanged"), "{message}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_mcp_json_rejects_non_object_mcp_servers_instead_of_panicking() {
+        let dir = scratch_dir("shape");
+        let original = r#"{"mcpServers":[]}"#;
+        std::fs::write(dir.join("mcp.json"), original).unwrap();
+
+        let (message, after) = write_entry(&dir, false);
+        assert_eq!(after, original, "original bytes must be preserved");
+        assert!(message.contains("must be a JSON object"), "{message}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_mcp_json_merges_into_a_valid_config() {
+        let dir = scratch_dir("valid");
+        std::fs::write(
+            dir.join("mcp.json"),
+            r#"{"mcpServers":{"existing":{"command":"keep-me"}},"custom":"keep"}"#,
+        )
+        .unwrap();
+
+        let (message, after) = write_entry(&dir, false);
+        let parsed: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(parsed["mcpServers"]["existing"]["command"], "keep-me");
+        assert_eq!(parsed["mcpServers"][super::MCP_KEY]["command"], "memoria");
+        assert_eq!(parsed["custom"], "keep");
+        assert!(message.contains("updated memoria entry"), "{message}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_mcp_json_replaces_unparseable_config_with_force() {
+        let dir = scratch_dir("forced");
+        std::fs::write(dir.join("mcp.json"), r#"{"bad json",}"#).unwrap();
+
+        let (message, after) = write_entry(&dir, true);
+        let parsed: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(parsed["mcpServers"][super::MCP_KEY]["command"], "memoria");
+        assert!(message.contains("replaced"), "{message}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_mcp_json_creates_a_missing_config() {
+        let dir = scratch_dir("missing");
+        let (message, after) = write_entry(&dir, false);
+        let parsed: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(parsed["mcpServers"][super::MCP_KEY]["command"], "memoria");
+        assert!(message.contains("created"), "{message}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
