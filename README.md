@@ -403,7 +403,7 @@ If you're an AI agent helping a user set up Memoria:
 3. **Run `memoria init -i`** in the user's project directory
 4. **Tell user to restart** their AI tool, then **verify** with `memory_retrieve("test")`
 
-> **Self-Hosted only:** Configure embedding BEFORE first MCP server start — dimension is locked into schema.
+> **Self-Hosted only:** Embedding dimension defaults to auto-infer (`EMBEDDING_DIM=0`): Memoria probes the embedding service on startup. Set `EMBEDDING_DIM` explicitly if the service may be unavailable at boot. The dimension is locked into the database schema on first run.
 
 ---
 

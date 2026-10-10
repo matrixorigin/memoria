@@ -2726,6 +2726,52 @@ impl SqlMemoryStore {
         Ok(())
     }
 
+    /// Check that the configured embedding dimension matches the dimension
+    /// already stored in the database schema.
+    ///
+    /// If `mem_memories` already exists with a different dimension, returning
+    /// an error here is far better than silently failing on the first INSERT.
+    /// Called after `migrate()` so the table is guaranteed to exist.
+    ///
+    /// # Errors
+    /// Returns [`MemoriaError::Internal`] when a mismatch is detected,
+    /// with a human-readable message explaining how to resolve it.
+    pub async fn check_embedding_dim_compat(&self) -> Result<(), MemoriaError> {
+        // Query the actual column type stored in the schema, e.g. "vecf32(768)"
+        let col_type: Option<String> = sqlx::query_scalar(
+            "SELECT column_type \
+             FROM information_schema.columns \
+             WHERE table_schema = DATABASE() \
+               AND table_name   = 'mem_memories' \
+               AND column_name  = 'embedding'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        if let Some(ct) = col_type {
+            // Parse "vecf32(768)" → 768
+            if let Ok(schema_dim) = ct
+                .trim_start_matches("vecf32(")
+                .trim_end_matches(')')
+                .parse::<usize>()
+            {
+                if schema_dim != self.embedding_dim {
+                    return Err(MemoriaError::Internal(format!(
+                        "Embedding dimension mismatch: the database schema has \
+                         {}d vectors but Memoria is configured for {}d. \
+                         To fix: either set EMBEDDING_DIM={} to match the \
+                         existing schema, or drop the database (data loss) and \
+                         restart to rebuild with the new dimension.",
+                        schema_dim, self.embedding_dim, schema_dim
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     // ── Audit log ─────────────────────────────────────────────────────────────
 
     /// Create a safety snapshot before destructive operations. Best-effort.
