@@ -586,13 +586,37 @@ Personal mode users won't see this. SDK exposes `MemoriaForbiddenError` for grou
 
 ### Retry Policy
 
-| Condition | Retry? |
-|-----------|--------|
-| 5xx / network errors | Yes — exponential backoff (`max_retries=3`) |
-| 401 | No |
-| 403 | No |
-| 422 | No (caller bug) |
-| Other 4xx | No |
+Retry eligibility depends on whether repeating the request can create something.
+Idempotent methods (GET/HEAD/PUT/DELETE/OPTIONS/TRACE) are safe to repeat;
+non-idempotent ones (POST/PATCH) are not, and no status code or transport error
+proves the server did *not* already commit the write — a gateway can return 504
+while the upstream keeps going and commits, and a connection can drop after the
+write but before the response. Without an idempotency key there is no way to
+retry such a write safely, so by default the SDK does not.
+
+Eligibility is per *operation*, not purely per HTTP verb: `memories.correct()`
+uses `PUT /v1/memories/{id}/correct` but is **not** idempotent — the server
+mints a replacement record and supersedes the original, so a replay either 404s
+on the already-superseded memory or creates a second replacement. It is
+classified with the non-idempotent column below.
+
+| Condition | Idempotent (GET/PUT/DELETE/…) | Non-idempotent (POST/PATCH, `memories.correct`) |
+|-----------|-------------------------------|------------------------------|
+| 500 | Yes — exponential backoff (`max_retries=3`) | No |
+| 502 / 503 / 504 | Yes | No — opt in with `retry_unsafe_writes=True` |
+| `ConnectError` (never reached the server) | Yes | Yes |
+| Other transport errors (timeout, dropped connection, disconnect before response, proxy failure) | Yes | No — opt in with `retry_unsafe_writes=True` |
+| 401 / 403 / 422 / other 4xx | No | No |
+
+Every `httpx.TransportError` — including `RemoteProtocolError` ("server
+disconnected without sending a response"), which is a sibling of `NetworkError`
+rather than a subclass — is surfaced as `MemoriaConnectionError`, with the
+original exception preserved as `__cause__`.
+
+`retry_unsafe_writes=True` trades at-most-once for resilience: a write whose
+response was lost may be committed twice. Note that `memories.store` is
+additionally protected server-side by near-duplicate detection, which supersedes
+rather than duplicates identical content; other write endpoints are not.
 
 ---
 

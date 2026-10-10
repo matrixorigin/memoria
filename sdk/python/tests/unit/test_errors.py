@@ -20,6 +20,13 @@ def client_with_retry() -> MemoriaClient:
     return MemoriaClient(base_url=BASE_URL, api_key=API_KEY, max_retries=2)
 
 
+@pytest.fixture
+def client_retrying_writes() -> MemoriaClient:
+    return MemoriaClient(
+        base_url=BASE_URL, api_key=API_KEY, max_retries=2, retry_unsafe_writes=True
+    )
+
+
 def test_500_raises_server_error(httpx_mock: HTTPXMock, client_no_retry: MemoriaClient) -> None:
     httpx_mock.add_response(status_code=500, json={"detail": "internal error"})
     with pytest.raises(MemoriaServerError) as exc:
@@ -38,24 +45,48 @@ def test_500_on_post_not_retried(
     assert len(httpx_mock.get_requests()) == 1
 
 
-def test_502_on_post_retried_then_succeeds(
-    httpx_mock: HTTPXMock, client_with_retry: MemoriaClient
+@pytest.mark.parametrize("status", [502, 503, 504])
+def test_gateway_error_on_post_not_retried_by_default(
+    httpx_mock: HTTPXMock, client_with_retry: MemoriaClient, status: int
 ) -> None:
-    # 502/503/504 are gateway errors; POST is safe to retry (server did not process).
-    httpx_mock.add_response(status_code=502, json={"detail": "bad gateway"})
-    httpx_mock.add_response(status_code=502, json={"detail": "bad gateway"})
+    # A gateway error does not prove the upstream skipped the write: it can fire
+    # after a commit (notably 504). Without an idempotency key the only safe
+    # default for a non-idempotent method is to surface the error.
+    httpx_mock.add_response(status_code=status, json={"detail": "gateway"})
+    with pytest.raises(MemoriaServerError):
+        client_with_retry.memories.store(content="x")
+    assert len(httpx_mock.get_requests()) == 1
+
+
+@pytest.mark.parametrize("status", [502, 503, 504])
+def test_gateway_error_on_post_retried_when_opted_in(
+    httpx_mock: HTTPXMock, client_retrying_writes: MemoriaClient, status: int
+) -> None:
+    httpx_mock.add_response(status_code=status, json={"detail": "gateway"})
     httpx_mock.add_response(json=MEMORY_STUB)
-    mem = client_with_retry.memories.store(content="x")
+    mem = client_retrying_writes.memories.store(content="x")
     assert mem.memory_id == "mem_abc123"
+    assert len(httpx_mock.get_requests()) == 2
 
 
-def test_502_exhausted_retries_raises(
-    httpx_mock: HTTPXMock, client_with_retry: MemoriaClient
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_gateway_error_on_get_still_retried(
+    httpx_mock: HTTPXMock, client_with_retry: MemoriaClient, status: int
+) -> None:
+    # Idempotent methods are unaffected: repeating a GET cannot create anything.
+    httpx_mock.add_response(status_code=status, json={"detail": "gateway"})
+    httpx_mock.add_response(json={"items": [], "next_cursor": None})
+    assert client_with_retry.memories.list().items == []
+    assert len(httpx_mock.get_requests()) == 2
+
+
+def test_gateway_error_exhausted_retries_raises(
+    httpx_mock: HTTPXMock, client_retrying_writes: MemoriaClient
 ) -> None:
     for _ in range(3):  # max_retries=2 → 3 total attempts
         httpx_mock.add_response(status_code=502, json={"detail": "bad gateway"})
     with pytest.raises(MemoriaServerError):
-        client_with_retry.memories.store(content="x")
+        client_retrying_writes.memories.store(content="x")
 
 
 def test_unknown_4xx_raises_api_error(

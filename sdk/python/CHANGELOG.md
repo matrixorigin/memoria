@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Fixed
+- Every `httpx.TransportError` now surfaces as `MemoriaConnectionError` with the original
+  exception preserved as `__cause__`. `RemoteProtocolError` ("server disconnected without
+  sending a response"), `LocalProtocolError` and `ProxyError` are siblings of `NetworkError`
+  rather than subclasses, so they previously escaped the SDK exception hierarchy entirely.
+
+### Changed
+- **Breaking (behavioral):** non-idempotent requests (POST/PATCH) are no longer retried on
+  502/503/504 or on transport errors other than `ConnectError`. None of those prove the server
+  skipped the write — a gateway can return 504 while the upstream commits — so retrying without
+  an idempotency key risked duplicate writes. Pass `retry_unsafe_writes=True` to either client
+  to restore the previous behavior. Idempotent methods are unchanged, and `ConnectError` (where
+  the request never reached the server) is still retried for every method.
+  Retry eligibility is per operation rather than purely per HTTP verb: `memories.correct()`
+  uses PUT but is treated as non-idempotent, because the server mints a replacement record and
+  supersedes the original, so a replay either 404s or creates a second replacement.
+
 ### Added
 - Sync and async `memories.query()` for exact structured filtering through the REST API,
   including scalar `extra_metadata`, subject, type, session, trust tier, branch, and pagination.

@@ -492,7 +492,11 @@ class MemoriesResource:
         branch: str | None = None,
     ) -> Memory:
         body = _strip_none({"new_content": new_content, "reason": reason, "branch": branch})
-        data = self._client._request("PUT", f"/v1/memories/{id}/correct", json=body)
+        # PUT, but not idempotent: the server mints a replacement record and
+        # supersedes the original, so a replay 404s or creates a second one.
+        data = self._client._request(
+            "PUT", f"/v1/memories/{id}/correct", json=body, idempotent=False
+        )
         return Memory.from_dict(data)
 
     def correct_by_query(
@@ -787,7 +791,10 @@ class AsyncMemoriesResource:
         branch: str | None = None,
     ) -> Memory:
         body = _strip_none({"new_content": new_content, "reason": reason, "branch": branch})
-        data = await self._client._arequest("PUT", f"/v1/memories/{id}/correct", json=body)
+        # PUT, but not idempotent — see the sync path.
+        data = await self._client._arequest(
+            "PUT", f"/v1/memories/{id}/correct", json=body, idempotent=False
+        )
         return Memory.from_dict(data)
 
     async def correct_by_query(

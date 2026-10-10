@@ -56,8 +56,15 @@ class MemoriaClient(_HttpTransport):
         *,
         timeout: float = _DEFAULT_TIMEOUT,
         max_retries: int = _DEFAULT_MAX_RETRIES,
+        retry_unsafe_writes: bool = False,
     ) -> None:
-        super().__init__(base_url, api_key, timeout=timeout, max_retries=max_retries)
+        super().__init__(
+            base_url,
+            api_key,
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_unsafe_writes=retry_unsafe_writes,
+        )
         self._http = httpx.Client(
             headers=_build_headers(api_key),
             timeout=httpx.Timeout(timeout),
@@ -135,8 +142,15 @@ class AsyncMemoriaClient(_HttpTransport):
         *,
         timeout: float = _DEFAULT_TIMEOUT,
         max_retries: int = _DEFAULT_MAX_RETRIES,
+        retry_unsafe_writes: bool = False,
     ) -> None:
-        super().__init__(base_url, api_key, timeout=timeout, max_retries=max_retries)
+        super().__init__(
+            base_url,
+            api_key,
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_unsafe_writes=retry_unsafe_writes,
+        )
         self._ahttp = httpx.AsyncClient(
             headers=_build_headers(api_key),
             timeout=httpx.Timeout(timeout),
