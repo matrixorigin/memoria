@@ -325,6 +325,13 @@ function parseGenericResult(text: string): Record<string, unknown> {
 export class MemoriaClient {
   private readonly sessions = new Map<string, MemoriaHttpTransport>();
   private readonly memoryCache = new Map<string, MemoriaMemoryRecord>();
+  /**
+   * Bumped whenever a user's cache is invalidated. A read captures the current
+   * value before issuing its request and only caches its response if the value
+   * is unchanged — otherwise a request that was already in flight during an
+   * invalidation would write pre-purge (or pre-checkout) records back in.
+   */
+  private readonly cacheGeneration = new Map<string, number>();
 
   constructor(private readonly config: MemoriaPluginConfig) {}
 
@@ -355,6 +362,7 @@ export class MemoriaClient {
     sessionId?: string;
     source?: string;
   }) {
+    const generation = this.currentGeneration(params.userId);
     const text = await this.callToolText(params.userId, "memory_store", {
       content: params.content,
       memory_type: params.memoryType,
@@ -362,7 +370,7 @@ export class MemoriaClient {
       trust_tier: params.trustTier,
     });
     const record = parseStoredMemory(text, params);
-    this.cacheMemories(params.userId, [record]);
+    this.cacheMemories(params.userId, [record], generation);
     return record;
   }
 
@@ -374,13 +382,14 @@ export class MemoriaClient {
     sessionId?: string;
     includeCrossSession?: boolean;
   }) {
+    const generation = this.currentGeneration(params.userId);
     const text = await this.callToolText(params.userId, "memory_retrieve", {
       query: params.query,
       top_k: params.topK,
       session_id: params.sessionId,
     });
     const memories = parseMemoryTextList(text);
-    this.cacheMemories(params.userId, memories);
+    this.cacheMemories(params.userId, memories, generation);
     return memories;
   }
 
@@ -389,12 +398,13 @@ export class MemoriaClient {
     query: string;
     topK: number;
   }) {
+    const generation = this.currentGeneration(params.userId);
     const text = await this.callToolText(params.userId, "memory_search", {
       query: params.query,
       top_k: params.topK,
     });
     const memories = parseMemoryTextList(text);
-    this.cacheMemories(params.userId, memories);
+    this.cacheMemories(params.userId, memories, generation);
     return memories;
   }
 
@@ -407,6 +417,7 @@ export class MemoriaClient {
       return cached;
     }
 
+    const generation = this.currentGeneration(params.userId);
     const text = await this.callToolText(params.userId, "memory_get", {
       memory_id: params.memoryId,
     });
@@ -417,7 +428,7 @@ export class MemoriaClient {
       return null;
     }
     const memory = normalizeMemoryRecord(record);
-    this.cacheMemories(params.userId, [memory]);
+    this.cacheMemories(params.userId, [memory], generation);
     return memory;
   }
 
@@ -433,12 +444,13 @@ export class MemoriaClient {
       ? Math.min(2000, Math.max(params.limit, params.limit * this.config.maxListPages))
       : params.limit;
 
+    const generation = this.currentGeneration(params.userId);
     const text = await this.callToolText(params.userId, "memory_list", {
       limit: scanLimit,
     });
     let items = parseMemoryTextList(text);
     const hasMore = parseListHasMore(text) ?? items.length >= scanLimit;
-    this.cacheMemories(params.userId, items);
+    this.cacheMemories(params.userId, items, generation);
 
     const limitations: string[] = [];
     if (params.memoryType) {
@@ -518,6 +530,7 @@ export class MemoriaClient {
     newContent: string;
     reason?: string;
   }) {
+    const generation = this.currentGeneration(params.userId);
     const text = await this.callToolText(params.userId, "memory_correct", {
       memory_id: params.memoryId,
       new_content: params.newContent,
@@ -525,7 +538,16 @@ export class MemoriaClient {
     });
     const corrected = parseCorrectedMemory(text, params.newContent);
     if (corrected) {
-      this.cacheMemories(params.userId, [corrected]);
+      // Assessed before this method's own bump below. A generation change does not
+      // mean the cache is empty — invalidateMemoryIds keeps unrelated ids — so it
+      // gates only whether the replacement can be cached, never the invalidation.
+      const unchanged = generation === this.currentGeneration(params.userId);
+      // The original was superseded no matter what else happened meanwhile, so it
+      // must stop serving its old content unconditionally.
+      this.invalidateMemoryIds(params.userId, [params.memoryId]);
+      if (unchanged) {
+        this.cacheMemories(params.userId, [corrected], this.currentGeneration(params.userId));
+      }
       return corrected;
     }
     return { error: true, message: text };
@@ -537,6 +559,7 @@ export class MemoriaClient {
     newContent: string;
     reason?: string;
   }) {
+    const generation = this.currentGeneration(params.userId);
     const text = await this.callToolText(params.userId, "memory_correct", {
       query: params.query,
       new_content: params.newContent,
@@ -544,7 +567,16 @@ export class MemoriaClient {
     });
     const corrected = parseCorrectedMemory(text, params.newContent);
     if (corrected) {
-      this.cacheMemories(params.userId, [corrected]);
+      // Checked before the invalidation below, which would otherwise make this
+      // method's own bump look like an intervening one. As in correctById, it
+      // gates caching only — a correction always invalidates.
+      const unchanged = generation === this.currentGeneration(params.userId);
+      // Which memory was superseded is not knowable from the response, so no
+      // cached record for this user can be trusted any more.
+      this.invalidateUserCache(params.userId);
+      if (unchanged) {
+        this.cacheMemories(params.userId, [corrected], this.currentGeneration(params.userId));
+      }
       return corrected;
     }
     return { error: true, message: text };
@@ -559,7 +591,7 @@ export class MemoriaClient {
       memory_id: params.memoryId,
       reason: params.reason ?? "",
     });
-    this.memoryCache.delete(this.memoryCacheKey(params.userId, params.memoryId));
+    this.invalidateMemoryIds(params.userId, [params.memoryId]);
     return { purged: parsePurgedCount(text) };
   }
 
@@ -575,11 +607,17 @@ export class MemoriaClient {
       reason: params.reason ?? "",
     });
     if (params.memoryId) {
-      for (const memoryId of params.memoryId.split(",").map((entry) => entry.trim())) {
-        if (memoryId) {
-          this.memoryCache.delete(this.memoryCacheKey(params.userId, memoryId));
-        }
-      }
+      this.invalidateMemoryIds(
+        params.userId,
+        params.memoryId.split(",").map((entry) => entry.trim()),
+      );
+    } else {
+      // A topic purge does not report which ids it removed, so no cached record
+      // for this user can be trusted. Deliberately not gated on the purged count:
+      // that comes from a regex over human-readable text and reads 0 for a JSON
+      // body, and over-invalidating only costs a cache miss. A failed call throws
+      // above, so the cache survives failures.
+      this.invalidateUserCache(params.userId);
     }
     return { purged: parsePurgedCount(text), message: text };
   }
@@ -662,6 +700,7 @@ export class MemoriaClient {
     sourceEventIds?: string[];
     sessionId?: string;
   }) {
+    const generation = this.currentGeneration(params.userId);
     const text = await this.callToolText(params.userId, "memory_observe", {
       messages: params.messages,
       session_id: params.sessionId,
@@ -673,7 +712,7 @@ export class MemoriaClient {
           .filter((entry): entry is Record<string, unknown> => Boolean(entry))
           .map((entry) => normalizeMemoryRecord(entry))
       : [];
-    this.cacheMemories(params.userId, memories);
+    this.cacheMemories(params.userId, memories, generation);
     return memories;
   }
 
@@ -698,11 +737,14 @@ export class MemoriaClient {
     userId: string;
     name: string;
   }) {
-    return parseGenericResult(
+    const result = parseGenericResult(
       await this.callToolText(params.userId, "memory_rollback", {
         name: params.name,
       }),
     );
+    // Rolling back replaces the visible memory state wholesale.
+    this.invalidateUserCache(params.userId);
+    return result;
   }
 
   async branchCreate(params: {
@@ -729,22 +771,31 @@ export class MemoriaClient {
     userId: string;
     name: string;
   }) {
-    return parseGenericResult(
+    const result = parseGenericResult(
       await this.callToolText(params.userId, "memory_checkout", {
         name: params.name,
       }),
     );
+    // The cache key carries no branch, so the same id can mean different
+    // content after a checkout.
+    this.invalidateUserCache(params.userId);
+    return result;
   }
 
   async branchDelete(params: {
     userId: string;
     name: string;
   }) {
-    return parseGenericResult(
+    const result = parseGenericResult(
       await this.callToolText(params.userId, "memory_branch_delete", {
         name: params.name,
       }),
     );
+    // Deleting the active branch resets the backend to main, so this has the
+    // same cache implications as a checkout. The response does not say whether
+    // the deleted branch was the active one, so invalidate either way.
+    this.invalidateUserCache(params.userId);
+    return result;
   }
 
   async branchMerge(params: {
@@ -752,12 +803,15 @@ export class MemoriaClient {
     source: string;
     strategy: string;
   }) {
-    return parseGenericResult(
+    const result = parseGenericResult(
       await this.callToolText(params.userId, "memory_merge", {
         source: params.source,
         strategy: params.strategy,
       }),
     );
+    // A merge can supersede or add records on the active branch.
+    this.invalidateUserCache(params.userId);
+    return result;
   }
 
   async branchDiff(params: {
@@ -773,7 +827,51 @@ export class MemoriaClient {
     );
   }
 
-  private cacheMemories(userId: string, memories: MemoriaMemoryRecord[]) {
+  /**
+   * Drop every cached record for one user, leaving other users untouched.
+   * Used after operations whose effect on individual memories cannot be known
+   * from the response (a topic purge, a correction found by query) or that
+   * change which memories are visible at all (branch checkout/merge, snapshot
+   * rollback — the cache key carries no branch or version).
+   */
+  private invalidateUserCache(userId: string) {
+    const prefix = `${userId}::`;
+    for (const key of this.memoryCache.keys()) {
+      if (key.startsWith(prefix)) {
+        this.memoryCache.delete(key);
+      }
+    }
+    this.bumpGeneration(userId);
+  }
+
+  /**
+   * Drop specific ids and still advance the generation: a read dispatched
+   * before the mutation holds the old generation and would otherwise restore
+   * exactly the superseded or deleted record. Unrelated cached ids survive.
+   */
+  private invalidateMemoryIds(userId: string, memoryIds: string[]) {
+    for (const memoryId of memoryIds) {
+      if (memoryId) {
+        this.memoryCache.delete(this.memoryCacheKey(userId, memoryId));
+      }
+    }
+    this.bumpGeneration(userId);
+  }
+
+  private bumpGeneration(userId: string) {
+    this.cacheGeneration.set(userId, this.currentGeneration(userId) + 1);
+  }
+
+  private currentGeneration(userId: string) {
+    return this.cacheGeneration.get(userId) ?? 0;
+  }
+
+  private cacheMemories(userId: string, memories: MemoriaMemoryRecord[], generation?: number) {
+    // A response that was already in flight when the cache was invalidated
+    // describes a state the backend has since left behind.
+    if (generation !== undefined && generation !== this.currentGeneration(userId)) {
+      return;
+    }
     for (const memory of memories) {
       if (!memory.memory_id) {
         continue;
