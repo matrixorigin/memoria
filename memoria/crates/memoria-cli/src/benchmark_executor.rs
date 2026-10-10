@@ -13,10 +13,14 @@ pub struct BenchmarkExecutor {
 
 impl BenchmarkExecutor {
     pub fn new(api_url: &str, token: &str) -> Self {
-        let run_id = SystemTime::now()
+        // A second-granularity timestamp alone collides: independent runs started
+        // in the same second share a namespace and can purge/correct each other's
+        // memories. Mix in random bits so each run is isolated.
+        let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs().to_string())
+            .map(|d| d.as_secs())
             .unwrap_or_default();
+        let run_id = format!("{secs}-{:08x}", fastrand::u32(..));
         Self {
             base_url: api_url.trim_end_matches('/').into(),
             token: token.into(),
@@ -131,32 +135,52 @@ impl BenchmarkExecutor {
         let resp = client
             .post(format!("{}/v1/memories", self.base_url))
             .json(&body)
-            .send()?;
+            .send()?
+            .error_for_status()?;
         let data: Value = resp.json()?;
-        Ok(data["memory_id"].as_str().unwrap_or("").to_string())
+        match data["memory_id"].as_str() {
+            Some(id) if !id.is_empty() => Ok(id.to_string()),
+            // A 2xx without a memory_id is a response-shape failure, not a write
+            // that happened to return nothing.
+            _ => anyhow::bail!("store response carried no memory_id"),
+        }
     }
 
-    fn retrieve(&self, client: &Client, query: &str, session_id: &str, top_k: i64) -> Vec<String> {
+    /// `Ok(vec![])` means the service answered with no matches; an `Err` means the
+    /// query never produced an answer. Collapsing both into an empty vector hid
+    /// service failures behind valid-looking empty retrievals.
+    fn retrieve(
+        &self,
+        client: &Client,
+        query: &str,
+        session_id: &str,
+        top_k: i64,
+    ) -> anyhow::Result<Vec<String>> {
         let resp = client
             .post(format!("{}/v1/memories/retrieve", self.base_url))
             .json(&json!({"query": query, "top_k": top_k, "session_id": session_id}))
-            .send();
-        let data: Value = match resp.and_then(|r| r.json()) {
-            Ok(v) => v,
-            Err(_) => return vec![],
-        };
+            .send()?
+            .error_for_status()?;
+        let data: Value = resp.json()?;
         let items = if data.is_array() {
             data.as_array()
         } else {
             data["results"].as_array()
         };
+        let items = items.ok_or_else(|| {
+            anyhow::anyhow!("retrieve response was neither an array nor {{\"results\": [...]}}")
+        })?;
+        // filter_map would silently drop an entry whose content is missing or not
+        // a string, so a malformed backend response could still score full marks.
         items
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|i| i["content"].as_str().map(String::from))
-                    .collect()
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                item["content"].as_str().map(String::from).ok_or_else(|| {
+                    anyhow::anyhow!("retrieve result [{i}] has no string \"content\" field")
+                })
             })
-            .unwrap_or_default()
+            .collect()
     }
 
     fn run_step(&self, client: &Client, step: &ScenarioStep, session_id: &str) -> StepResult {
@@ -180,7 +204,7 @@ impl BenchmarkExecutor {
                         step.query.as_deref().unwrap_or(""),
                         session_id,
                         step.top_k.unwrap_or(5),
-                    );
+                    )?;
                 }
                 "search" => {
                     client
@@ -214,14 +238,14 @@ impl BenchmarkExecutor {
         })();
         match result {
             Ok(()) => StepResult {
-                _action: action,
+                action,
                 success: true,
-                _error: None,
+                error: None,
             },
             Err(e) => StepResult {
-                _action: action,
+                action,
                 success: false,
-                _error: Some(e.to_string()),
+                error: Some(format!("{e:#}")),
             },
         }
     }
@@ -232,11 +256,17 @@ impl BenchmarkExecutor {
         assertion: &MemoryAssertion,
         session_id: &str,
     ) -> AssertionResult {
-        let contents = self.retrieve(client, &assertion.query, session_id, assertion.top_k);
-        AssertionResult {
-            _query: assertion.query.clone(),
-            returned_contents: contents,
-            _error: None,
+        match self.retrieve(client, &assertion.query, session_id, assertion.top_k) {
+            Ok(contents) => AssertionResult {
+                query: assertion.query.clone(),
+                returned_contents: contents,
+                error: None,
+            },
+            Err(e) => AssertionResult {
+                query: assertion.query.clone(),
+                returned_contents: vec![],
+                error: Some(format!("{e:#}")),
+            },
         }
     }
 

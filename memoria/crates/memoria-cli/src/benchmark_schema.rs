@@ -80,15 +80,15 @@ fn default_top_k() -> i64 {
 }
 
 pub struct StepResult {
-    pub _action: String,
+    pub action: String,
     pub success: bool,
-    pub _error: Option<String>,
+    pub error: Option<String>,
 }
 
 pub struct AssertionResult {
-    pub _query: String,
+    pub query: String,
     pub returned_contents: Vec<String>,
-    pub _error: Option<String>,
+    pub error: Option<String>,
 }
 
 pub struct ScenarioExecution {

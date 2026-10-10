@@ -11,7 +11,7 @@
 
 mod benchmark;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::future::IntoFuture;
 use std::path::{Path, PathBuf};
@@ -3285,7 +3285,7 @@ fn cmd_benchmark(
     dataset: &str,
     out: Option<&str>,
     validate_only: bool,
-) {
+) -> Result<()> {
     fn print_category_breakdown(
         heading: &str,
         values: &std::collections::HashMap<String, benchmark::CategoryBreakdown>,
@@ -3345,7 +3345,7 @@ fn cmd_benchmark(
             }
             std::process::exit(1);
         }
-        return;
+        return Ok(());
     }
 
     let ds: benchmark::ScenarioDataset = serde_json::from_str(&content).unwrap_or_else(|e| {
@@ -3358,6 +3358,20 @@ fn cmd_benchmark(
         ds.version,
         ds.scenarios.len()
     );
+
+    // --validate-only is not the only way in: scenario IDs that share an
+    // execution namespace would silently let one scenario's writes, purges and
+    // corrections hit another, so this invariant is enforced on every run.
+    let collisions = benchmark::colliding_scenario_namespaces(&ds.scenarios);
+    if !collisions.is_empty() {
+        for c in &collisions {
+            eprintln!("  ❌ {c}");
+        }
+        anyhow::bail!(
+            "dataset has {} scenario_id collision(s); scenarios would share a memory namespace",
+            collisions.len()
+        );
+    }
 
     let executor = benchmark::BenchmarkExecutor::new(api_url, token);
     let mut executions = std::collections::HashMap::new();
@@ -3372,6 +3386,22 @@ fn cmd_benchmark(
             _ => "❌",
         };
         println!(" {icon} {:.1} ({})", result.total_score, result.grade);
+        // Surface service failures: a scenario can legitimately score poorly on
+        // recall, but a failed seed/step/retrieval means the run never measured
+        // what the score claims to measure.
+        if let Some(error) = &exec.error {
+            eprintln!("    ✗ setup failed: {error}");
+        }
+        for step in exec.step_results.iter().filter(|s| !s.success) {
+            if let Some(error) = &step.error {
+                eprintln!("    ✗ step '{}' failed: {error}", step.action);
+            }
+        }
+        for assertion in &exec.assertion_results {
+            if let Some(error) = &assertion.error {
+                eprintln!("    ✗ assertion {:?} failed: {error}", assertion.query);
+            }
+        }
         executions.insert(scenario.scenario_id.clone(), exec);
     }
 
@@ -3416,9 +3446,13 @@ fn cmd_benchmark(
 
     if let Some(path) = out {
         let json = serde_json::to_string_pretty(&report).unwrap();
-        std::fs::write(path, &json).unwrap_or_else(|e| eprintln!("Failed to write {path}: {e}"));
+        // Scripts archive reports based on the exit status, so a failed write has
+        // to fail the command — and "Saved" must only be printed once it is.
+        std::fs::write(path, &json)
+            .with_context(|| format!("failed to write benchmark report to {path}"))?;
         println!("  Saved: {path}");
     }
+    Ok(())
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -3542,7 +3576,7 @@ fn main() -> Result<()> {
             out,
             validate_only,
         } => {
-            cmd_benchmark(&api_url, &token, &dataset, out.as_deref(), validate_only);
+            cmd_benchmark(&api_url, &token, &dataset, out.as_deref(), validate_only)?;
         }
         Commands::Plugin { command } => {
             tokio::runtime::Builder::new_multi_thread()

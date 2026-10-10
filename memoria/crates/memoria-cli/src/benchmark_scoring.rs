@@ -88,12 +88,17 @@ pub fn score_scenario(scenario: &Scenario, exec: &ScenarioExecution) -> Scenario
     let mut noises = vec![];
     let mut passed_count = 0usize;
     for (i, assertion) in scenario.assertions.iter().enumerate() {
-        let returned = exec
-            .assertion_results
-            .get(i)
-            .map(|r| r.returned_contents.as_slice())
-            .unwrap_or(&[]);
-        let (p, r, n, ok) = score_contents(assertion, returned);
+        let result = exec.assertion_results.get(i);
+        // A retrieval that failed tells us nothing about recall or noise. Scoring
+        // it like an empty-but-successful answer would let an assertion with no
+        // expected_contents pass on a service failure.
+        let (p, r, n, ok) = match result {
+            Some(result) if result.error.is_some() => (0.0, 0.0, 0.0, false),
+            _ => score_contents(
+                assertion,
+                result.map(|r| r.returned_contents.as_slice()).unwrap_or(&[]),
+            ),
+        };
         precisions.push(p);
         recalls.push(r);
         noises.push(n);
