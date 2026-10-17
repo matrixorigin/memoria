@@ -11348,3 +11348,85 @@ async fn test_correction_metadata_by_id_remains_queryable() {
 async fn test_correction_metadata_by_query_remains_queryable() {
     assert_correction_preserves_metadata(true).await;
 }
+
+async fn assert_correct_content_length(by_query: bool) {
+    let (base, client, _server) = spawn_server().await;
+    let uid = uid();
+    let original = "original correction limit memory";
+    let stored = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"content": original}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stored.status(), 201);
+    let stored: Value = stored.json().await.unwrap();
+    let id = stored["memory_id"].as_str().unwrap();
+    for content in ["x".repeat(32_769), "中".repeat(10_923)] {
+        let response = if by_query {
+            client
+                .post(format!("{base}/v1/memories/correct"))
+                .header("X-User-Id", &uid)
+                .json(&json!({"query": original, "new_content": content}))
+                .send()
+                .await
+                .unwrap()
+        } else {
+            client
+                .put(format!("{base}/v1/memories/{id}/correct"))
+                .header("X-User-Id", &uid)
+                .json(&json!({"new_content": content}))
+                .send()
+                .await
+                .unwrap()
+        };
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, 422, "oversized correction: {body}");
+        let listed: Value = client
+            .get(format!("{base}/v1/memories"))
+            .header("X-User-Id", &uid)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let items = listed["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["memory_id"], id);
+        assert_eq!(items[0]["content"], original);
+    }
+    let content = "x".repeat(32_768);
+    let response = if by_query {
+        client
+            .post(format!("{base}/v1/memories/correct"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"query": original, "new_content": content}))
+            .send()
+            .await
+            .unwrap()
+    } else {
+        client
+            .put(format!("{base}/v1/memories/{id}/correct"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"new_content": content}))
+            .send()
+            .await
+            .unwrap()
+    };
+    assert_eq!(response.status(), 200, "exactly 32 KiB remains valid");
+    let corrected: Value = response.json().await.unwrap();
+    assert_eq!(corrected["content"], content);
+}
+
+#[tokio::test]
+async fn test_correct_content_length_by_id_is_422_without_write() {
+    assert_correct_content_length(false).await;
+}
+
+#[tokio::test]
+async fn test_correct_content_length_by_query_is_422_without_write() {
+    assert_correct_content_length(true).await;
+}

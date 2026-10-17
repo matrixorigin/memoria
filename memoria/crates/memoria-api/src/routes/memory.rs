@@ -598,7 +598,7 @@ pub async fn correct_by_query(
             &req.new_content,
         )
         .await
-        .map_err(api_err)?;
+        .map_err(api_err_typed)?;
     Ok(Json(m.into()))
 }
 

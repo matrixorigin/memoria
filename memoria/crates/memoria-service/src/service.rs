@@ -2255,6 +2255,11 @@ impl MemoryService {
         memory_id: &str,
         new_content: &str,
     ) -> Result<Memory, MemoriaError> {
+        if new_content.len() > MAX_MEMORY_CONTENT_BYTES {
+            return Err(MemoriaError::Validation(
+                "content exceeds 32 KiB limit".into(),
+            ));
+        }
         // Sensitivity check — same as store_memory
         let sensitivity = check_sensitivity(new_content);
         if sensitivity.blocked {
