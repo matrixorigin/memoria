@@ -145,7 +145,10 @@ async fn router_persists_and_repairs_user_schema_version_marker() {
         .expect("initial updated_at");
     assert_eq!(initial_version, CURRENT_USER_SCHEMA_VERSION);
 
-    router.invalidate_user(&user).await;
+    router
+        .invalidate_user(&user)
+        .await
+        .expect("invalidate user caches");
     router.user_store(&user).await.expect("user store reentry");
 
     let row_after_skip =
@@ -177,7 +180,10 @@ async fn router_persists_and_repairs_user_schema_version_marker() {
     .await
     .expect("set stale schema marker");
 
-    router.invalidate_user(&user).await;
+    router
+        .invalidate_user(&user)
+        .await
+        .expect("invalidate user caches");
     router
         .user_store(&user)
         .await
@@ -308,7 +314,377 @@ async fn router_initializes_one_fresh_user_under_concurrent_access() {
         .execute(router.shared_pool())
         .await
         .expect("clean up test registry database");
-    for result in outcomes {
-        assert!(result.is_ok(), "same-user initialization failed");
+    let first = outcomes[0].as_ref().expect("first initializer succeeded");
+    for result in &outcomes {
+        let store = result.as_ref().expect("same-user initialization succeeded");
+        assert!(
+            std::sync::Arc::ptr_eq(first, store),
+            "concurrent first access must reuse one initialized store"
+        );
     }
+}
+
+#[tokio::test]
+async fn router_retries_initialization_after_a_schema_failure() {
+    let router = DbRouter::connect(&shared_db_url(), test_dim(), Uuid::new_v4().to_string())
+        .await
+        .expect("connect router");
+    let user = format!("schema_retry_{}", Uuid::new_v4().simple());
+    let db = router.user_db_name(&user).await.expect("provision user DB");
+    // A partially initialized schema must fail without publishing readiness or
+    // stranding the next caller behind an initialization gate.
+    sqlx::raw_sql(&format!(
+        "CREATE TABLE `{db}`.mem_schema_meta (schema_key VARCHAR(64) PRIMARY KEY)"
+    ))
+    .execute(router.shared_pool())
+    .await
+    .expect("create incomplete schema marker");
+    let first = router.user_store(&user).await;
+    sqlx::raw_sql(&format!("DROP TABLE `{db}`.mem_schema_meta"))
+        .execute(router.shared_pool())
+        .await
+        .expect("remove incomplete marker");
+
+    let retry = tokio::time::timeout(std::time::Duration::from_secs(30), router.user_store(&user))
+        .await
+        .expect("failed initialization must release its gate")
+        .expect("retry initializes repaired schema");
+    let cached = router.user_store(&user).await.expect("cached store");
+    let version: i64 = sqlx::query_scalar(&format!(
+        "SELECT schema_version FROM `{db}`.mem_schema_meta WHERE schema_key = 'user_schema'"
+    ))
+    .fetch_one(router.shared_pool())
+    .await
+    .expect("read repaired schema marker");
+    sqlx::raw_sql(&format!("DROP DATABASE `{db}`"))
+        .execute(router.shared_pool())
+        .await
+        .expect("clean up test user database");
+    sqlx::raw_sql(&format!("DROP DATABASE `{}`", router.shared_db_name()))
+        .execute(router.shared_pool())
+        .await
+        .expect("clean up test registry database");
+
+    assert!(first.is_err(), "incomplete schema must fail initialization");
+    assert!(std::sync::Arc::ptr_eq(&retry, &cached));
+    assert_eq!(version, CURRENT_USER_SCHEMA_VERSION);
+}
+
+#[tokio::test]
+async fn router_recovers_when_a_cold_initializer_or_waiter_is_cancelled() {
+    let router = DbRouter::connect(&shared_db_url(), test_dim(), Uuid::new_v4().to_string())
+        .await
+        .expect("connect router");
+    for cancel_initializer in [true, false] {
+        let user = format!("schema_cancel_{}", Uuid::new_v4().simple());
+        // Exhaust the registry pool so the first cold call stops before
+        // provisioning. Polling both futures makes cancellation deterministic.
+        let mut held_connections = Vec::new();
+        for _ in 0..router.shared_pool_max_connections() {
+            held_connections.push(
+                router
+                    .shared_pool()
+                    .acquire()
+                    .await
+                    .expect("hold pool slot"),
+            );
+        }
+        let mut initializer = Box::pin(router.user_store(&user));
+        assert!(futures::poll!(&mut initializer).is_pending());
+        let mut waiter = Box::pin(router.user_store(&user));
+        assert!(futures::poll!(&mut waiter).is_pending());
+        let survivor = if cancel_initializer {
+            drop(initializer);
+            waiter
+        } else {
+            drop(waiter);
+            initializer
+        };
+        drop(held_connections);
+        let store = tokio::time::timeout(std::time::Duration::from_secs(30), survivor)
+            .await
+            .expect("cancellation must not strand the surviving caller")
+            .expect("surviving caller initializes the user");
+        let cached = router.user_store(&user).await.expect("cached store");
+        assert!(std::sync::Arc::ptr_eq(&store, &cached));
+        sqlx::raw_sql(&format!(
+            "DROP DATABASE `{}`",
+            DbRouter::user_db_name_for_id(&user)
+        ))
+        .execute(router.shared_pool())
+        .await
+        .expect("clean up test user database");
+    }
+    sqlx::raw_sql(&format!("DROP DATABASE `{}`", router.shared_db_name()))
+        .execute(router.shared_pool())
+        .await
+        .expect("clean up test registry database");
+}
+
+async fn register_test_group(router: &DbRouter) -> (String, String) {
+    SqlMemoryStore::new(
+        router.shared_pool().clone(),
+        test_dim(),
+        "group-init-test".into(),
+    )
+    .migrate_shared()
+    .await
+    .expect("initialize shared group registry");
+    let group = format!("grp_{}", Uuid::new_v4().simple());
+    let db = format!("memoria_group_init_{}", Uuid::new_v4().simple());
+    sqlx::raw_sql(&format!("CREATE DATABASE `{db}`"))
+        .execute(router.shared_pool())
+        .await
+        .expect("create test group database");
+    let now = Utc::now().naive_utc();
+    sqlx::query(
+        "INSERT INTO mem_groups (group_id, group_name, db_name, owner_user_id, status, created_at, updated_at) \
+         VALUES (?, 'Synthetic group', ?, 'synthetic-owner', 'active', ?, ?)",
+    )
+    .bind(&group)
+    .bind(&db)
+    .bind(now)
+    .bind(now)
+    .execute(router.shared_pool())
+    .await
+    .expect("register test group");
+    (group, db)
+}
+
+#[tokio::test]
+async fn router_coalesces_group_initialization_through_scope_dispatch() {
+    let router = DbRouter::connect(&shared_db_url(), test_dim(), Uuid::new_v4().to_string())
+        .await
+        .expect("connect router");
+    let (group, db) = register_test_group(&router).await;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let router = router.clone();
+        let group = group.clone();
+        let barrier = barrier.clone();
+        tasks.spawn(async move {
+            barrier.wait().await;
+            router.scope_store(&group).await
+        });
+    }
+    let mut stores = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        stores.push(result.expect("join group initializer"));
+    }
+    sqlx::raw_sql(&format!("DROP DATABASE `{db}`"))
+        .execute(router.shared_pool())
+        .await
+        .expect("clean up group database");
+    sqlx::raw_sql(&format!("DROP DATABASE `{}`", router.shared_db_name()))
+        .execute(router.shared_pool())
+        .await
+        .expect("clean up registry database");
+    let first = stores[0].as_ref().expect("group initializes");
+    for result in &stores {
+        let store = result.as_ref().expect("concurrent group initializes");
+        assert!(
+            std::sync::Arc::ptr_eq(first, store),
+            "concurrent group first access must reuse one initialized store"
+        );
+    }
+}
+
+#[tokio::test]
+async fn router_invalidation_cannot_be_overtaken_by_a_cold_initializer() {
+    let router = DbRouter::connect(&shared_db_url(), test_dim(), Uuid::new_v4().to_string())
+        .await
+        .expect("connect router");
+    for group_scope in [false, true] {
+        let (scope, db) = if group_scope {
+            register_test_group(&router).await
+        } else {
+            let user = format!("invalidate_race_{}", Uuid::new_v4().simple());
+            let db = DbRouter::user_db_name_for_id(&user);
+            (user, db)
+        };
+        let held_connections = hold_registry_connections(&router).await;
+        let mut initializer = Box::pin(router.scope_store(&scope));
+        assert!(futures::poll!(&mut initializer).is_pending());
+        let mut invalidation = Box::pin(router.invalidate_scope(&scope));
+        let waited = futures::poll!(&mut invalidation).is_pending();
+        drop(held_connections);
+        let original = initializer.await.expect("cold initializer succeeds");
+        sqlx::query(&format!(
+            "UPDATE `{db}`.mem_schema_meta SET schema_version=0 WHERE schema_key='user_schema'"
+        ))
+        .execute(router.shared_pool())
+        .await
+        .expect("make initialized schema marker stale");
+        if waited {
+            invalidation.await.expect("invalidate scoped caches");
+        }
+        let refreshed = router
+            .scope_store(&scope)
+            .await
+            .expect("reload scoped store");
+        let version: i64 = sqlx::query_scalar(&format!(
+            "SELECT schema_version FROM `{db}`.mem_schema_meta WHERE schema_key='user_schema'"
+        ))
+        .fetch_one(router.shared_pool())
+        .await
+        .expect("read revalidated schema marker");
+        sqlx::raw_sql(&format!("DROP DATABASE `{db}`"))
+            .execute(router.shared_pool())
+            .await
+            .expect("clean up scoped database");
+        assert!(
+            waited,
+            "invalidation must wait for in-flight initialization"
+        );
+        assert!(!std::sync::Arc::ptr_eq(&original, &refreshed));
+        assert_eq!(version, CURRENT_USER_SCHEMA_VERSION);
+    }
+    sqlx::raw_sql(&format!("DROP DATABASE `{}`", router.shared_db_name()))
+        .execute(router.shared_pool())
+        .await
+        .expect("clean up registry database");
+}
+
+async fn hold_registry_connections(
+    router: &DbRouter,
+) -> Vec<sqlx::pool::PoolConnection<sqlx::MySql>> {
+    let mut connections = Vec::new();
+    for _ in 0..router.shared_pool_max_connections() {
+        connections.push(
+            router
+                .shared_pool()
+                .acquire()
+                .await
+                .expect("hold pool slot"),
+        );
+    }
+    connections
+}
+
+#[tokio::test]
+async fn router_invalidation_also_orders_an_inflight_database_mapping_lookup() {
+    let router = DbRouter::connect(&shared_db_url(), test_dim(), Uuid::new_v4().to_string())
+        .await
+        .expect("connect router");
+    let user = format!("mapping_race_{}", Uuid::new_v4().simple());
+    let replacement = format!("mapping_replacement_{}", Uuid::new_v4().simple());
+    let held_connections = hold_registry_connections(&router).await;
+    let mut lookup = Box::pin(router.user_db_name(&user));
+    assert!(futures::poll!(&mut lookup).is_pending());
+    let mut invalidation = Box::pin(router.invalidate_user(&user));
+    let waited = futures::poll!(&mut invalidation).is_pending();
+    drop(held_connections);
+    let original = lookup.await.expect("mapping lookup succeeds");
+    sqlx::raw_sql(&format!("CREATE DATABASE `{replacement}`"))
+        .execute(router.shared_pool())
+        .await
+        .expect("create replacement database");
+    router
+        .register_user_db(&user, &replacement)
+        .await
+        .expect("replace mapping");
+    if waited {
+        invalidation.await.expect("invalidate scoped caches");
+    }
+    let refreshed = router.user_db_name(&user).await.expect("reload mapping");
+    for db in [&original, &replacement, router.shared_db_name()] {
+        sqlx::raw_sql(&format!("DROP DATABASE `{db}`"))
+            .execute(router.shared_pool())
+            .await
+            .expect("clean up mapping test database");
+    }
+    assert!(waited, "invalidation must wait for the mapping publisher");
+    assert_eq!(refreshed, replacement);
+}
+
+#[tokio::test]
+async fn router_isolates_user_ids_that_match_the_legacy_group_cache_prefix() {
+    let router = DbRouter::connect(&shared_db_url(), test_dim(), Uuid::new_v4().to_string())
+        .await
+        .expect("connect router");
+    for group_first in [true, false] {
+        let (group, group_db) = register_test_group(&router).await;
+        let user = format!("group:{group}");
+        let user_db = DbRouter::user_db_name_for_id(&user);
+        let (user_store, group_store) = if group_first {
+            let group_store = router
+                .scope_store(&group)
+                .await
+                .expect("initialize group first");
+            (
+                router
+                    .user_store(&user)
+                    .await
+                    .expect("initialize user second"),
+                group_store,
+            )
+        } else {
+            let user_store = router
+                .user_store(&user)
+                .await
+                .expect("initialize user first");
+            (
+                user_store,
+                router
+                    .scope_store(&group)
+                    .await
+                    .expect("initialize group second"),
+            )
+        };
+        let isolated = user_store.db_name() == Some(user_db.as_str())
+            && group_store.db_name() == Some(group_db.as_str())
+            && !std::sync::Arc::ptr_eq(&user_store, &group_store);
+        // Keep cleanup valid on the unfixed implementation too: a collision can
+        // skip user provisioning entirely.
+        if !isolated {
+            for db in [&user_db, &group_db, router.shared_db_name()] {
+                sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS `{db}`"))
+                    .execute(router.shared_pool())
+                    .await
+                    .expect("clean up collision reproduction");
+            }
+            assert!(
+                isolated,
+                "user and group must never return each other's store"
+            );
+        }
+        assert_eq!(
+            router.user_db_name(&user).await.expect("user mapping"),
+            user_db
+        );
+        router
+            .invalidate_user(&user)
+            .await
+            .expect("invalidate only the user");
+        assert!(std::sync::Arc::ptr_eq(
+            &group_store,
+            &router
+                .group_store(&group)
+                .await
+                .expect("group stays cached")
+        ));
+        let refreshed_user = router.user_store(&user).await.expect("reload user");
+        assert!(!std::sync::Arc::ptr_eq(&user_store, &refreshed_user));
+        router
+            .invalidate_group(&group)
+            .await
+            .expect("invalidate only the group");
+        assert!(std::sync::Arc::ptr_eq(
+            &refreshed_user,
+            &router.user_store(&user).await.expect("user stays cached")
+        ));
+        let refreshed_group = router.group_store(&group).await.expect("reload group");
+        assert!(!std::sync::Arc::ptr_eq(&group_store, &refreshed_group));
+        for db in [&user_db, &group_db] {
+            sqlx::raw_sql(&format!("DROP DATABASE `{db}`"))
+                .execute(router.shared_pool())
+                .await
+                .expect("clean up isolated database");
+        }
+    }
+    sqlx::raw_sql(&format!("DROP DATABASE `{}`", router.shared_db_name()))
+        .execute(router.shared_pool())
+        .await
+        .expect("clean up registry database");
 }

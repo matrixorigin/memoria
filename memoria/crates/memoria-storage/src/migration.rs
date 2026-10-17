@@ -488,7 +488,7 @@ async fn migrate_user(
         let target_url = router.user_db_url(&target_db)?;
         eprintln!("  Resetting target user database {target_db}");
         reset_database(&target_url).await?;
-        router.invalidate_user(user_id).await;
+        router.invalidate_user(user_id).await?;
         // Register user in shared DB so runtime can discover it later
         router.register_user_db(user_id, &target_db).await?;
         target_db

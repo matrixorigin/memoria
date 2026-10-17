@@ -1,3 +1,4 @@
+use crate::keyed_gates::KeyedGates;
 use crate::pool_config::{
     configured_multi_db_pool_budget, configured_multi_db_pool_size, multi_db_pool_default_size,
     multi_db_pool_max_size, split_pool_budget, MultiDbPoolKind, MULTI_DB_POOL_BUDGET_MAX,
@@ -12,7 +13,9 @@ use sqlx::{
     mysql::{MySqlConnectOptions, MySqlPoolOptions},
     MySqlPool, Row,
 };
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Semaphore;
 
 fn db_err(e: sqlx::Error) -> MemoriaError {
@@ -34,6 +37,23 @@ const USER_SCHEMA_CACHE_MAX_CAPACITY: u64 = 10_000;
 const USER_STORE_CACHE_IDLE_SECS: u64 = 600;
 const MERGED_SHARED_POOL_MAX_CONNECTIONS_ENV: &str = "MEMORIA_MERGED_SHARED_POOL_MAX_CONNECTIONS";
 const LEGACY_SHARED_COMPONENT_WEIGHTS: [u32; 3] = [40, 40, 20];
+
+// User IDs may contain arbitrary prefixes. Keep scope identity typed in every
+// shared cache and gate rather than relying on a reserved string namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ScopeKey {
+    User(String),
+    Group(String),
+}
+
+fn configured_router_timeout(name: &str, default_secs: u64) -> Duration {
+    let secs = std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(default_secs)
+        .clamp(1, 3600);
+    Duration::from_secs(secs)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SharedPoolPlan {
@@ -75,8 +95,11 @@ pub struct DbRouter {
     embedding_dim: usize,
     instance_id: String,
     user_db_cache: Cache<String, String>,
-    user_schema_cache: Cache<String, bool>,
-    user_store_cache: Cache<String, Arc<SqlMemoryStore>>,
+    user_schema_cache: Cache<ScopeKey, bool>,
+    user_store_cache: Cache<ScopeKey, Arc<SqlMemoryStore>>,
+    cache_gates: KeyedGates<ScopeKey>,
+    init_timeout: Duration,
+    invalidation_timeout: Duration,
     user_init_semaphore: Arc<Semaphore>,
 }
 
@@ -192,6 +215,12 @@ impl DbRouter {
                 .max_capacity(USER_STORE_CACHE_MAX_CAPACITY)
                 .time_to_idle(std::time::Duration::from_secs(USER_STORE_CACHE_IDLE_SECS))
                 .build(),
+            cache_gates: KeyedGates::default(),
+            init_timeout: configured_router_timeout("MEMORIA_ROUTER_INIT_TIMEOUT_SECS", 120),
+            invalidation_timeout: configured_router_timeout(
+                "MEMORIA_ROUTER_INVALIDATION_TIMEOUT_SECS",
+                15,
+            ),
             user_init_semaphore: Arc::new(Semaphore::new(user_init_max)),
         };
         router.ensure_user_registry_table().await?;
@@ -309,95 +338,114 @@ impl DbRouter {
             return Ok(cached);
         }
 
-        // Avoid moka single-flight here: its init future makes upstream callers
-        // fail Send bounds under axum handlers and tokio::spawn.
-        let shared_pool = self.shared_pool.clone();
-        let user_id_owned = user_id.to_string();
-        let row = sqlx::query(
-            "SELECT db_name FROM mem_user_registry WHERE user_id = ? AND status = 'active'",
-        )
-        .bind(&user_id_owned)
-        .fetch_optional(&shared_pool)
+        let key = ScopeKey::User(user_id.to_owned());
+        self.cache_operation(key, self.init_timeout, "database mapping lookup", async {
+            if let Some(cached) = self.user_db_cache.get(user_id) {
+                return Ok(cached);
+            }
+            // Avoid moka single-flight here: its init future makes upstream callers
+            // fail Send bounds under axum handlers and tokio::spawn.
+            let shared_pool = self.shared_pool.clone();
+            let user_id_owned = user_id.to_string();
+            let row = sqlx::query(
+                "SELECT db_name FROM mem_user_registry WHERE user_id = ? AND status = 'active'",
+            )
+            .bind(&user_id_owned)
+            .fetch_optional(&shared_pool)
+            .await
+            .map_err(db_err)?;
+            let db_name = match row {
+                Some(row) => row.try_get("db_name").map_err(db_err)?,
+                None => provision_user_db_with_pool(&shared_pool, &user_id_owned).await?,
+            };
+            self.user_db_cache.insert(user_id_owned, db_name.clone());
+            Ok(db_name)
+        })
         .await
-        .map_err(db_err)?;
-        let db_name = match row {
-            Some(row) => row.try_get("db_name").map_err(db_err)?,
-            None => provision_user_db_with_pool(&shared_pool, &user_id_owned).await?,
-        };
-        self.user_db_cache.insert(user_id_owned, db_name.clone());
-        Ok(db_name)
     }
 
     pub async fn user_store(&self, user_id: &str) -> Result<Arc<SqlMemoryStore>, MemoriaError> {
-        if let Some(cached) = self.user_store_cache.get(user_id) {
+        let cache_key = ScopeKey::User(user_id.to_owned());
+        if let Some(cached) = self.user_store_cache.get(&cache_key) {
             return Ok(cached);
         }
 
-        // Avoid moka single-flight here: its init future makes upstream callers
-        // fail Send bounds under axum handlers and tokio::spawn.
-        let shared_pool = self.shared_pool.clone();
-        let global_user_pool = self.global_user_pool.clone();
-        let user_init_pool = self.user_init_pool.clone();
-        let shared_db_url = self.shared_db_url.clone();
-        let embedding_dim = self.embedding_dim;
-        let instance_id = self.instance_id.clone();
-        let user_db_cache = self.user_db_cache.clone();
-        let user_schema_cache = self.user_schema_cache.clone();
-        let user_init_semaphore = self.user_init_semaphore.clone();
-        let user_id_owned = user_id.to_string();
-        let existing = sqlx::query(
-            "SELECT db_name FROM mem_user_registry WHERE user_id = ? AND status = 'active'",
-        )
-        .bind(&user_id_owned)
-        .fetch_optional(&shared_pool)
-        .await
-        .map_err(db_err)?;
-        let (db_name, needs_init) = match existing {
-            Some(row) => (row.try_get("db_name").map_err(db_err)?, false),
-            None => (
-                provision_user_db_with_pool(&shared_pool, &user_id_owned).await?,
-                true,
-            ),
-        };
-        if user_schema_cache.get(&user_id_owned).is_none() {
-            let _permit = user_init_semaphore
-                .acquire_owned()
+        self.cache_operation(
+            cache_key.clone(),
+            self.init_timeout,
+            "user initialization",
+            async {
+                if let Some(cached) = self.user_store_cache.get(&cache_key) {
+                    return Ok(cached);
+                }
+                // Avoid moka single-flight here: its init future makes upstream callers
+                // fail Send bounds under axum handlers and tokio::spawn.
+                let shared_pool = self.shared_pool.clone();
+                let global_user_pool = self.global_user_pool.clone();
+                let user_init_pool = self.user_init_pool.clone();
+                let shared_db_url = self.shared_db_url.clone();
+                let embedding_dim = self.embedding_dim;
+                let instance_id = self.instance_id.clone();
+                let user_db_cache = self.user_db_cache.clone();
+                let user_schema_cache = self.user_schema_cache.clone();
+                let user_init_semaphore = self.user_init_semaphore.clone();
+                let user_id_owned = user_id.to_string();
+                let existing = sqlx::query(
+                    "SELECT db_name FROM mem_user_registry WHERE user_id = ? AND status = 'active'",
+                )
+                .bind(&user_id_owned)
+                .fetch_optional(&shared_pool)
                 .await
-                .map_err(|_| MemoriaError::Internal("user schema init semaphore closed".into()))?;
-            if user_schema_cache.get(&user_id_owned).is_none() {
-                let init_store = build_routed_store(
-                    user_init_pool.clone(),
+                .map_err(db_err)?;
+                let (db_name, needs_init) = match existing {
+                    Some(row) => (row.try_get("db_name").map_err(db_err)?, false),
+                    None => (
+                        provision_user_db_with_pool(&shared_pool, &user_id_owned).await?,
+                        true,
+                    ),
+                };
+                if user_schema_cache.get(&cache_key).is_none() {
+                    let _permit = user_init_semaphore.acquire_owned().await.map_err(|_| {
+                        MemoriaError::Internal("user schema init semaphore closed".into())
+                    })?;
+                    if user_schema_cache.get(&cache_key).is_none() {
+                        let init_store = build_routed_store(
+                            user_init_pool.clone(),
+                            &shared_db_url,
+                            embedding_dim,
+                            &instance_id,
+                            &db_name,
+                        )?;
+                        let init_result = init_store.migrate_user().await;
+                        if let Err(err) = init_result {
+                            if needs_init {
+                                let delete_registration =
+                                    "DELETE FROM mem_user_registry WHERE user_id = ? AND db_name = ?";
+                                let _ = sqlx::query(delete_registration)
+                                    .bind(&user_id_owned)
+                                    .bind(&db_name)
+                                    .execute(&shared_pool)
+                                    .await;
+                            }
+                            return Err(err);
+                        }
+                        user_schema_cache.insert(cache_key.clone(), true);
+                    }
+                }
+                user_db_cache.insert(user_id_owned.clone(), db_name.clone());
+                let store = Arc::new(build_routed_store(
+                    global_user_pool,
                     &shared_db_url,
                     embedding_dim,
                     &instance_id,
                     &db_name,
-                )?;
-                let init_result = init_store.migrate_user().await;
-                if let Err(err) = init_result {
-                    if needs_init {
-                        let _ = sqlx::query(
-                            "DELETE FROM mem_user_registry WHERE user_id = ? AND db_name = ?",
-                        )
-                        .bind(&user_id_owned)
-                        .bind(&db_name)
-                        .execute(&shared_pool)
-                        .await;
-                    }
-                    return Err(err);
-                }
-                user_schema_cache.insert(user_id_owned.clone(), true);
-            }
-        }
-        user_db_cache.insert(user_id_owned.clone(), db_name.clone());
-        let store = Arc::new(build_routed_store(
-            global_user_pool,
-            &shared_db_url,
-            embedding_dim,
-            &instance_id,
-            &db_name,
-        )?);
-        self.user_store_cache.insert(user_id_owned, store.clone());
-        Ok(store)
+                )?);
+                self.user_store_cache
+                    .insert(cache_key.clone(), store.clone());
+                Ok(store)
+            },
+        )
+        .await
     }
 
     pub fn routed_store_for_user(&self, user_id: &str) -> Result<SqlMemoryStore, MemoriaError> {
@@ -415,10 +463,63 @@ impl DbRouter {
         )
     }
 
-    pub async fn invalidate_user(&self, user_id: &str) {
-        self.user_db_cache.invalidate(user_id);
-        self.user_schema_cache.invalidate(user_id);
-        self.user_store_cache.invalidate(user_id);
+    /// Wait for an in-flight cold path, then clear its published caches.
+    /// A timeout returns an error without reporting successful invalidation.
+    /// Existing store handles and database mutations are not cancelled.
+    pub async fn invalidate_user(&self, user_id: &str) -> Result<(), MemoriaError> {
+        self.invalidate_cached_store(ScopeKey::User(user_id.to_owned()))
+            .await
+    }
+
+    pub async fn invalidate_group(&self, group_id: &str) -> Result<(), MemoriaError> {
+        self.invalidate_cached_store(ScopeKey::Group(group_id.to_owned()))
+            .await
+    }
+
+    /// Use the same user/group dispatch as `scope_store()`.
+    pub async fn invalidate_scope(&self, scope_id: &str) -> Result<(), MemoriaError> {
+        if scope_id.starts_with("grp_") {
+            self.invalidate_group(scope_id).await
+        } else {
+            self.invalidate_user(scope_id).await
+        }
+    }
+
+    async fn invalidate_cached_store(&self, cache_key: ScopeKey) -> Result<(), MemoriaError> {
+        self.cache_operation(
+            cache_key.clone(),
+            self.invalidation_timeout,
+            "cache invalidation",
+            async {
+                if let ScopeKey::User(user_id) = &cache_key {
+                    self.user_db_cache.invalidate(user_id);
+                }
+                self.user_schema_cache.invalidate(&cache_key);
+                self.user_store_cache.invalidate(&cache_key);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    async fn cache_operation<T>(
+        &self,
+        key: ScopeKey,
+        deadline: Duration,
+        operation: &'static str,
+        work: impl Future<Output = Result<T, MemoriaError>>,
+    ) -> Result<T, MemoriaError> {
+        // Do not spawn the work: a timeout must drop its future and release the
+        // gate, rather than let a detached initializer publish stale caches.
+        self.cache_gates
+            .run(key, deadline, work)
+            .await
+            .map_err(|_| {
+                MemoriaError::Database(format!(
+                    "routed {operation} timed out after {}ms",
+                    deadline.as_millis()
+                ))
+            })?
     }
 
     async fn ensure_user_registry_table(&self) -> Result<(), MemoriaError> {
@@ -543,48 +644,61 @@ impl DbRouter {
     }
 
     pub async fn group_store(&self, group_id: &str) -> Result<Arc<SqlMemoryStore>, MemoriaError> {
-        let cache_key = format!("group:{group_id}");
+        let cache_key = ScopeKey::Group(group_id.to_owned());
         if let Some(cached) = self.user_store_cache.get(&cache_key) {
             return Ok(cached);
         }
 
-        let db_name = self.group_db_name(group_id).await?;
-        let cache_key_owned = cache_key.clone();
-        if self.user_schema_cache.get(&cache_key_owned).is_none() {
-            let _permit = self
-                .user_init_semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| MemoriaError::Internal("group schema init semaphore closed".into()))?;
-            if self.user_schema_cache.get(&cache_key_owned).is_none() {
-                let db_url = self.user_db_url(&db_name)?;
-                let init_result = match SqlMemoryStore::connect_routed(
-                    &db_url,
+        self.cache_operation(
+            cache_key.clone(),
+            self.init_timeout,
+            "group initialization",
+            async {
+                if let Some(cached) = self.user_store_cache.get(&cache_key) {
+                    return Ok(cached);
+                }
+
+                let db_name = self.group_db_name(group_id).await?;
+                let cache_key_owned = cache_key.clone();
+                if self.user_schema_cache.get(&cache_key_owned).is_none() {
+                    let _permit = self
+                        .user_init_semaphore
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| {
+                            MemoriaError::Internal("group schema init semaphore closed".into())
+                        })?;
+                    if self.user_schema_cache.get(&cache_key_owned).is_none() {
+                        let db_url = self.user_db_url(&db_name)?;
+                        let init_result = match SqlMemoryStore::connect_routed(
+                            &db_url,
+                            self.embedding_dim,
+                            self.instance_id.clone(),
+                        )
+                        .await
+                        {
+                            Ok(init_store) => init_store.migrate_user().await,
+                            Err(err) => Err(err),
+                        };
+                        init_result?;
+                        self.user_schema_cache.insert(cache_key_owned.clone(), true);
+                    }
+                }
+                let mut store = build_routed_store(
+                    self.global_user_pool.clone(),
+                    &self.shared_db_url,
                     self.embedding_dim,
-                    self.instance_id.clone(),
-                )
-                .await
-                {
-                    Ok(init_store) => init_store.migrate_user().await,
-                    Err(err) => Err(err),
-                };
-                init_result?;
-                self.user_schema_cache.insert(cache_key_owned.clone(), true);
-            }
-        }
-        let mut store = build_routed_store(
-            self.global_user_pool.clone(),
-            &self.shared_db_url,
-            self.embedding_dim,
-            &self.instance_id,
-            &db_name,
-        )?;
-        store.set_db_router(Arc::new(self.clone()));
-        let store = Arc::new(store);
-        self.user_store_cache.insert(cache_key, store.clone());
-        self.user_db_cache.insert(group_id.to_string(), db_name);
-        Ok(store)
+                    &self.instance_id,
+                    &db_name,
+                )?;
+                store.set_db_router(Arc::new(self.clone()));
+                let store = Arc::new(store);
+                self.user_store_cache.insert(cache_key, store.clone());
+                Ok(store)
+            },
+        )
+        .await
     }
 
     pub async fn scope_store(&self, scope_id: &str) -> Result<Arc<SqlMemoryStore>, MemoriaError> {
@@ -831,6 +945,174 @@ mod tests {
             params.get("statement-cache-capacity").map(String::as_str),
             Some("0")
         );
+    }
+
+    // Lazy pools keep deadline tests independent of database/network behavior.
+    fn cache_test_router(
+        init_timeout: std::time::Duration,
+        invalidation_timeout: std::time::Duration,
+    ) -> super::DbRouter {
+        let options = sqlx::mysql::MySqlConnectOptions::new().database("router_deadline_test");
+        let pool = sqlx::mysql::MySqlPoolOptions::new().connect_lazy_with(options);
+        super::DbRouter {
+            shared_pool: pool.clone(),
+            shared_pool_max_connections: 1,
+            global_user_pool: pool.clone(),
+            global_user_pool_max_connections: 1,
+            user_init_pool: pool,
+            user_init_pool_max_connections: 1,
+            shared_db_url: "mysql://localhost/router_deadline_test".into(),
+            shared_db_name: "router_deadline_test".into(),
+            embedding_dim: 8,
+            instance_id: "synthetic-deadline-test".into(),
+            user_db_cache: moka::sync::Cache::new(10),
+            user_schema_cache: moka::sync::Cache::new(10),
+            user_store_cache: moka::sync::Cache::new(10),
+            cache_gates: crate::keyed_gates::KeyedGates::default(),
+            init_timeout,
+            invalidation_timeout,
+            user_init_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
+
+    #[tokio::test]
+    async fn invalidation_timeout_is_an_error_and_leaves_busy_scope_caches_intact() {
+        use super::ScopeKey;
+        use std::time::Duration;
+        for key in [
+            ScopeKey::User("synthetic-user".into()),
+            ScopeKey::Group("grp_synthetic".into()),
+        ] {
+            let router = cache_test_router(Duration::from_secs(30), Duration::from_millis(1));
+            let scope_id = match &key {
+                ScopeKey::User(id) | ScopeKey::Group(id) => id,
+            };
+            router.user_schema_cache.insert(key.clone(), true);
+            let store =
+                std::sync::Arc::new(router.routed_store_for_db_name("synthetic_scope").unwrap());
+            router.user_store_cache.insert(key.clone(), store.clone());
+            if let ScopeKey::User(id) = &key {
+                router
+                    .user_db_cache
+                    .insert(id.clone(), "synthetic_scope".into());
+            }
+            let mut busy = Box::pin(router.cache_operation(
+                key.clone(),
+                router.init_timeout,
+                "synthetic initialization",
+                std::future::pending::<Result<(), memoria_core::MemoriaError>>(),
+            ));
+            assert!(futures::poll!(&mut busy).is_pending());
+            let error = router.invalidate_scope(scope_id).await.unwrap_err();
+            assert!(
+                matches!(error, memoria_core::MemoriaError::Database(ref message) if message.contains("cache invalidation timed out"))
+            );
+            assert!(router.user_schema_cache.get(&key).is_some());
+            assert!(std::sync::Arc::ptr_eq(
+                &store,
+                &router.user_store_cache.get(&key).unwrap()
+            ));
+            if let ScopeKey::User(id) = &key {
+                assert!(router.user_db_cache.get(id).is_some());
+            }
+            drop(busy);
+            router
+                .invalidate_scope(scope_id)
+                .await
+                .expect("retry after cancellation succeeds");
+            assert!(router.user_schema_cache.get(&key).is_none());
+            assert!(router.user_store_cache.get(&key).is_none());
+            if let ScopeKey::User(id) = &key {
+                assert!(router.user_db_cache.get(id).is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_cold_cache_entry_point_has_a_gate_wait_deadline() {
+        use std::time::Duration;
+        let router = cache_test_router(Duration::from_millis(1), Duration::from_secs(1));
+        for group_scope in [false, true] {
+            let key = if group_scope {
+                super::ScopeKey::Group("grp_synthetic".into())
+            } else {
+                super::ScopeKey::User("synthetic-user".into())
+            };
+            let mut blocker = Box::pin(router.cache_operation(
+                key,
+                Duration::from_secs(30),
+                "blocker",
+                std::future::pending::<Result<(), memoria_core::MemoriaError>>(),
+            ));
+            assert!(futures::poll!(&mut blocker).is_pending());
+            let error = if group_scope {
+                router
+                    .group_store("grp_synthetic")
+                    .await
+                    .err()
+                    .expect("group must time out")
+            } else {
+                router
+                    .user_store("synthetic-user")
+                    .await
+                    .err()
+                    .expect("user must time out")
+            };
+            assert!(
+                matches!(error, memoria_core::MemoriaError::Database(ref message) if message.contains("initialization timed out"))
+            );
+            if !group_scope {
+                let error = router.user_db_name("synthetic-user").await.unwrap_err();
+                assert!(
+                    matches!(error, memoria_core::MemoriaError::Database(ref message) if message.contains("database mapping lookup timed out"))
+                );
+            }
+            drop(blocker);
+        }
+    }
+
+    #[tokio::test]
+    async fn initialization_deadline_drops_work_and_unblocks_invalidation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        struct OnDrop<'a>(&'a AtomicBool);
+        impl Drop for OnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let router = cache_test_router(Duration::from_millis(1), Duration::from_secs(1));
+        let dropped = AtomicBool::new(false);
+        let key = super::ScopeKey::User("synthetic-user".into());
+        let mut initializer = Box::pin(router.cache_operation(
+            key,
+            router.init_timeout,
+            "user initialization",
+            async {
+                let _drop_signal = OnDrop(&dropped);
+                std::future::pending::<Result<(), memoria_core::MemoriaError>>().await
+            },
+        ));
+        assert!(futures::poll!(&mut initializer).is_pending());
+        let mut invalidation = Box::pin(router.invalidate_user("synthetic-user"));
+        assert!(futures::poll!(&mut invalidation).is_pending());
+        let error = initializer.await.unwrap_err();
+        assert!(
+            matches!(error, memoria_core::MemoriaError::Database(ref message) if message.contains("user initialization timed out"))
+        );
+        assert!(dropped.load(Ordering::Relaxed));
+        invalidation
+            .await
+            .expect("timed-out initializer releases the gate");
+        router
+            .cache_operation(
+                super::ScopeKey::User("synthetic-user".into()),
+                Duration::from_secs(1),
+                "retry",
+                async { Ok(()) },
+            )
+            .await
+            .expect("later retry can enter");
     }
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();

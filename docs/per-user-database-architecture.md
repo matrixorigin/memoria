@@ -678,6 +678,8 @@ LLM_MODEL=<model-name>
 | `MEMORIA_LEGACY_MIGRATION_MAX_CONCURRENCY` | 启动期 legacy -> multi-db 自动迁移的用户并发上限 |
 | `MEMORIA_USER_SCHEMA_INIT_POOL_MAX_CONNECTIONS` | 首次用户 schema init / compat migration 专用池大小 |
 | `MEMORIA_USER_SCHEMA_INIT_MAX_CONCURRENCY` | 首次用户 schema init 并发上限 |
+| `MEMORIA_ROUTER_INIT_TIMEOUT_SECS` | 用户/组冷初始化及用户 DB 映射查询的总时限（含 gate/全局许可等待），默认 120 秒，范围 1–3600 秒 |
+| `MEMORIA_ROUTER_INVALIDATION_TIMEOUT_SECS` | 缓存失效等待总时限，默认 15 秒，范围 1–3600 秒；超时返回错误，不宣告失效成功 |
 | `MEMORIA_SHARED_POOL_MAX_CONNECTIONS` | 兼容旧配置的 shared router 组件配额；仅在显式设置时参与 merged shared pool 计算 |
 | `MEMORIA_SHARED_MAIN_POOL_MAX_CONNECTIONS` | 兼容旧配置的 shared store 组件配额；仅在显式设置时参与 merged shared pool 计算 |
 | `MEMORIA_GIT_POOL_MAX_CONNECTIONS` | 兼容旧配置的 git 组件配额；仅在显式设置时参与 merged shared pool 计算 |

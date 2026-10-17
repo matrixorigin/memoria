@@ -2096,7 +2096,11 @@ async fn test_call_log_repair_failure_keeps_memory_api_available_and_background_
         .execute(&pool)
         .await
         .unwrap();
-    server.router().invalidate_user(&user).await;
+    server
+        .router()
+        .invalidate_user(&user)
+        .await
+        .expect("invalidate user caches");
     let response = client
         .post(format!("{base}/v1/memories"))
         .bearer_auth(master)

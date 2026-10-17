@@ -1,5 +1,6 @@
 mod branch_capability;
 pub mod graph;
+mod keyed_gates;
 pub mod migration;
 pub mod pool_config;
 pub mod router;
@@ -28,6 +29,6 @@ pub use store::{
     validate_fulltext_query, FeedbackStats, MemoryFeedback, OwnedEditLogEntry, PoolHealthLevel,
     PoolHealthSnapshot, SqlMemoryStore, TierFeedback, UserRetrievalParams, ACTOR_USER_ID,
     EXTRA_METADATA_FILTER_MAX_FIELDS, EXTRA_METADATA_FILTER_MAX_KEY_BYTES,
-    EXTRA_METADATA_FILTER_MAX_VALUE_BYTES, FULLTEXT_QUERY_MAX_BYTES,
-    FULLTEXT_SEARCH_DEFAULT_LIMIT, FULLTEXT_SEARCH_MAX_LIMIT,
+    EXTRA_METADATA_FILTER_MAX_VALUE_BYTES, FULLTEXT_QUERY_MAX_BYTES, FULLTEXT_SEARCH_DEFAULT_LIMIT,
+    FULLTEXT_SEARCH_MAX_LIMIT,
 };

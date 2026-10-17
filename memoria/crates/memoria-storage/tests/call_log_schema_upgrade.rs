@@ -15,7 +15,10 @@ struct LegacyFixture {
 
 impl LegacyFixture {
     async fn cleanup(self) {
-        self.router.invalidate_user(&self.user).await;
+        self.router
+            .invalidate_user(&self.user)
+            .await
+            .expect("invalidate user caches");
         self.pool.close().await;
         // Only databases owned by this fixture are removed.
         for db in [&self.user_db, &self.shared_db] {
@@ -107,7 +110,10 @@ async fn legacy_fixture(version: i64, partial: bool) -> LegacyFixture {
     .execute(&pool)
     .await
     .unwrap();
-    router.invalidate_user(&user).await;
+    router
+        .invalidate_user(&user)
+        .await
+        .expect("invalidate user caches");
     LegacyFixture {
         router,
         pool,
@@ -203,7 +209,10 @@ async fn routed_upgrade(version: i64, partial: bool) {
     if version == CURRENT_USER_SCHEMA_VERSION {
         assert_eq!(updated_at.to_string(), "2000-01-01 00:00:00");
     }
-    f.router.invalidate_user(&f.user).await;
+    f.router
+        .invalidate_user(&f.user)
+        .await
+        .expect("invalidate user caches");
     f.router
         .user_store(&f.user)
         .await
