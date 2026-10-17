@@ -195,18 +195,23 @@ const TRUST_TIER_DESCRIPTION: &str = concat!(
     "T4 = speculative, reflective, or otherwise unverified hypothesis."
 );
 
-pub(crate) const MEMORY_CAPABILITIES_TEXT: &str = concat!(
-    "Available tools: memory_store, memory_retrieve, memory_search, ",
-    "memory_correct, memory_purge, memory_profile, memory_list, ",
-    "memory_capabilities, memory_governance, memory_consolidate, ",
-    "memory_reflect, memory_feedback",
-    "\n\nmemory_store trust_tier guide:",
-    "\n- T1 (Verified): directly stated or explicitly confirmed facts, preferences, or decisions.",
-    "\n- T2 (Curated): corrected or manually curated memory replacing an older record.",
-    "\n- T3 (Inferred): summaries, extracted patterns, or soft conclusions not explicitly confirmed. Prefer T3 if unsure.",
-    "\n- T4 (Unverified): speculative, reflective, or otherwise unverified hypotheses.",
-    "\nUse exact values T1/T2/T3/T4; natural-language labels like 'verified' are invalid."
-);
+/// One catalog for tools/list and memory_capabilities, including Git-backed tools.
+pub(crate) fn tool_catalog() -> Value {
+    let mut all_tools = list().as_array().unwrap().clone();
+    all_tools.extend(crate::git_tools::list().as_array().unwrap().clone());
+    json!({"tools": all_tools})
+}
+
+/// Return machine-readable MCP tool discovery while keeping JSON text content
+/// for clients that do not yet consume structuredContent.
+pub(crate) fn capabilities_result() -> Value {
+    let catalog = tool_catalog();
+    let text = catalog.to_string();
+    json!({
+        "content": [{"type": "text", "text": text}],
+        "structuredContent": catalog
+    })
+}
 
 pub fn list() -> Value {
     json!([
@@ -796,7 +801,7 @@ pub async fn call(
             Ok(mcp_text(&text))
         }
 
-        ToolCallName::MemoryCapabilities => Ok(mcp_text(MEMORY_CAPABILITIES_TEXT)),
+        ToolCallName::MemoryCapabilities => Ok(capabilities_result()),
 
         ToolCallName::MemoryGovernance => {
             let force = args["force"].as_bool().unwrap_or(false);
@@ -1572,6 +1577,28 @@ pub fn entity_extract_prompt(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_capabilities_match_the_public_mcp_catalog() {
+        let result = capabilities_result();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed, result["structuredContent"]);
+        assert_eq!(parsed, tool_catalog());
+        let tools = parsed["tools"].as_array().unwrap();
+        for required in ["memory_store", "memory_capabilities", "memory_checkout"] {
+            assert!(
+                tools.iter().any(|tool| tool["name"].as_str() == Some(required)),
+                "missing advertised tool: {required}"
+            );
+        }
+        for tool in tools {
+            assert!(tool["name"].is_string());
+            assert!(tool["description"].is_string());
+            assert!(tool["inputSchema"].is_object());
+        }
+    }
+
 
     #[test]
     fn missing_session_id_preserves_message_and_input_classification() {

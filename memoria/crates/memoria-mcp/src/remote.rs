@@ -588,10 +588,7 @@ impl RemoteClient {
                 Ok(Self::mcp_text(&text))
             }
 
-            "memory_capabilities" => Ok(Self::mcp_text(&format!(
-                "{}\n[remote mode — connected to Memoria API server]",
-                crate::tools::MEMORY_CAPABILITIES_TEXT
-            ))),
+            "memory_capabilities" => Ok(crate::tools::capabilities_result()),
 
             "memory_get_retrieval_params" => {
                 let r = self

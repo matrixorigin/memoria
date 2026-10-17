@@ -401,9 +401,7 @@ async fn dispatch(
         })),
         RpcMethod::Ping => Ok(json!({})),
         RpcMethod::ToolsList => {
-            let mut all_tools = tools::list().as_array().unwrap().clone();
-            all_tools.extend(git_tools::list().as_array().unwrap().clone());
-            Ok(json!({"tools": all_tools}))
+            Ok(tools::tool_catalog())
         }
         RpcMethod::ToolsCall => {
             let (name, args) = validate_tool_call(Some(&p))?;
@@ -453,9 +451,7 @@ async fn dispatch_embedded_owned(
         })),
         RpcMethod::Ping => Ok(json!({})),
         RpcMethod::ToolsList => {
-            let mut all_tools = tools::list().as_array().unwrap().clone();
-            all_tools.extend(git_tools::list().as_array().unwrap().clone());
-            Ok(json!({"tools": all_tools}))
+            Ok(tools::tool_catalog())
         }
         RpcMethod::ToolsCall => {
             let (name, args) = validate_tool_call(Some(&p))?;
