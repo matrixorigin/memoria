@@ -3836,11 +3836,20 @@ async fn test_remote_capabilities() {
         .await
         .expect("capabilities");
     let text = r["content"][0]["text"].as_str().unwrap_or("");
-    assert!(
-        text.contains("remote mode"),
-        "should mention remote mode, got: {text}"
+    let parsed: Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("capabilities text should be JSON ({e}), got: {text}"));
+    assert_eq!(
+        parsed, r["structuredContent"],
+        "text and structuredContent should carry the same catalog"
     );
-    println!("✅ remote capabilities: {}", &text[..text.len().min(80)]);
+    let mut advertised = memoria_mcp::tools::list().as_array().unwrap().clone();
+    advertised.extend(memoria_mcp::git_tools::list().as_array().unwrap().clone());
+    assert_eq!(
+        parsed,
+        json!({ "tools": advertised }),
+        "remote capabilities should match the advertised tool catalog"
+    );
+    println!("✅ remote capabilities: {} tools", advertised.len());
 }
 
 #[tokio::test]

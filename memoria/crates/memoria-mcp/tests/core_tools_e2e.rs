@@ -849,6 +849,25 @@ async fn test_capabilities() {
     let (svc, uid, _ctx) = setup().await;
     let r = call("memory_capabilities", json!({}), &svc, &uid).await;
     let t = text(&r);
+    let parsed: Value = serde_json::from_str(t)
+        .unwrap_or_else(|e| panic!("capabilities text should be JSON ({e}), got: {t}"));
+    assert_eq!(
+        parsed, r["structuredContent"],
+        "text and structuredContent should carry the same catalog"
+    );
+    let mut advertised = memoria_mcp::tools::list().as_array().unwrap().clone();
+    advertised.extend(memoria_mcp::git_tools::list().as_array().unwrap().clone());
+    assert_eq!(
+        parsed,
+        json!({ "tools": advertised }),
+        "capabilities should match the advertised tool catalog"
+    );
+    let names: Vec<&str> = parsed["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
     for tool in &[
         "memory_store",
         "memory_retrieve",
@@ -857,34 +876,47 @@ async fn test_capabilities() {
         "memory_purge",
         "memory_profile",
         "memory_feedback",
+        "memory_observe",
     ] {
-        assert!(t.contains(tool), "missing {tool}: {t}");
+        assert!(names.contains(tool), "missing {tool}: {names:?}");
     }
-    // Hidden ops/debug tools must NOT appear in capabilities
+    // Unadvertised ops/debug tools must NOT appear in capabilities
     for hidden in &[
         "memory_rebuild_index",
         "memory_extract_entities",
         "memory_link_entities",
         "memory_get_retrieval_params",
         "memory_tune_params",
-        "memory_observe",
     ] {
         assert!(
-            !t.contains(hidden),
-            "hidden tool {hidden} should not be in capabilities: {t}"
+            !names.contains(hidden),
+            "hidden tool {hidden} should not be in capabilities: {names:?}"
         );
     }
+    // Trust-tier guidance now lives in the memory_store input schema.
+    let store = parsed["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "memory_store")
+        .expect("memory_store advertised");
+    let tier_desc = store["inputSchema"]["properties"]["trust_tier"]["description"]
+        .as_str()
+        .expect("trust_tier description");
     for hint in &[
-        "memory_store trust_tier guide",
-        "T1 (Verified)",
-        "T2 (Curated)",
-        "T3 (Inferred)",
-        "Prefer T3 if unsure",
-        "natural-language labels like 'verified' are invalid",
+        "T1/T2/T3/T4",
+        "T1 =",
+        "T2 =",
+        "T3 =",
+        "prefer T3 if unsure",
+        "T4 =",
     ] {
-        assert!(t.contains(hint), "missing tier hint {hint}: {t}");
+        assert!(
+            tier_desc.contains(hint),
+            "missing tier hint {hint}: {tier_desc}"
+        );
     }
-    println!("✅ capabilities: {t}");
+    println!("✅ capabilities: {} tools", names.len());
 }
 
 // ── 18. unknown tool returns error ────────────────────────────────────────────
