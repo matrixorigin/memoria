@@ -40,7 +40,7 @@ Services: API on `:8100`, MatrixOne on `:6001`. Verify: `curl http://localhost:8
 | `MEMORIA_EMBEDDING_API_KEY` | — | Required if provider is `openai` (single-backend) |
 | `MEMORIA_EMBEDDING_BASE_URL` | — | Custom endpoint, OpenAI-compatible (single-backend) |
 | `MEMORIA_EMBEDDING_ENDPOINTS` | — | JSON array for multi-backend round-robin. When set, supersedes `BASE_URL`/`API_KEY`. Format: `[{"url":"https://api1.example.com/v1","api_key":"sk-1"},{"url":"https://api2.example.com/v1","api_key":"sk-2"}]`. All endpoints must serve the same model. Requests rotate round-robin; failed/rate-limited endpoints are skipped automatically. |
-| `MEMORIA_EMBEDDING_DIM` | `0` (auto) | Embedding dimension |
+| `MEMORIA_EMBEDDING_DIM` | `0` (auto) | Embedding dimension. `0` = auto-infer: Memoria probes the embedding service on startup and uses the returned vector length. Set explicitly (e.g. `768`, `1024`) to skip the probe or when the embedding service may be unavailable at boot time. |
 
 ### Distributed
 
