@@ -5,9 +5,9 @@ from __future__ import annotations
 import pytest
 from pytest_httpx import HTTPXMock
 
-from memoria import MemoriaClient, MemoriaValidationError
+from memoria import AsyncMemoriaClient, MemoriaClient, MemoriaValidationError
 from memoria.models import Snapshot
-from tests.conftest import BASE_URL, API_KEY, SNAPSHOT_STUB
+from tests.conftest import API_KEY, BASE_URL, SNAPSHOT_STUB
 
 
 @pytest.fixture
@@ -62,3 +62,25 @@ def test_delete_no_selector_raises(client: MemoriaClient) -> None:
 def test_delete_multiple_selectors_raises(client: MemoriaClient) -> None:
     with pytest.raises(MemoriaValidationError, match="mutually exclusive"):
         client.snapshots.delete("snap-1", prefix="pre_")
+
+
+@pytest.mark.parametrize("prefix", ["", "   "])
+def test_delete_empty_prefix_raises_without_request(
+    httpx_mock: HTTPXMock, client: MemoriaClient, prefix: str
+) -> None:
+    with pytest.raises(MemoriaValidationError, match="prefix must not be empty"):
+        client.snapshots.delete(prefix=prefix)
+    assert httpx_mock.get_requests() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix", ["", "   "])
+async def test_async_delete_empty_prefix_raises_without_request(
+    httpx_mock: HTTPXMock, prefix: str
+) -> None:
+    async with AsyncMemoriaClient(
+        base_url=BASE_URL, api_key=API_KEY, max_retries=0
+    ) as client:
+        with pytest.raises(MemoriaValidationError, match="prefix must not be empty"):
+            await client.snapshots.delete(prefix=prefix)
+    assert httpx_mock.get_requests() == []
