@@ -653,6 +653,24 @@ async fn test_api_structured_query_cursor_and_subject_isolation() {
         .collect();
     assert_eq!(first_ids.len(), 2);
 
+    for invalid_cursor in ["", " ", "\t\n", "\u{2003}"] {
+        let response = client
+            .post(format!("{base}/v1/memories/query"))
+            .header("X-User-Id", &user_id)
+            .json(&json!({
+                "extra_metadata_filter": {"marker": marker},
+                "subject_id": matching_subject,
+                "limit": 2,
+                "cursor": invalid_cursor
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, 422, "blank cursor {invalid_cursor:?}: {body}");
+    }
+
     let second = client
         .post(format!("{base}/v1/memories/query"))
         .header("X-User-Id", &user_id)
