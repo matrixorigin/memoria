@@ -95,7 +95,7 @@ def _should_retry_network_error(
     if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
         return True
     retryable = isinstance(
-        exc, (httpx.TimeoutException, httpx.NetworkError, httpx.ProtocolError)
+        exc, (httpx.TimeoutException, httpx.NetworkError, httpx.ProtocolError, httpx.ProxyError)
     )
     if _is_idempotent(method, idempotent):
         return retryable
