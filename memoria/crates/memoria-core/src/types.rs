@@ -238,4 +238,137 @@ mod tests {
             assert_eq!(parsed.to_string(), s);
         }
     }
+
+    #[test]
+    fn memory_type_parse_is_exact_and_reports_input() {
+        for bad in [
+            "",
+            "Semantic",
+            "SEMANTIC",
+            " semantic",
+            "semantic ",
+            "tool-result",
+            "toolresult",
+            "unknown",
+        ] {
+            match bad.parse::<MemoryType>() {
+                Err(crate::MemoriaError::InvalidMemoryType(got)) => assert_eq!(got, bad),
+                other => panic!("{bad:?} parsed as {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn trust_tier_parse_is_exact_and_reports_input() {
+        for bad in ["", "t1", "T0", "T5", "T1 ", "verified", "T1Verified"] {
+            match bad.parse::<TrustTier>() {
+                Err(crate::MemoriaError::InvalidTrustTier(got)) => assert_eq!(got, bad),
+                other => panic!("{bad:?} parsed as {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn serde_names_match_display_names() {
+        for name in MemoryType::ALL_NAMES {
+            let parsed: MemoryType = name.parse().unwrap();
+            assert_eq!(
+                serde_json::to_value(&parsed).unwrap(),
+                serde_json::json!(name)
+            );
+            let back: MemoryType = serde_json::from_value(serde_json::json!(name)).unwrap();
+            assert_eq!(back, parsed);
+        }
+        for tier in ["T1", "T2", "T3", "T4"] {
+            let parsed: TrustTier = tier.parse().unwrap();
+            assert_eq!(
+                serde_json::to_value(&parsed).unwrap(),
+                serde_json::json!(tier)
+            );
+            let back: TrustTier = serde_json::from_value(serde_json::json!(tier)).unwrap();
+            assert_eq!(back, parsed);
+        }
+        assert!(serde_json::from_value::<MemoryType>(serde_json::json!("ToolResult")).is_err());
+        assert!(serde_json::from_value::<TrustTier>(serde_json::json!("T1Verified")).is_err());
+    }
+
+    #[test]
+    fn trust_tier_defaults_and_ordering_of_parameters() {
+        assert_eq!(TrustTier::default(), TrustTier::T3Inferred);
+        let tiers = [
+            TrustTier::T1Verified,
+            TrustTier::T2Curated,
+            TrustTier::T3Inferred,
+            TrustTier::T4Unverified,
+        ];
+        // Higher trust must never decay faster or start less confident.
+        for pair in tiers.windows(2) {
+            assert!(pair[0].default_half_life_days() > pair[1].default_half_life_days());
+            assert!(pair[0].initial_confidence() > pair[1].initial_confidence());
+        }
+        for tier in tiers {
+            let c = tier.initial_confidence();
+            assert!((0.0..=1.0).contains(&c), "{tier}: {c}");
+            assert!(tier.default_half_life_days() > 0.0);
+        }
+    }
+
+    fn memory_observed(observed_at: Option<DateTime<Utc>>, tier: TrustTier) -> Memory {
+        Memory {
+            memory_id: "m1".into(),
+            user_id: "u1".into(),
+            author_id: None,
+            subject_id: None,
+            memory_type: MemoryType::Semantic,
+            content: "c".into(),
+            initial_confidence: 0.8,
+            embedding: None,
+            source_event_ids: vec![],
+            superseded_by: None,
+            is_active: true,
+            access_count: 0,
+            session_id: None,
+            observed_at,
+            created_at: None,
+            updated_at: None,
+            extra_metadata: None,
+            trust_tier: tier,
+            retrieval_score: None,
+        }
+    }
+
+    #[test]
+    fn effective_confidence_without_observation_time_is_initial() {
+        let m = memory_observed(None, TrustTier::T4Unverified);
+        assert_eq!(m.effective_confidence(None), 0.8);
+        assert_eq!(m.effective_confidence(Some(1.0)), 0.8);
+    }
+
+    #[test]
+    fn effective_confidence_decays_with_tier_or_explicit_half_life() {
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-3;
+        // Just observed: no measurable decay.
+        let fresh = memory_observed(Some(Utc::now()), TrustTier::T1Verified);
+        assert!(close(fresh.effective_confidence(None), 0.8));
+
+        // 30 days old with the T4 default (30 days): C0 * e^-1.
+        let t4 = memory_observed(
+            Some(Utc::now() - chrono::Duration::days(30)),
+            TrustTier::T4Unverified,
+        );
+        assert!(close(t4.effective_confidence(None), 0.8 * (-1.0f64).exp()));
+        // An explicit half-life overrides the tier default.
+        assert!(close(
+            t4.effective_confidence(Some(60.0)),
+            0.8 * (-0.5f64).exp()
+        ));
+
+        // Same age decays less for a more trusted tier.
+        let t1 = memory_observed(
+            Some(Utc::now() - chrono::Duration::days(30)),
+            TrustTier::T1Verified,
+        );
+        assert!(t1.effective_confidence(None) > t4.effective_confidence(None));
+        assert!(t1.effective_confidence(None) < 0.8);
+    }
 }
