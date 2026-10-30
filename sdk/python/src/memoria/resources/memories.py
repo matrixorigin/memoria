@@ -311,7 +311,15 @@ class MemoriesResource:
         session_id: str | None = None,
         trust_tier: str | None = None,
         branch: str | None = None,
+        idempotency_key: str | None = None,
     ) -> Memory:
+        """Store one memory, optionally with retry-safe write identity.
+
+        When ``idempotency_key`` is provided, the request uses the server's
+        atomic idempotent-store endpoint and may safely follow the normal
+        idempotent retry policy. Reusing a key with a different payload is
+        rejected by the server.
+        """
         body = _strip_none(
             {
                 "content": content,
@@ -319,9 +327,13 @@ class MemoriesResource:
                 "session_id": session_id,
                 "trust_tier": trust_tier,
                 "branch": branch,
+                "idempotency_key": idempotency_key,
             }
         )
-        data = self._client._request("POST", "/v1/memories", json=body)
+        path = "/v1/memories/idempotent" if idempotency_key is not None else "/v1/memories"
+        data = self._client._request(
+            "POST", path, json=body, idempotent=idempotency_key is not None
+        )
         return Memory.from_dict(data)
 
     def store_batch(
@@ -608,7 +620,12 @@ class AsyncMemoriesResource:
         session_id: str | None = None,
         trust_tier: str | None = None,
         branch: str | None = None,
+        idempotency_key: str | None = None,
     ) -> Memory:
+        """Store one memory, optionally with retry-safe write identity.
+
+        See :meth:`MemoriesResource.store` for the retry and replay contract.
+        """
         body = _strip_none(
             {
                 "content": content,
@@ -616,9 +633,13 @@ class AsyncMemoriesResource:
                 "session_id": session_id,
                 "trust_tier": trust_tier,
                 "branch": branch,
+                "idempotency_key": idempotency_key,
             }
         )
-        data = await self._client._arequest("POST", "/v1/memories", json=body)
+        path = "/v1/memories/idempotent" if idempotency_key is not None else "/v1/memories"
+        data = await self._client._arequest(
+            "POST", path, json=body, idempotent=idempotency_key is not None
+        )
         return Memory.from_dict(data)
 
     async def store_batch(
