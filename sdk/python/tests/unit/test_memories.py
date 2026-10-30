@@ -305,13 +305,32 @@ def test_list_happy_path(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
 
 def test_list_with_cursor(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
     httpx_mock.add_response(json={"items": [], "next_cursor": None})
-    page = client.memories.list(limit=10, cursor="abc123", memory_type="semantic")
+    cursor = "a" * 32
+    page = client.memories.list(limit=10, cursor=cursor, memory_type="semantic")
     assert page.items == []
+    request = httpx_mock.get_request()
+    assert request is not None
+    assert request.url.params["cursor"] == cursor
 
 
 def test_list_over_max_limit_raises(client: MemoriaClient) -> None:
     with pytest.raises(MemoriaValidationError, match="500"):
         client.memories.list(limit=501)
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, "10", 1.5, None])
+def test_list_rejects_invalid_limit(client: MemoriaClient, limit: object) -> None:
+    with pytest.raises(MemoriaValidationError, match="limit"):
+        client.memories.list(limit=limit)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "cursor",
+    ["", "abc123", "a" * 31, "a" * 33, "g" * 32, 123],
+)
+def test_list_rejects_invalid_cursor(client: MemoriaClient, cursor: object) -> None:
+    with pytest.raises(MemoriaValidationError, match="cursor"):
+        client.memories.list(cursor=cursor)  # type: ignore[arg-type]
 
 
 def test_structured_query(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:

@@ -22,6 +22,7 @@ _EXTRA_METADATA_FILTER_MAX_VALUE_BYTES = 1024
 _FULLTEXT_QUERY_MAX_BYTES = 4096
 _FULLTEXT_SEARCH_DEFAULT_LIMIT = 20
 _FULLTEXT_SEARCH_MAX_LIMIT = 100
+_MEMORY_CURSOR_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
 _MEMORY_TYPE_NAMES = {
     "semantic",
@@ -44,6 +45,19 @@ def _memory_path(memory_id: str, suffix: str = "") -> str:
     if memory_id in {".", ".."}:
         encoded = "%2E" * len(memory_id)
     return f"/v1/memories/{encoded}{suffix}"
+
+
+def _validate_list_page(limit: int, cursor: str | None) -> None:
+    if type(limit) is not int:
+        raise MemoriaValidationError("list: limit must be an integer")
+    if limit < 1 or limit > 500:
+        raise MemoriaValidationError("list: limit must be between 1 and 500")
+    if cursor is not None and (
+        not isinstance(cursor, str)
+        or len(cursor) != 32
+        or any(char not in _MEMORY_CURSOR_HEX_DIGITS for char in cursor)
+    ):
+        raise MemoriaValidationError("list: cursor must be a 32-character hexadecimal memory_id")
 
 
 def _normalize_query_memory_types(
@@ -444,8 +458,7 @@ class MemoriesResource:
         trust_tier: str | None = None,
         branch: str | None = None,
     ) -> MemoryPage:
-        if limit > 500:
-            raise MemoriaValidationError("list: limit must not exceed 500")
+        _validate_list_page(limit, cursor)
         params = _strip_none(
             {
                 "limit": limit,
@@ -745,8 +758,7 @@ class AsyncMemoriesResource:
         trust_tier: str | None = None,
         branch: str | None = None,
     ) -> MemoryPage:
-        if limit > 500:
-            raise MemoriaValidationError("list: limit must not exceed 500")
+        _validate_list_page(limit, cursor)
         params = _strip_none(
             {
                 "limit": limit,
