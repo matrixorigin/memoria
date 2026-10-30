@@ -330,11 +330,27 @@ async fn run_io(
             continue;
         }
 
-        let req: Request = match serde_json::from_str(&line) {
+        let value: Value = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("PARSE_ERROR: {e} | RAW: {line}");
                 let resp = json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":e.to_string()}});
+                write_line(&mut stdout, &resp).await?;
+                continue;
+            }
+        };
+
+        let response_id = value
+            .get("id")
+            .filter(|id| id.is_string() || id.is_number())
+            .cloned()
+            .unwrap_or(Value::Null);
+        let is_object = value.is_object();
+        let req = match serde_json::from_value::<Request>(value) {
+            Ok(req) if is_object && !req.method.is_empty() => req,
+            _ => {
+                let resp = json!({"jsonrpc":"2.0","id":response_id,
+                    "error":{"code":-32600,"message":"Invalid Request"}});
                 write_line(&mut stdout, &resp).await?;
                 continue;
             }
@@ -511,6 +527,56 @@ mod tests {
                 -32602
             );
         }
+    }
+
+    #[tokio::test]
+    async fn stdio_invalid_requests_preserve_ids_and_allow_following_requests() {
+        let mode = Mode::Remote(RemoteClient::new(
+            "http://127.0.0.1:1",
+            None,
+            "test".into(),
+            None,
+        ));
+        let cases = [
+            (json!({"jsonrpc":"2.0","id":8}), json!(8)),
+            (json!({"jsonrpc":"2.0","id":9,"method":42}), json!(9)),
+            (json!({"id":"missing"}), json!("missing")),
+            (json!({"id":"empty","method":""}), json!("empty")),
+            (json!({"method":null}), json!(null)),
+            (json!({"id":true}), json!(null)),
+            (json!({"id":[]}), json!(null)),
+            (json!({"id":{}}), json!(null)),
+            (json!([]), json!(null)),
+            (json!(["2.0", 8, "ping", null]), json!(null)),
+            (json!(42), json!(null)),
+            (json!(null), json!(null)),
+        ];
+        let mut input = String::from("{invalid json\n");
+        for (request, _) in &cases {
+            input.push_str(&request.to_string());
+            input.push('\n');
+        }
+        input.push_str("{\"method\":\"ping\"}\n{\"id\":\"after\",\"method\":\"ping\"}\n");
+        let mut output = Vec::new();
+        super::run_io(input.as_bytes(), &mut output, mode, "test".into())
+            .await
+            .unwrap();
+        let messages: Vec<serde_json::Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(messages.len(), cases.len() + 2);
+        assert_eq!(messages[0]["error"]["code"], -32700);
+        assert_eq!(messages[0]["id"], json!(null));
+        for (message, (request, id)) in messages[1..].iter().zip(&cases) {
+            assert_eq!(message["error"]["code"], -32600, "{request}");
+            assert_eq!(&message["id"], id, "{request}");
+        }
+        assert_eq!(
+            messages.last().unwrap(),
+            &json!({"jsonrpc":"2.0","id":"after","result":{}})
+        );
     }
 
     #[tokio::test]
