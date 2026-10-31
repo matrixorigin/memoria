@@ -313,11 +313,11 @@ async fn run_io(
     mode: Mode,
     user_id: String,
 ) -> Result<()> {
-    let mut reader = BufReader::new(stdin).lines();
+    let mut reader = BufReader::new(stdin).split(b'\n');
 
     loop {
         let line = tokio::select! {
-            result = reader.next_line() => {
+            result = reader.next_segment() => {
                 match result? {
                     Some(l) => l,
                     None => break, // EOF
@@ -325,12 +325,20 @@ async fn run_io(
             }
             _ = shutdown_signal() => break,
         };
-        let line = line.trim().to_string();
+        let line = match std::str::from_utf8(&line) {
+            Ok(line) => line.trim(),
+            Err(e) => {
+                eprintln!("PARSE_ERROR: {e}");
+                let resp = json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":e.to_string()}});
+                write_line(&mut stdout, &resp).await?;
+                continue;
+            }
+        };
         if line.is_empty() {
             continue;
         }
 
-        let value: Value = match serde_json::from_str(&line) {
+        let value: Value = match serde_json::from_str(line) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("PARSE_ERROR: {e} | RAW: {line}");
@@ -577,6 +585,70 @@ mod tests {
             messages.last().unwrap(),
             &json!({"jsonrpc":"2.0","id":"after","result":{}})
         );
+    }
+
+    #[tokio::test]
+    async fn stdio_propagates_input_errors() {
+        struct FailedInput;
+        impl tokio::io::AsyncRead for FailedInput {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "input failed",
+                )))
+            }
+        }
+        let mode = Mode::Remote(RemoteClient::new(
+            "http://127.0.0.1:1",
+            None,
+            "test".into(),
+            None,
+        ));
+        let mut output = Vec::new();
+        let error = super::run_io(FailedInput, &mut output, mode, "test".into())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stdio_recovers_after_non_utf8_lines() {
+        let mode = Mode::Remote(RemoteClient::new(
+            "http://127.0.0.1:1",
+            None,
+            "test".into(),
+            None,
+        ));
+        let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\r\n\xff\xfe\n\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n\xff";
+        let mut output = Vec::new();
+        super::run_io(&input[..], &mut output, mode, "test".into())
+            .await
+            .unwrap();
+        let messages: Vec<serde_json::Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0], json!({"jsonrpc":"2.0","id":1,"result":{}}));
+        assert_eq!(messages[2], json!({"jsonrpc":"2.0","id":2,"result":{}}));
+        for message in [&messages[1], &messages[3]] {
+            assert_eq!(message["jsonrpc"], "2.0");
+            assert_eq!(message["id"], json!(null));
+            assert_eq!(message["error"]["code"], -32700);
+            assert!(message["error"]["message"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()));
+            assert!(message.get("result").is_none());
+        }
     }
 
     #[tokio::test]
