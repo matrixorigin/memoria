@@ -198,6 +198,19 @@ describe("Group 3: Cloud API Communication", () => {
       expect(result.content[0].text).toBe("Stored memory m1: hello world");
     });
 
+    it.each([
+      ["empty object", {}],
+      ["null", null],
+      ["array", []],
+      ["numeric memory ID", { memory_id: 42 }],
+      ["blank memory ID", { memory_id: "   " }],
+      ["empty HTTP body", ""],
+    ])("3.34a memory_store rejects %s", async (_case, response) => {
+      fetchMock.respondWith(200, response);
+      await expect(transport.callTool("memory_store", { content: "fixture" }))
+        .rejects.toThrow(/invalid store response/i);
+    });
+
     it("3.35 memory_retrieve preserves structured records", async () => {
       fetchMock.respondWith(200, {
         results: [
