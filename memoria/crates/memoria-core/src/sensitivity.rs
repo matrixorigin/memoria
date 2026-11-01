@@ -106,6 +106,29 @@ static COMPILED: Lazy<Vec<(&'static Pattern, Regex)>> = Lazy::new(|| {
         .collect()
 });
 
+/// Luhn checksum over the digits of `candidate`, ignoring separators.
+fn luhn_valid(candidate: &str) -> bool {
+    let digits: Vec<u32> = candidate.chars().filter_map(|c| c.to_digit(10)).collect();
+    let sum: u32 = digits
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(i, &d)| {
+            if i % 2 == 1 {
+                let doubled = d * 2;
+                if doubled > 9 {
+                    doubled - 9
+                } else {
+                    doubled
+                }
+            } else {
+                d
+            }
+        })
+        .sum();
+    digits.len() >= 13 && sum % 10 == 0
+}
+
 /// Check content for PII/credentials. Returns a `SensitivityResult`.
 pub fn check_sensitivity(text: &str) -> SensitivityResult {
     // HIGH tier — any match blocks immediately
@@ -125,7 +148,18 @@ pub fn check_sensitivity(text: &str) -> SensitivityResult {
 
     for (p, re) in COMPILED.iter() {
         if p.tier == SensitivityTier::Medium {
-            let result = re.replace_all(&redacted, p.replacement);
+            let result = if p.label == "credit_card" {
+                // Only redact digit runs that pass Luhn; keep timestamps and IDs.
+                re.replace_all(&redacted, |caps: &regex::Captures| {
+                    if luhn_valid(&caps[0]) {
+                        p.replacement.to_string()
+                    } else {
+                        caps[0].to_string()
+                    }
+                })
+            } else {
+                re.replace_all(&redacted, p.replacement)
+            };
             if result != redacted {
                 hits.push(p.label);
                 redacted = Cow::Owned(result.into_owned());
@@ -391,5 +425,17 @@ mod tests {
         let redacted = r.redacted_content.unwrap();
         assert!(redacted.contains("[email]"));
         assert!(redacted.contains("[phone]"));
+    }
+
+    #[test]
+    fn credit_card_redaction_requires_luhn_valid_number() {
+        // Epoch-millisecond timestamps and 64-bit snowflake IDs are 13-19 digits
+        // but fail the Luhn check, so they must not be redacted as cards.
+        for text in ["event at 1730284800123 ms", "snowflake id 1849203948572039485"] {
+            let r = check_sensitivity(text);
+            assert_eq!(r.redacted_content, None, "non-card digits redacted: {text}");
+        }
+        let r = check_sensitivity("card 4111 1111 1111 1111 on file");
+        assert_eq!(r.redacted_content.as_deref(), Some("card [card] on file"));
     }
 }
