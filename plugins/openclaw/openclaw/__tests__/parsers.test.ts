@@ -102,11 +102,11 @@ describe("Group 4: Response Parsing (format round-trip)", () => {
       expect(result.content[0].text).toBe("Stored memory new-1: Test memory");
     });
 
-    it("4.6 store with missing id → uses empty string", async () => {
+    it("4.6 store with missing id → rejects malformed receipt", async () => {
       const t = setup();
       fetchHelper.respondWith(200, { content: "No id returned" });
-      const result = await t.callTool("memory_store", { content: "No id returned" }) as any;
-      expect(result.content[0].text).toBe("Stored memory : No id returned");
+      await expect(t.callTool("memory_store", { content: "No id returned" }))
+        .rejects.toThrow(/invalid store response/i);
     });
 
     it("4.7 correct by id → 'Corrected memory <id>: <content>'", async () => {
