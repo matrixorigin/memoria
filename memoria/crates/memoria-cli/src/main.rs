@@ -3600,7 +3600,7 @@ mod tests {
         LEGACY_MIGRATION_MAX_CONCURRENCY_ENV,
     };
     use super::{
-        enable_runtime_multi_db, normalize_tool_name, redact_url, run_with_edit_log_drain,
+        enable_runtime_multi_db, mask_key, normalize_tool_name, redact_url, run_with_edit_log_drain,
         validate_embedding_config, Cli, Commands, MigrationCommands,
     };
     use async_trait::async_trait;
