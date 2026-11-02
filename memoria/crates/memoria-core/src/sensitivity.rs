@@ -71,7 +71,7 @@ static PATTERNS: &[Pattern] = &[
     Pattern {
         label: "email",
         tier: SensitivityTier::Medium,
-        regex: r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}",
+        regex: r"[a-zA-Z0-9_.+-]+@(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}",
         replacement: "[email]",
     },
     Pattern {
