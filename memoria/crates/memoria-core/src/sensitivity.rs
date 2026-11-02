@@ -176,7 +176,7 @@ mod tests {
             "-----BEGIN ENCRYPTED PRIVATE KEY-----",
             "-----BEGIN PGP PRIVATE KEY BLOCK-----",
         ] {
-            let result = check_sensitivity(&format!("{header}\\nsynthetic-test-payload"));
+            let result = check_sensitivity(&format!("{header}\nsynthetic-test-payload"));
             assert!(result.blocked, "private key not blocked: {header}");
             assert_eq!(result.matched_labels, vec!["private_key"]);
             assert!(result.redacted_content.is_none());
