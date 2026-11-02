@@ -25,6 +25,7 @@ from .exceptions import (
     MemoriaNotFoundError,
     MemoriaServerError,
     MemoriaUnprocessableError,
+    MemoriaValidationError,
 )
 
 try:
@@ -164,6 +165,8 @@ class _HttpTransport:
         max_retries: int = _DEFAULT_MAX_RETRIES,
         retry_unsafe_writes: bool = False,
     ) -> None:
+        if type(max_retries) is not int or max_retries < 0:
+            raise MemoriaValidationError("max_retries must be a non-negative integer")
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._timeout = timeout
