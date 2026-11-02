@@ -218,6 +218,29 @@ describe("Group 3: Cloud API Communication", () => {
       expect(result.content[0].text).toBe("[]");
     });
 
+    it.each(["memory_retrieve", "memory_search"])(
+      "3.36a %s rejects malformed successful responses",
+      async (tool) => {
+        for (const response of [null, {}, { error: "upstream failed" }, { results: null }, "invalid", 42]) {
+          fetchMock.respondWith(200, response);
+          await expect(transport.callTool(tool, { query: "q" }))
+            .rejects.toThrow(/invalid memoria api memory list response/i);
+        }
+      },
+    );
+
+    it.each(["memory_retrieve", "memory_search"])(
+      "3.36b %s accepts every documented list envelope",
+      async (tool) => {
+        const item = { memory_id: "m1", content: "remember this" };
+        for (const response of [[item], { results: [item] }, { items: [item] }]) {
+          fetchMock.respondWith(200, response);
+          const result = await transport.callTool(tool, { query: "q" }) as any;
+          expect(JSON.parse(result.content[0].text)).toEqual([item]);
+        }
+      },
+    );
+
     it("3.38 memory_profile with profile → profile text", async () => {
       fetchMock.respondWith(200, { profile: "Likes TypeScript" });
       const result = await transport.callTool("memory_profile", {}) as any;
