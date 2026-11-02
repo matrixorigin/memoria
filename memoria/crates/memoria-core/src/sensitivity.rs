@@ -327,6 +327,25 @@ mod tests {
     }
 
     #[test]
+    fn email_redaction_covers_entire_multilabel_domain() {
+        for (address, expected) in [
+            ("bob@mail.example.com", "mail [email] now"),
+            ("bob@example.co.uk", "mail [email] now"),
+            ("alice@example.com", "mail [email] now"),
+        ] {
+            let input = format!("mail {address} now");
+            let result = check_sensitivity(&input);
+            assert!(!result.blocked, "email unexpectedly blocked: {address}");
+            assert_eq!(
+                result.redacted_content.as_deref(),
+                Some(expected),
+                "email domain tail survived redaction: {address}"
+            );
+            assert_eq!(result.matched_labels, vec!["email"]);
+        }
+    }
+
+    #[test]
     fn test_phone_redacted() {
         let r = check_sensitivity("call 555-867-5309 anytime");
         assert!(!r.blocked);
