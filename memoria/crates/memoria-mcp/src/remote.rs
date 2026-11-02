@@ -48,6 +48,29 @@ impl RemoteClient {
         format!("{}{}", self.base_url, path)
     }
 
+    // Tool arguments are opaque identifiers, never URL syntax. Encode their
+    // UTF-8 bytes as exactly one segment to prevent cross-endpoint requests.
+    fn path_segment(value: &str) -> Result<String> {
+        // WHATWG URL parsers normalize dot-only segments even if percent-encoded.
+        if value.is_empty() || value == "." || value == ".." {
+            return Err(crate::tool_result::input_error(
+                "Invalid remote path identifier: empty or dot-only segment".to_string(),
+            ));
+        }
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let mut encoded = String::with_capacity(value.len());
+        for byte in value.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                encoded.push(byte as char);
+            } else {
+                encoded.push('%');
+                encoded.push(HEX[(byte >> 4) as usize] as char);
+                encoded.push(HEX[(byte & 15) as usize] as char);
+            }
+        }
+        Ok(encoded)
+    }
+
     fn mcp_text(text: &str) -> Value {
         json!({"content": [{"type": "text", "text": text}]})
     }
@@ -394,8 +417,9 @@ impl RemoteClient {
                 let memory_id = args["memory_id"].as_str().unwrap_or("");
                 let query = args["query"].as_str().unwrap_or("");
                 let r = if !memory_id.is_empty() {
+                    let encoded_memory_id = Self::path_segment(memory_id)?;
                     self.client
-                        .put(self.url(&format!("/v1/memories/{memory_id}/correct")))
+                        .put(self.url(&format!("/v1/memories/{encoded_memory_id}/correct")))
                         .json(&json!({
                             "new_content": new_content,
                             "reason": args["reason"],
@@ -838,9 +862,10 @@ impl RemoteClient {
 
             "memory_rollback" => {
                 let name = args["name"].as_str().unwrap_or("");
+                let encoded_name = Self::path_segment(name)?;
                 let r = self
                     .client
-                    .post(self.url(&format!("/v1/snapshots/{name}/rollback")))
+                    .post(self.url(&format!("/v1/snapshots/{encoded_name}/rollback")))
                     .json(&json!({}))
                     .send()
                     .await?;
@@ -873,9 +898,10 @@ impl RemoteClient {
 
             "memory_checkout" => {
                 let name = args["name"].as_str().unwrap_or("");
+                let encoded_name = Self::path_segment(name)?;
                 let r = self
                     .client
-                    .post(self.url(&format!("/v1/branches/{name}/checkout")))
+                    .post(self.url(&format!("/v1/branches/{encoded_name}/checkout")))
                     .json(&json!({}))
                     .send()
                     .await?;
@@ -886,9 +912,10 @@ impl RemoteClient {
 
             "memory_merge" => {
                 let source = args["source"].as_str().unwrap_or("");
+                let encoded_source = Self::path_segment(source)?;
                 let r = self
                     .client
-                    .post(self.url(&format!("/v1/branches/{source}/merge")))
+                    .post(self.url(&format!("/v1/branches/{encoded_source}/merge")))
                     .json(&json!({"strategy": args["strategy"].as_str().unwrap_or("accept")}))
                     .send()
                     .await?;
@@ -899,13 +926,14 @@ impl RemoteClient {
 
             "memory_pick" => {
                 let source = args["source"].as_str().unwrap_or("");
+                let encoded_source = Self::path_segment(source)?;
                 let target = args["target"].as_str().unwrap_or("main");
                 let strategy = args["strategy"].as_str().unwrap_or("fail");
                 let dry_run = args.get("dry_run").cloned().unwrap_or(Value::Null);
                 let preview_requested = !dry_run.is_null();
                 let r = self
                     .client
-                    .post(self.url(&format!("/v1/branches/{source}/pick")))
+                    .post(self.url(&format!("/v1/branches/{encoded_source}/pick")))
                     .json(&json!({
                         "target": target,
                         "strategy": strategy,
@@ -936,10 +964,11 @@ impl RemoteClient {
             "memory_diff" => {
                 Self::expect_tool_args(&args, "memory_diff", &["source", "limit"])?;
                 let source = Self::required_string_arg(&args, "memory_diff", "source")?;
+                let encoded_source = Self::path_segment(&source)?;
                 let limit = Self::optional_i64_arg(&args, "memory_diff", "limit", 50)?;
                 let r = self
                     .client
-                    .get(self.url(&format!("/v1/branches/{source}/diff?limit={limit}")))
+                    .get(self.url(&format!("/v1/branches/{encoded_source}/diff?limit={limit}")))
                     .send()
                     .await?;
                 let body = Self::parse_response(r).await?;
@@ -959,9 +988,10 @@ impl RemoteClient {
                     ],
                 )?;
                 let source = Self::required_string_arg(&args, "memory_apply", "source")?;
+                let encoded_source = Self::path_segment(&source)?;
                 let r = self
                     .client
-                    .post(self.url(&format!("/v1/branches/{source}/apply")))
+                    .post(self.url(&format!("/v1/branches/{encoded_source}/apply")))
                     .json(&json!({
                         "adds": Self::json_array_arg(&args, "adds")?,
                         "updates": Self::json_array_arg(&args, "updates")?,
@@ -977,9 +1007,10 @@ impl RemoteClient {
 
             "memory_branch_delete" => {
                 let name = args["name"].as_str().unwrap_or("");
+                let encoded_name = Self::path_segment(name)?;
                 let r = self
                     .client
-                    .delete(self.url(&format!("/v1/branches/{name}")))
+                    .delete(self.url(&format!("/v1/branches/{encoded_name}")))
                     .send()
                     .await?;
                 let _body = Self::parse_response_allow_empty(r).await?;
@@ -1012,10 +1043,11 @@ impl RemoteClient {
 
             "memory_feedback" => {
                 let memory_id = args["memory_id"].as_str().unwrap_or("");
+                let encoded_memory_id = Self::path_segment(memory_id)?;
                 let signal = args["signal"].as_str().unwrap_or("");
                 let r = self
                     .client
-                    .post(self.url(&format!("/v1/memories/{memory_id}/feedback")))
+                    .post(self.url(&format!("/v1/memories/{encoded_memory_id}/feedback")))
                     .json(&json!({
                         "signal": signal,
                         "context": args["context"],
@@ -1048,6 +1080,29 @@ mod tests {
     };
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn path_segment_encoding_survives_url_parsing() {
+        for (value, expected) in [
+            ("../memories/victim", "..%2Fmemories%2Fvictim"),
+            ("snap#frag", "snap%23frag"),
+            ("a/b?x=1", "a%2Fb%3Fx%3D1"),
+            ("%2e%2e", "%252e%252e"),
+            ("中文", "%E4%B8%AD%E6%96%87"),
+            ("normal.name", "normal.name"),
+        ] {
+            let encoded = RemoteClient::path_segment(value).expect("valid path identifier");
+            assert_eq!(encoded, expected);
+            let url =
+                reqwest::Url::parse(&format!("https://example.test/v1/branches/{encoded}/merge"))
+                    .expect("valid URL");
+            assert_eq!(url.path(), format!("/v1/branches/{encoded}/merge"));
+            assert!(url.query().is_none(), "identifier injected a query");
+        }
+        for value in ["", ".", ".."] {
+            assert!(RemoteClient::path_segment(value).is_err(), "{value:?}");
+        }
+    }
 
     #[tokio::test]
     async fn remote_tool_path_arguments_cannot_escape_their_rest_endpoint() {
