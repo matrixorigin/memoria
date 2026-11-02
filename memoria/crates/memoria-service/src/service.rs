@@ -3564,8 +3564,18 @@ mod tests {
         for content in ["", "  ", "\t\n", "\u{2003}"] {
             let single = service
                 .store_memory_with_metadata_and_key_on_branch(
-                    "user", None, content, MemoryType::Semantic,
-                    None, None, None, None, None, None, None, None,
+                    "user",
+                    None,
+                    content,
+                    MemoryType::Semantic,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                 )
                 .await;
             assert!(
@@ -3578,8 +3588,12 @@ mod tests {
                     "user",
                     None,
                     vec![(
-                        content.to_string(), MemoryType::Semantic,
-                        None, None, None, None,
+                        content.to_string(),
+                        MemoryType::Semantic,
+                        None,
+                        None,
+                        None,
+                        None,
                     )],
                     None,
                 )
