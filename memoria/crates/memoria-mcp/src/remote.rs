@@ -1050,6 +1050,51 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[tokio::test]
+    async fn remote_tool_path_arguments_cannot_escape_their_rest_endpoint() {
+        use axum::http::{Method, StatusCode, Uri};
+
+        // Capture the real HTTP request URI. Returning 404 means the test can
+        // detect an accidentally routed mutation without modifying any data.
+        let requests = Arc::new(Mutex::new(Vec::<(Method, String, Option<String>)>::new()));
+        let captured = Arc::clone(&requests);
+        let app = Router::new().fallback(move |method: Method, uri: Uri| {
+            let captured = Arc::clone(&captured);
+            async move {
+                captured.lock().unwrap().push((
+                    method,
+                    uri.path().to_string(),
+                    uri.query().map(str::to_string),
+                ));
+                (StatusCode::NOT_FOUND, "not found")
+            }
+        });
+        let (base, server) = serve(app).await;
+        let remote = RemoteClient::new(&base, None, "test".into(), None);
+
+        let _ = remote
+            .call(
+                "memory_feedback",
+                json!({"memory_id": "../snapshots/precious/rollback?x=", "signal": "useful"}),
+            )
+            .await;
+        let _ = remote
+            .call("memory_branch_delete", json!({"name": "../memories/victim"}))
+            .await;
+
+        let actual = requests.lock().unwrap().clone();
+        server.abort();
+        assert_eq!(actual.len(), 2, "both tools must send one request");
+        assert_eq!(actual[0].0, Method::POST);
+        assert_eq!(
+            actual[0].1,
+            "/v1/memories/..%2Fsnapshots%2Fprecious%2Frollback%3Fx%3D/feedback"
+        );
+        assert_eq!(actual[0].2, None, "a path argument must not inject a query");
+        assert_eq!(actual[1].0, Method::DELETE);
+        assert_eq!(actual[1].1, "/v1/branches/..%2Fmemories%2Fvictim");
+    }
+
+    #[tokio::test]
     async fn remote_errors_preserve_plain_text_and_json_without_exposing_server_bodies() {
         use crate::tool_result::{error_kind, execution_error, ErrorKind};
         use axum::http::{header::CONTENT_TYPE, StatusCode};
