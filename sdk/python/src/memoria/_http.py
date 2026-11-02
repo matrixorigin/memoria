@@ -95,7 +95,7 @@ def _should_retry_network_error(
     if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
         return True
     retryable = isinstance(
-        exc, (httpx.TimeoutException, httpx.NetworkError, httpx.ProtocolError)
+        exc, (httpx.TimeoutException, httpx.NetworkError, httpx.ProtocolError, httpx.DecodingError)
     )
     if _is_idempotent(method, idempotent):
         return retryable
@@ -208,12 +208,10 @@ class _HttpTransport:
                     json=json,
                     timeout=self._timeout,
                 )
-            # httpx.TransportError covers every failure that produced no response —
-            # including ProtocolError/RemoteProtocolError ("server disconnected
-            # without sending a response") and ProxyError, which are siblings of
-            # NetworkError rather than subclasses. Catching the base class keeps
-            # new httpx subclasses from escaping the SDK hierarchy.
-            except httpx.TransportError as exc:
+            # DecodingError is outside TransportError: corrupt compressed response
+            # bytes fail while HTTPX reads the body. The request may have committed,
+            # so preserve the same idempotency/unsafe-write retry boundary.
+            except (httpx.TransportError, httpx.DecodingError) as exc:
                 last_exc = exc
                 if attempt < self._max_retries and _should_retry_network_error(
                     method, exc, self._retry_unsafe_writes, idempotent
@@ -277,9 +275,8 @@ class _HttpTransport:
                     json=json,
                     timeout=self._timeout,
                 )
-            # See the sync path: catch the TransportError base class so protocol and
-            # proxy failures cannot escape as raw httpx exceptions.
-            except httpx.TransportError as exc:
+            # See the sync path for compressed response decoding and replay safety.
+            except (httpx.TransportError, httpx.DecodingError) as exc:
                 last_exc = exc
                 if attempt < self._max_retries and _should_retry_network_error(
                     method, exc, self._retry_unsafe_writes, idempotent
