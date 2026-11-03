@@ -26,6 +26,13 @@ use tracing::Instrument;
 const MAX_RESULT_BYTES: usize = 1 << 20;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn caller_cancelled(cancel: &mut oneshot::Receiver<()>) -> bool {
+    matches!(
+        cancel.try_recv(),
+        Err(oneshot::error::TryRecvError::Closed) | Ok(())
+    )
+}
+
 fn database_failure(phase: &'static str, error: sqlx::Error) -> MemorySqlError {
     let code = error.as_database_error().and_then(|error| error.code());
     let number = error
@@ -93,13 +100,18 @@ impl MemorySqlGateway {
     }
 
     #[tracing::instrument(skip_all)]
-    pub async fn execute(
+    pub async fn execute<F>(
         self: &Arc<Self>,
-        store: Arc<SqlMemoryStore>,
+        store: F,
         scope: String,
         plan: PreparedMemoryQuery,
         parameters: Vec<Value>,
-    ) -> Result<MemorySqlResult, MemorySqlError> {
+    ) -> Result<MemorySqlResult, MemorySqlError>
+    where
+        F: std::future::Future<Output = Result<Arc<SqlMemoryStore>, MemorySqlError>>
+            + Send
+            + 'static,
+    {
         Self::validate_parameters(&plan, &parameters)?;
         if !self.healthy.load(Ordering::Acquire) {
             return Err(MemorySqlError::Unavailable);
@@ -110,7 +122,7 @@ impl MemorySqlGateway {
             .try_acquire_owned()
             .map_err(|_| MemorySqlError::Busy)?;
         let gateway = self.clone();
-        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
         let (result_tx, result_rx) = oneshot::channel();
         // The bounded task owns its permit until the DB query is drained and
         // its connection closed, including when an HTTP caller disconnects.
@@ -121,9 +133,20 @@ impl MemorySqlGateway {
                 let query_id = uuid::Uuid::new_v4().simple().to_string();
                 let fingerprint = plan.fingerprint.clone();
                 let scope_hash = format!("{:x}", Sha256::digest(scope.as_bytes()));
-                let result = gateway
-                    .run(store, &scope, plan, parameters, cancel_rx, &query_id)
-                    .await;
+                // Admission must also bound lazy user-database resolution; it
+                // cannot run outside the semaphore and flood database setup.
+                let result = async {
+                    if caller_cancelled(&mut cancel_rx) {
+                        return Err(MemorySqlError::Timeout);
+                    }
+                    let store = tokio::time::timeout(QUERY_TIMEOUT, store)
+                        .await
+                        .map_err(|_| MemorySqlError::Timeout)??;
+                    gateway
+                        .run(store, &scope, plan, parameters, cancel_rx, &query_id)
+                        .await
+                }
+                .await;
                 tracing::info!(
                     query_id,
                     fingerprint,
@@ -244,10 +267,7 @@ impl MemorySqlGateway {
             tokio::time::timeout(QUERY_TIMEOUT, self.reader_options(&store, scope))
                 .await
                 .map_err(|_| MemorySqlError::Timeout)??;
-        if matches!(
-            cancel.try_recv(),
-            Err(oneshot::error::TryRecvError::Closed) | Ok(())
-        ) {
+        if caller_cancelled(&mut cancel) {
             return Err(MemorySqlError::Timeout);
         }
         let database = options.get_database().ok_or(MemorySqlError::Unavailable)?;
@@ -486,6 +506,30 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn full_admission_never_resolves_a_database() {
+        let gateway = MemorySqlGateway::new(vec![37; 32]).unwrap();
+        let _held = gateway.permits.clone().acquire_many_owned(4).await.unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let observed = called.clone();
+        let result = gateway
+            .execute(
+                async move {
+                    called.store(true, Ordering::Release);
+                    Err(MemorySqlError::Unavailable)
+                },
+                "synthetic_owner".into(),
+                PreparedMemoryQuery::parse("SELECT memory_id FROM memories LIMIT 1").unwrap(),
+                vec![],
+            )
+            .await;
+        assert!(matches!(result, Err(MemorySqlError::Busy)));
+        assert!(
+            !observed.load(Ordering::Acquire),
+            "Admission rejection still initialized a database"
+        );
+    }
+
     /// Selected explicitly by the real-DB acceptance runner, not counted as a
     /// passing offline unit test when DATABASE_URL is absent.
     #[tokio::test]
@@ -564,7 +608,10 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), active.close()).await;
         let resumed = gateway
             .execute(
-                store.clone(),
+                {
+                    let store = store.clone();
+                    async move { Ok(store) }
+                },
                 scope.into(),
                 PreparedMemoryQuery::parse("SELECT memory_id FROM memories LIMIT 1").unwrap(),
                 vec![],
@@ -581,7 +628,7 @@ mod tests {
             callers.push(tokio::spawn(async move {
                 gateway
                     .execute(
-                        store,
+                        async move { Ok(store) },
                         scope.into(),
                         PreparedMemoryQuery::parse("SELECT memory_id FROM memories LIMIT 1")
                             .unwrap(),
@@ -599,7 +646,10 @@ mod tests {
         .is_ok();
         let excess = gateway
             .execute(
-                store.clone(),
+                {
+                    let store = store.clone();
+                    async move { Ok(store) }
+                },
                 scope.into(),
                 PreparedMemoryQuery::parse("SELECT memory_id FROM memories LIMIT 1").unwrap(),
                 vec![],

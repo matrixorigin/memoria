@@ -6,6 +6,23 @@ use memoria_storage::readonly_sql::MemorySqlGateway;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{ConnectOptions, Connection, Executor};
+use std::{
+    io::Write,
+    sync::{Arc, Mutex},
+};
+
+#[derive(Clone, Default)]
+struct SqlLogs(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SqlLogs {
+    fn write(&mut self, value: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(value);
+        Ok(value.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 struct FixedSqlEmbedding;
 
@@ -77,9 +94,14 @@ async fn disabled_sql_has_no_reader_objects_or_query_execution() {
 
 #[tokio::test]
 async fn sql_reads_only_authenticated_scope_and_rejects_unsafe_queries() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("memoria_storage::readonly_sql=warn")
-        .try_init();
+    let logs = SqlLogs::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter("memoria_storage::readonly_sql=info,sqlx=debug")
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
     let master = "synthetic-scoped-sql";
     let gateway = MemorySqlGateway::new(vec![19; 32]).unwrap();
     let server = support::multi_db::spawn_api_server_with_sql(
@@ -124,6 +146,13 @@ async fn sql_reads_only_authenticated_scope_and_rejects_unsafe_queries() {
     assert_eq!(result["rows"][0][0], ids[0]);
     assert_ne!(result["rows"][0][0], ids[1]);
     assert_eq!(result["rows"][0][2], "synthetic-agent");
+    let private_query = json!({"sql":"SELECT content FROM memories WHERE content = 'synthetic-private-sql-literal' AND subject_id = ? LIMIT 1", "parameters":["synthetic-private-sql-parameter"],"branch":"main"});
+    request(&private_query)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
     assert!(result["fingerprint"]
         .as_str()
         .is_some_and(|s| s.len() == 64));
@@ -285,4 +314,20 @@ async fn sql_reads_only_authenticated_scope_and_rejects_unsafe_queries() {
         .await
         .unwrap();
     admin.close().await.unwrap();
+    let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        captured.contains("memory SQL query completed"),
+        "SQL audit log was not actually captured"
+    );
+    for private in [
+        "synthetic-private-sql-literal",
+        "synthetic-private-sql-parameter",
+        sql_key.as_str(),
+        password.as_str(),
+    ] {
+        assert!(
+            !captured.contains(private),
+            "SQL logs exposed private query or authentication material"
+        );
+    }
 }

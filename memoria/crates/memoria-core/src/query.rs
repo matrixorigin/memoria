@@ -21,6 +21,21 @@ pub struct MetadataPredicate {
     pub value: Value,
 }
 
+/// Bounded object-key selector shared by retrieval filters and memory SQL.
+/// This intentionally does not accept recursive or wildcard JSONPath.
+pub fn valid_metadata_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 128
+        && path.split('.').all(|key| {
+            let mut chars = key.chars();
+            chars
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+                && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        })
+        && path.split('.').next() != Some(crate::STORE_REQUEST_HASH_FIELD)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryFilter {
@@ -51,18 +66,7 @@ impl MemoryFilter {
             ));
         }
         for predicate in &self.metadata {
-            let safe_path = !predicate.path.is_empty()
-                && predicate.path.len() <= 128
-                && predicate.path.split('.').all(|key| {
-                    let mut chars = key.chars();
-                    chars
-                        .next()
-                        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
-                        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-                });
-            if !safe_path
-                || predicate.path.split('.').next() == Some(crate::STORE_REQUEST_HASH_FIELD)
-            {
+            if !valid_metadata_path(&predicate.path) {
                 return Err(MemoriaError::Validation(
                     "filter metadata path must contain bounded object keys, not JSONPath".into(),
                 ));

@@ -53,6 +53,7 @@ pub struct PreparedMemoryQuery {
 
 enum Binding {
     Caller(usize),
+    JsonPathCaller(usize),
     Literal(serde_json::Value),
 }
 
@@ -120,14 +121,19 @@ impl PreparedMemoryQuery {
         if parameters.len() != self.parameter_count {
             return Err(MemorySqlError::Invalid);
         }
-        Ok(self
-            .bindings
+        self.bindings
             .iter()
             .map(|binding| match binding {
-                Binding::Caller(index) => parameters[*index].clone(),
-                Binding::Literal(value) => value.clone(),
+                Binding::Caller(index) => Ok(parameters[*index].clone()),
+                Binding::JsonPathCaller(index) => {
+                    if !parameters[*index].as_str().is_some_and(valid_json_path) {
+                        return Err(MemorySqlError::Invalid);
+                    }
+                    Ok(parameters[*index].clone())
+                }
+                Binding::Literal(value) => Ok(value.clone()),
             })
-            .collect())
+            .collect()
     }
 
     /// Only server-owned binding identifiers can be used here. The client
@@ -174,6 +180,13 @@ pub fn valid_identifier(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_')
         && value.as_bytes()[0].is_ascii_alphabetic()
+}
+
+fn valid_json_path(value: &str) -> bool {
+    value == "$"
+        || value
+            .strip_prefix("$.")
+            .is_some_and(memoria_core::query::valid_metadata_path)
 }
 
 struct Validator {
@@ -434,11 +447,39 @@ impl Validator {
                 {
                     return Err(MemorySqlError::Unsupported);
                 }
-                for argument in &mut args.args {
+                let name = function.name.0[0].value.to_ascii_lowercase();
+                let expected_args = match name.as_str() {
+                    "json_extract" | "l2_distance" | "cosine_distance" | "inner_product" => 2,
+                    _ => 1,
+                };
+                if args.args.len() != expected_args {
+                    return Err(MemorySqlError::Unsupported);
+                }
+                for (index, argument) in args.args.iter_mut().enumerate() {
                     let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = argument else {
                         return Err(MemorySqlError::Unsupported);
                     };
+                    let mut path_parameter = false;
+                    if name == "json_extract" && index == 1 {
+                        match expr {
+                            Expr::Value(Value::SingleQuotedString(path))
+                                if valid_json_path(path) =>
+                            {
+                                ()
+                            }
+                            Expr::Value(Value::Placeholder(marker)) if marker == "?" => {
+                                path_parameter = true
+                            }
+                            _ => return Err(MemorySqlError::Unsupported),
+                        }
+                    }
                     self.expression(expr, redact, allow_alias)?;
+                    if path_parameter {
+                        let Some(Binding::Caller(index)) = self.bindings.pop() else {
+                            unreachable!()
+                        };
+                        self.bindings.push(Binding::JsonPathCaller(index));
+                    }
                 }
             }
             _ => return Err(MemorySqlError::Unsupported),
@@ -522,5 +563,36 @@ mod tests {
         assert_eq!(values.len(), 2);
         assert!(values[0].as_str().unwrap().starts_with("synthetic'quote"));
         assert_eq!(values[1], "consumer");
+    }
+
+    #[test]
+    fn json_functions_cannot_expand_results_or_use_unbounded_paths() {
+        for sql in [
+            "SELECT JSON_EXTRACT(extra_metadata, '$', '$') FROM memories LIMIT 1",
+            "SELECT JSON_EXTRACT(extra_metadata, '$.*') FROM memories LIMIT 1",
+            "SELECT JSON_EXTRACT(extra_metadata, '$**.content') FROM memories LIMIT 1",
+            "SELECT JSON_EXTRACT(extra_metadata, content) FROM memories LIMIT 1",
+            "SELECT LOWER(content, content) FROM memories LIMIT 1",
+            "SELECT l2_distance(embedding) FROM memories LIMIT 1",
+        ] {
+            assert!(
+                PreparedMemoryQuery::parse(sql).is_err(),
+                "Accepted unbounded function: {sql}"
+            );
+        }
+        let query = PreparedMemoryQuery::parse(
+            "SELECT JSON_EXTRACT(extra_metadata, ?) FROM memories LIMIT 1",
+        )
+        .unwrap();
+        assert!(query
+            .bound_parameters(&[serde_json::json!("$.scope.agent_id")])
+            .is_ok());
+        for path in [
+            serde_json::json!("$.*"),
+            serde_json::json!("$**.content"),
+            serde_json::json!(true),
+        ] {
+            assert!(query.bound_parameters(&[path]).is_err());
+        }
     }
 }

@@ -60,13 +60,17 @@ pub async fn query(
     }
     let plan = PreparedMemoryQuery::parse(&request.sql).map_err(failure)?;
     MemorySqlGateway::validate_parameters(&plan, &request.parameters).map_err(failure)?;
-    let store = state
-        .service
-        .user_sql_store(auth.scope_id())
-        .await
-        .map_err(|_| failure(MemorySqlError::Unavailable))?;
+    let scope = auth.scope_id().to_owned();
+    let service = state.service.clone();
+    let target_scope = scope.clone();
+    let store = async move {
+        service
+            .user_sql_store(&target_scope)
+            .await
+            .map_err(|_| MemorySqlError::Unavailable)
+    };
     gateway
-        .execute(store, auth.scope_id().into(), plan, request.parameters)
+        .execute(store, scope, plan, request.parameters)
         .await
         .map(Json)
         .map_err(failure)
