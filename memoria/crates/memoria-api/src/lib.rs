@@ -173,7 +173,10 @@ fn should_mark_metrics_dirty(
         }
     }
 
-    if method == "PUT" && path.starts_with("/v1/memories/") && path.ends_with("/correct") {
+    if method == "PUT"
+        && path.starts_with("/v1/memories/")
+        && (path.ends_with("/correct") || path.ends_with("/correct-idempotent"))
+    {
         return Some(DirtyMask::MEMORY);
     }
 
@@ -209,6 +212,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/memories/:id/correct",
             put(routes::memory::correct_memory),
+        )
+        .route(
+            "/v1/memories/:id/correct-idempotent",
+            put(routes::memory::correct_memory_idempotent),
         )
         .route("/v1/memories/:id", delete(routes::memory::delete_memory))
         .route("/v1/observe", post(routes::memory::observe_turn))
@@ -533,6 +540,9 @@ mod tests {
         assert!(should_mark_metrics_dirty("POST", "/v1/snapshots/demo/rollback", 200).is_some());
         assert!(should_mark_metrics_dirty("DELETE", "/v1/branches/demo", 204).is_some());
         assert!(should_mark_metrics_dirty("POST", "/v1/sessions/abc/summary", 200).is_some());
+        assert!(
+            should_mark_metrics_dirty("PUT", "/v1/memories/abc/correct-idempotent", 200).is_some()
+        );
     }
 
     #[test]

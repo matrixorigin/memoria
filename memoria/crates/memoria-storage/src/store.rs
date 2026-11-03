@@ -6,7 +6,7 @@ use memoria_core::{
     interfaces::MemoryStore, nullable_str, nullable_str_from_row, MemoriaError, Memory,
     MemoryFilter, MemoryType, TrustTier,
 };
-use sqlx::{mysql::MySqlPool, MySql, QueryBuilder, Row};
+use sqlx::{mysql::MySqlPool, MySql, MySqlConnection, QueryBuilder, Row};
 use std::borrow::Cow;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -5457,6 +5457,15 @@ impl SqlMemoryStore {
 
     #[tracing::instrument(skip(self, memory), fields(memory_id = %memory.memory_id))]
     pub async fn insert_into(&self, table: &str, memory: &Memory) -> Result<(), MemoriaError> {
+        let mut connection = self.pool.acquire().await.map_err(db_err)?;
+        Self::insert_on_connection(&mut connection, table, memory).await
+    }
+
+    async fn insert_on_connection(
+        connection: &mut MySqlConnection,
+        table: &str,
+        memory: &Memory,
+    ) -> Result<(), MemoriaError> {
         let now = Utc::now().naive_utc();
         let observed_at = memory.observed_at.map(|dt| dt.naive_utc()).unwrap_or(now);
         let created_at = memory.created_at.map(|dt| dt.naive_utc()).unwrap_or(now);
@@ -5523,10 +5532,95 @@ impl SqlMemoryStore {
             .bind(observed_at)
             .bind(created_at)
             .bind(now)
-            .execute(&self.pool)
+            .execute(connection)
             .await
             .map_err(db_err)?;
         Ok(())
+    }
+
+    /// Replace a previously read active fact and retire its graph references in
+    /// one transaction. No second active memory may survive a failed correction.
+    /// The caller supplies a table resolved by table_for_branch, never user SQL.
+    #[tracing::instrument(skip_all)]
+    pub async fn replace_memory_atomically(
+        &self,
+        table: &str,
+        expected: &Memory,
+        replacement: &Memory,
+    ) -> Result<(), MemoriaError> {
+        if expected.user_id != replacement.user_id
+            || expected.subject_id != replacement.subject_id
+            || expected.memory_id == replacement.memory_id
+            || !expected.is_active
+            || !replacement.is_active
+        {
+            return Err(MemoriaError::Validation(
+                "invalid correction identity".into(),
+            ));
+        }
+        let mut transaction = self.pool.begin().await.map_err(db_err)?;
+        let row = sqlx::query(&format!(
+            "SELECT {FULLTEXT_MEMORY_COLUMNS} FROM {table} WHERE memory_id = ? AND user_id = ? FOR UPDATE"
+        ))
+        .bind(&expected.memory_id)
+        .bind(&expected.user_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| MemoriaError::NotFound("memory".into()))?;
+        let current = row_to_memory(&row)?;
+        if !current.is_active
+            || current.subject_id != expected.subject_id
+            || current.content != expected.content
+            || current.memory_type != expected.memory_type
+            || current.extra_metadata != expected.extra_metadata
+            || current.updated_at != expected.updated_at
+        {
+            return Err(MemoriaError::Conflict(
+                "memory changed during correction".into(),
+            ));
+        }
+        let changed = sqlx::query(&format!(
+            "UPDATE {table} SET is_active = 0, superseded_by = ?, updated_at = NOW() WHERE memory_id = ? AND user_id = ? AND is_active = 1"
+        ))
+        .bind(&replacement.memory_id)
+        .bind(&expected.memory_id)
+        .bind(&expected.user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(db_err)?;
+        if changed.rows_affected() != 1 {
+            return Err(MemoriaError::Conflict(
+                "memory changed during correction".into(),
+            ));
+        }
+        // Keep the nullable parameter shapes identical to every other insertion.
+        Self::insert_on_connection(&mut transaction, table, replacement).await?;
+        // Graph retrieval is main-only. A branch clone may share IDs with main;
+        // correcting it must not retire the main branch's graph references.
+        if table == self.t("mem_memories") {
+            sqlx::query(&format!(
+                "UPDATE {} SET is_active = 0 WHERE memory_id = ? AND user_id = ?",
+                self.t("memory_graph_nodes")
+            ))
+            .bind(&expected.memory_id)
+            .bind(&expected.user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(db_err)?;
+            for relation in ["mem_memory_entity_links", "mem_entity_links"] {
+                sqlx::query(&format!(
+                    "DELETE FROM {} WHERE memory_id = ? AND user_id = ?",
+                    self.t(relation)
+                ))
+                .bind(&expected.memory_id)
+                .bind(&expected.user_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(db_err)?;
+            }
+        }
+        transaction.commit().await.map_err(db_err)
     }
 
     /// Batch-insert multiple memories in a single multi-row INSERT statement.

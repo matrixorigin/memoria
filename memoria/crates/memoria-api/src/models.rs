@@ -354,6 +354,15 @@ pub struct CorrectRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdempotentCorrectRequest {
+    pub new_content: String,
+    pub subject_id: String,
+    pub branch: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Deserialize)]
 pub struct CorrectByQueryRequest {
     pub query: String,
     pub new_content: String,

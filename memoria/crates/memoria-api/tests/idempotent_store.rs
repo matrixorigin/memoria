@@ -346,7 +346,11 @@ async fn owner_scoped_store_replays_real_receipts_and_rejects_missing_keys() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 422);
+    assert_eq!(
+        response.status(),
+        409,
+        "a different payload with the same key is a conflict, not invalid syntax"
+    );
     let mut missing = body.clone();
     missing.as_object_mut().unwrap().remove("idempotency_key");
     assert_eq!(

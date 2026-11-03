@@ -23,6 +23,7 @@ pub fn api_err_typed(e: memoria_core::MemoriaError) -> (StatusCode, String) {
     use memoria_core::MemoriaError::*;
     let status = match &e {
         NotFound(_) => StatusCode::NOT_FOUND,
+        Conflict(_) => StatusCode::CONFLICT,
         Validation(_) | InvalidMemoryType(_) | InvalidTrustTier(_) => {
             StatusCode::UNPROCESSABLE_ENTITY
         }
@@ -589,6 +590,64 @@ pub async fn get_memory(
     }
 
     Ok(Json(None))
+}
+
+/// A separate protocol cannot be mistaken for the old non-idempotent endpoint
+/// when a caller reaches an older Memoria instance during an upgrade.
+pub async fn correct_memory_idempotent(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    request: Result<Json<IdempotentCorrectRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<MemoryResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let Json(request) = request.map_err(|_| {
+        memory_record_error(memoria_core::MemoriaError::Validation(
+            "invalid body".into(),
+        ))
+    })?;
+    let memory = state
+        .service
+        .correct_with_key_on_branch(
+            auth.scope_id(),
+            &request.branch,
+            &id,
+            &request.subject_id,
+            &request.new_content,
+            &request.idempotency_key,
+        )
+        .await
+        .map_err(memory_record_error)?;
+    Ok(Json(memory.into()))
+}
+
+fn memory_record_error(error: memoria_core::MemoriaError) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, _) = api_err_typed(error);
+    let (code, message) = match status {
+        StatusCode::UNPROCESSABLE_ENTITY => (
+            "memory_record_invalid",
+            "The memory data request is invalid.",
+        ),
+        StatusCode::CONFLICT => (
+            "memory_record_conflict",
+            "The request conflicts with the stored memory state.",
+        ),
+        StatusCode::NOT_FOUND => (
+            "memory_resource_not_found",
+            "The requested memory resource was not found.",
+        ),
+        StatusCode::FORBIDDEN => (
+            "memory_record_denied",
+            "The memory data request is not permitted.",
+        ),
+        _ => (
+            "memory_record_unavailable",
+            "The memory data request could not be completed.",
+        ),
+    };
+    (
+        status,
+        Json(serde_json::json!({"code": code, "message": message})),
+    )
 }
 
 pub async fn correct_memory(

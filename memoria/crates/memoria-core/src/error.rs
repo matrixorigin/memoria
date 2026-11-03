@@ -30,6 +30,9 @@ pub enum MemoriaError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
     #[error("Blocked: {0}")]
     Blocked(String),
 }

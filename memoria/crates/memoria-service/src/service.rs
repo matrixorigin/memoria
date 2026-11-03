@@ -2259,8 +2259,6 @@ impl MemoryService {
         .await
     }
 
-    // TODO(concurrency): concurrent correct on same memory_id can create duplicate
-    // new memories. Consider SELECT FOR UPDATE or optimistic locking.
     pub async fn correct(
         &self,
         user_id: &str,
@@ -2278,6 +2276,58 @@ impl MemoryService {
         memory_id: &str,
         new_content: &str,
     ) -> Result<Memory, MemoriaError> {
+        self.correct_inner(user_id, branch, memory_id, new_content, None, None)
+            .await
+    }
+
+    /// A correction receipt is bound to authenticated owner, explicit branch,
+    /// original memory, subject and request payload. Replays cannot insert twice.
+    #[tracing::instrument(skip_all)]
+    pub async fn correct_with_key_on_branch(
+        &self,
+        user_id: &str,
+        branch: &str,
+        memory_id: &str,
+        subject_id: &str,
+        new_content: &str,
+        key: &str,
+    ) -> Result<Memory, MemoriaError> {
+        if branch.trim().is_empty()
+            || branch.trim() != branch
+            || subject_id.trim().is_empty()
+            || subject_id.trim() != subject_id
+            || self.sql_store.is_none()
+        {
+            return Err(MemoriaError::Validation(
+                "an explicit branch, subject and SQL storage are required".into(),
+            ));
+        }
+        // Reject malformed retry identities before resolving/provisioning storage.
+        idempotent_memory_id(user_id, Some(branch), key)?;
+        self.correct_inner(
+            user_id,
+            Some(branch),
+            memory_id,
+            new_content,
+            Some(subject_id),
+            Some(key),
+        )
+        .await
+    }
+
+    async fn correct_inner(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        memory_id: &str,
+        new_content: &str,
+        subject_id: Option<&str>,
+        key: Option<&str>,
+    ) -> Result<Memory, MemoriaError> {
+        let requested_content = new_content;
+        if new_content.trim().is_empty() {
+            return Err(MemoriaError::Validation("content must not be empty".into()));
+        }
         if new_content.len() > MAX_MEMORY_CONTENT_BYTES {
             return Err(MemoriaError::Validation(
                 "content exceeds 32 KiB limit".into(),
@@ -2300,13 +2350,55 @@ impl MemoryService {
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
             let table = sql.table_for_branch(user_id, branch).await?;
-            let old = sql
-                .get_from(&table, memory_id)
-                .await?
-                .filter(|memory| memory.user_id == user_id)
-                .ok_or_else(|| MemoriaError::NotFound(memory_id.to_string()))?;
+            let receipt = key
+                .map(|key| {
+                    correction_receipt(
+                        user_id,
+                        branch.expect("receipt requires explicit branch"),
+                        memory_id,
+                        subject_id.expect("receipt requires subject"),
+                        requested_content,
+                        key,
+                    )
+                })
+                .transpose()?;
+            if let Some((id, hash)) = &receipt {
+                if let Some(existing) = sql.get_from(&table, id).await? {
+                    if existing.subject_id.as_deref() != subject_id {
+                        return Err(MemoriaError::NotFound("memory".into()));
+                    }
+                    return validate_idempotent_receipt(existing, user_id, hash);
+                }
+            }
+            let old = sql.get_from(&table, memory_id).await?.filter(|memory| {
+                memory.user_id == user_id
+                    && subject_id
+                        .is_none_or(|subject| memory.subject_id.as_deref() == Some(subject))
+            });
+            let Some(old) = old else {
+                // A concurrent request can commit between the receipt and old
+                // lookups. Confirm the same durable result, never invent a retry.
+                if let Some((id, hash)) = &receipt {
+                    if let Some(existing) = sql.get_from(&table, id).await? {
+                        if existing.subject_id.as_deref() != subject_id {
+                            return Err(MemoriaError::NotFound("memory".into()));
+                        }
+                        return validate_idempotent_receipt(existing, user_id, hash);
+                    }
+                }
+                return Err(MemoriaError::NotFound("memory".into()));
+            };
 
-            let new_id = Uuid::now_v7().simple().to_string();
+            let new_id = receipt
+                .as_ref()
+                .map(|(id, _)| id.clone())
+                .unwrap_or_else(|| Uuid::now_v7().simple().to_string());
+            let mut metadata = correction_metadata(&old);
+            if let Some((_, hash)) = &receipt {
+                metadata
+                    .get_or_insert_with(HashMap::new)
+                    .insert(STORE_REQUEST_HASH_FIELD.into(), serde_json::json!(hash));
+            }
             let new_mem = Memory {
                 memory_id: new_id,
                 user_id: old.user_id.clone(),
@@ -2317,7 +2409,7 @@ impl MemoryService {
                 embedding: self.embed(new_content).await?,
                 session_id: old.session_id.clone(),
                 source_event_ids: vec![format!("correct:{}", memory_id)],
-                extra_metadata: correction_metadata(&old),
+                extra_metadata: metadata,
                 observed_at: Some(Utc::now()),
                 created_at: Some(Utc::now()),
                 updated_at: None,
@@ -2329,13 +2421,19 @@ impl MemoryService {
                 subject_id: old.subject_id.clone(),
             };
 
-            sql.insert_into(&table, &new_mem).await?;
-            // Supersede + cleanup are independent — run in parallel
-            let (sup_res, _) = tokio::join!(
-                sql.supersede_memory(&table, memory_id, &new_mem.memory_id),
-                Self::cleanup_entity_data_for_memory(sql.as_ref(), memory_id, "correct"),
-            );
-            sup_res?;
+            if let Err(error) = sql.replace_memory_atomically(&table, &old, &new_mem).await {
+                // This also confirms an uncertain COMMIT acknowledgement when
+                // the exact durable receipt is already visible.
+                if let Some((id, hash)) = &receipt {
+                    if let Some(existing) = sql.get_from(&table, id).await? {
+                        if existing.subject_id.as_deref() != subject_id {
+                            return Err(MemoriaError::NotFound("memory".into()));
+                        }
+                        return validate_idempotent_receipt(existing, user_id, hash);
+                    }
+                }
+                return Err(error);
+            }
 
             self.report(StatsEvent::MemoryStored {
                 user_id: user_id.to_string(),
@@ -2360,8 +2458,10 @@ impl MemoryService {
                 None,
             );
 
-            self.enqueue_entity_extraction(user_id, &new_mem.memory_id, new_content)
-                .await;
+            if table == sql.t("mem_memories") {
+                self.enqueue_entity_extraction(user_id, &new_mem.memory_id, new_content)
+                    .await;
+            }
 
             Ok(new_mem)
         } else {
@@ -3825,11 +3925,34 @@ fn validate_idempotent_receipt(
             .and_then(serde_json::Value::as_str)
             != Some(request_hash)
     {
-        return Err(MemoriaError::Validation(
+        return Err(MemoriaError::Conflict(
             "idempotency_key was already used for another payload or an inactive receipt".into(),
         ));
     }
     Ok(memory)
+}
+
+fn correction_receipt(
+    owner: &str,
+    branch: &str,
+    original: &str,
+    subject: &str,
+    content: &str,
+    key: &str,
+) -> Result<(String, String), MemoriaError> {
+    // Validate the same public key alphabet without sharing the store's identity
+    // namespace. IDs remain canonical 32-character hex, including for cursors.
+    idempotent_memory_id(owner, Some(branch), key)?;
+    use sha2::{Digest, Sha256};
+    let identity = serde_json::json!(["memoria.correct.v1", owner, branch, original, key]);
+    let digest = Sha256::digest(serde_json::to_vec(&identity)?);
+    let mut receipt = [0_u8; 16];
+    receipt.copy_from_slice(&digest[..16]);
+    let payload = serde_json::json!([original, subject, content]);
+    Ok((
+        format!("{:032x}", u128::from_be_bytes(receipt)),
+        format!("{:x}", Sha256::digest(serde_json::to_vec(&payload)?)),
+    ))
 }
 
 #[cfg(test)]
