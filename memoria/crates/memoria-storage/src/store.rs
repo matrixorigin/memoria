@@ -1,9 +1,10 @@
+use crate::filter::append_memory_filter;
 use crate::router::DbRouter;
 use async_trait::async_trait;
 use chrono::{NaiveDateTime, Utc};
 use memoria_core::{
-    interfaces::MemoryStore, nullable_str, nullable_str_from_row, MemoriaError, Memory, MemoryType,
-    TrustTier,
+    interfaces::MemoryStore, nullable_str, nullable_str_from_row, MemoriaError, Memory,
+    MemoryFilter, MemoryType, TrustTier,
 };
 use sqlx::{mysql::MySqlPool, MySql, QueryBuilder, Row};
 use std::borrow::Cow;
@@ -103,8 +104,7 @@ fn is_empty_fulltext_pattern_error(error: &sqlx::Error) -> bool {
                 .downcast_ref::<MySqlDatabaseError>()
         })
         .is_some_and(|mysql_error| {
-            mysql_error.number() == 20101
-                && mysql_error.message().contains("empty pattern")
+            mysql_error.number() == 20101 && mysql_error.message().contains("empty pattern")
         })
 }
 
@@ -2038,9 +2038,7 @@ impl SqlMemoryStore {
                      (column was added by a concurrent request): {e}"
                 ),
                 Err(e) => {
-                    tracing::error!(
-                        "migration: failed to add subject_id to {memories_table}: {e}"
-                    );
+                    tracing::error!("migration: failed to add subject_id to {memories_table}: {e}");
                     return Err(db_err(e));
                 }
             }
@@ -5232,10 +5230,7 @@ impl SqlMemoryStore {
         // None means the memory is not subject-scoped; only compare against
         // other unscoped rows (subject_id IS NULL).
         let subject_clause = match subject_id {
-            Some(sid) => format!(
-                " AND subject_id = '{}'",
-                sanitize_sql_literal(sid)
-            ),
+            Some(sid) => format!(" AND subject_id = '{}'", sanitize_sql_literal(sid)),
             None => " AND subject_id IS NULL".to_string(),
         };
         let sql = format!(
@@ -5592,9 +5587,7 @@ impl SqlMemoryStore {
                 if let Some(subject_id) = &m.subject_id {
                     q = q.bind(subject_id.clone());
                 }
-                q = q
-                    .bind(m.memory_type.to_string())
-                    .bind(m.content.clone());
+                q = q.bind(m.memory_type.to_string()).bind(m.content.clone());
                 if let Some(embedding) = embedding {
                     q = q.bind(embedding);
                 }
@@ -5732,6 +5725,7 @@ impl SqlMemoryStore {
         cursor: Option<&str>,
         subject_id: Option<&str>,
         extra_metadata_filter: &std::collections::HashMap<String, serde_json::Value>,
+        filter: &MemoryFilter,
     ) -> Result<Vec<Memory>, MemoriaError> {
         if !(1..=501).contains(&limit) {
             return Err(MemoriaError::Validation(
@@ -5743,64 +5737,46 @@ impl SqlMemoryStore {
         let mut metadata_filters: Vec<_> = extra_metadata_filter.iter().collect();
         metadata_filters.sort_by_key(|(key, _)| *key);
 
-        let mut inner =
-            format!("SELECT memory_id FROM {table} WHERE user_id = ? AND is_active = 1");
-        if let Some(types) = memory_types.filter(|types| !types.is_empty()) {
-            inner.push_str(" AND memory_type IN (");
-            inner.push_str(&vec!["?"; types.len()].join(", "));
-            inner.push(')');
-        }
-        if session_id.is_some() {
-            inner.push_str(" AND session_id = ?");
-        }
-        if trust_tier.is_some() {
-            inner.push_str(" AND trust_tier = ?");
-        }
-        if subject_id.is_some() {
-            inner.push_str(" AND subject_id = ?");
-        }
-        if cursor.is_some() {
-            inner.push_str(" AND memory_id < ?");
-        }
-        for (key, _) in &metadata_filters {
-            inner.push_str(&format!(
-                " AND json_extract(extra_metadata, '$.{key}') = CAST(? AS JSON)"
-            ));
-        }
-        inner.push_str(" ORDER BY memory_id DESC LIMIT ?");
-
-        let sql = format!(
+        let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
             "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
-             session_id, is_active, superseded_by, trust_tier, \
-             initial_confidence, observed_at, created_at, updated_at, \
-             CAST(extra_metadata AS CHAR) AS extra_meta \
-             FROM {table} WHERE memory_id IN ({inner}) \
-             ORDER BY memory_id DESC"
-        );
-
-        let mut query = sqlx::query(&sql).bind(user_id);
+             session_id, is_active, superseded_by, trust_tier, initial_confidence, \
+             observed_at, created_at, updated_at, CAST(extra_metadata AS CHAR) AS extra_meta \
+             FROM {table} WHERE user_id = "
+        ));
+        query.push_bind(user_id).push(" AND is_active = 1");
         if let Some(types) = memory_types.filter(|types| !types.is_empty()) {
+            query.push(" AND memory_type IN (");
+            let mut values = query.separated(", ");
             for memory_type in types {
-                query = query.bind(memory_type.to_string());
+                values.push_bind(memory_type.to_string());
             }
+            values.push_unseparated(")");
         }
         if let Some(value) = session_id {
-            query = query.bind(value);
+            query.push(" AND session_id = ").push_bind(value);
         }
         if let Some(value) = trust_tier {
-            query = query.bind(value);
+            query.push(" AND trust_tier = ").push_bind(value);
         }
         if let Some(value) = subject_id {
-            query = query.bind(value);
+            query.push(" AND subject_id = ").push_bind(value);
         }
         if let Some(value) = cursor {
-            query = query.bind(value);
+            query.push(" AND memory_id < ").push_bind(value);
         }
-        for (_, value) in metadata_filters {
-            query = query.bind(serde_json::to_string(value)?);
+        for (key, value) in metadata_filters {
+            query
+                .push(" AND json_extract(extra_metadata, ")
+                .push_bind(format!("$.{key}"))
+                .push(") = CAST(")
+                .push_bind(serde_json::to_string(value)?)
+                .push(" AS JSON)");
         }
-        query = query.bind(limit);
-        let rows = query.fetch_all(&self.pool).await.map_err(db_err)?;
+        append_memory_filter(&mut query, filter)?;
+        query
+            .push(" ORDER BY memory_id DESC LIMIT ")
+            .push_bind(limit);
+        let rows = query.build().fetch_all(&self.pool).await.map_err(db_err)?;
         rows.iter().map(row_to_memory_lite).collect()
     }
 
@@ -5904,8 +5880,17 @@ impl SqlMemoryStore {
         query: &str,
         limit: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
-        self.search_fulltext_from_scoped(table, user_id, query, limit, None, None, None)
-            .await
+        self.search_fulltext_from_scoped(
+            table,
+            user_id,
+            query,
+            limit,
+            None,
+            None,
+            None,
+            &MemoryFilter::default(),
+        )
+        .await
     }
 
     /// Search all distinct terms in bounded batches. Fusion is approximate:
@@ -5921,7 +5906,9 @@ impl SqlMemoryStore {
         session_id: Option<&str>,
         subject_id: Option<&str>,
         memory_types: Option<&[MemoryType]>,
+        filter: &MemoryFilter,
     ) -> Result<Vec<Memory>, MemoriaError> {
+        filter.validate()?;
         let batches = fulltext_query_batches(query);
         if batches.is_empty() || limit <= 0 {
             return Ok(Vec::new());
@@ -5937,6 +5924,7 @@ impl SqlMemoryStore {
                     subject_id,
                     memory_types,
                     true,
+                    filter,
                 )
                 .await?;
             return rows
@@ -5974,6 +5962,7 @@ impl SqlMemoryStore {
                 subject_id,
                 memory_types,
                 false,
+                filter,
             )
             .await
         }))
@@ -6014,6 +6003,7 @@ impl SqlMemoryStore {
                 }
                 stmt.push(")");
             }
+            append_memory_filter(&mut stmt, filter)?;
             stmt.push(" AND memory_id IN (");
             let mut separated = stmt.separated(", ");
             for (id, _) in chunk {
@@ -6048,6 +6038,7 @@ impl SqlMemoryStore {
         subject_id: Option<&str>,
         memory_types: Option<&[MemoryType]>,
         include_memory: bool,
+        filter: &MemoryFilter,
     ) -> Result<Vec<sqlx::mysql::MySqlRow>, MemoriaError> {
         let session_clause = match session_id {
             Some(session) => format!(
@@ -6080,7 +6071,20 @@ impl SqlMemoryStore {
         // MatrixOne 4.1.2 can return no rows when re-executing a prepared MATCH
         // query. Use the text protocol, as in vector search, with escaped scope
         // literals and an already-sanitized query. Hydration still uses binds.
-        fulltext_rows_or_empty(sqlx::raw_sql(&sql).fetch_all(&self.pool).await)
+        if filter.is_empty() {
+            return fulltext_rows_or_empty(sqlx::raw_sql(&sql).fetch_all(&self.pool).await);
+        }
+        let mut statement = QueryBuilder::<MySql>::new(format!(
+            "SELECT {columns}, MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) AS ft_score \
+             FROM {table} WHERE user_id = '{}' AND is_active = 1{session_clause}{subject_clause}{types_clause}",
+            sanitize_sql_literal(user_id),
+        ));
+        append_memory_filter(&mut statement, filter)?;
+        statement.push(format!(
+            " AND MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) \
+             ORDER BY ft_score DESC, memory_id ASC LIMIT {limit}"
+        ));
+        fulltext_rows_or_empty(statement.build().fetch_all(&self.pool).await)
     }
 
     /// Pure MatrixOne full-text search with exact structured SQL pre-filters.
@@ -6100,13 +6104,12 @@ impl SqlMemoryStore {
         trust_tier: Option<&str>,
         subject_id: Option<&str>,
         extra_metadata_filter: &std::collections::HashMap<String, serde_json::Value>,
+        filter: &MemoryFilter,
     ) -> Result<Vec<Memory>, MemoriaError> {
         if !(1..=FULLTEXT_SEARCH_MAX_LIMIT).contains(&limit) {
-            return Err(MemoriaError::Validation(
-                format!(
-                    "fulltext search storage limit must be between 1 and {FULLTEXT_SEARCH_MAX_LIMIT}"
-                ),
-            ));
+            return Err(MemoriaError::Validation(format!(
+                "fulltext search storage limit must be between 1 and {FULLTEXT_SEARCH_MAX_LIMIT}"
+            )));
         }
         validate_fulltext_query(query)?;
         validate_extra_metadata_filter(extra_metadata_filter)?;
@@ -6116,58 +6119,47 @@ impl SqlMemoryStore {
         let mut metadata_filters: Vec<_> = extra_metadata_filter.iter().collect();
         metadata_filters.sort_by_key(|(key, _)| *key);
 
-        let mut sql = format!(
+        let mut statement = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
             "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
              session_id, is_active, superseded_by, trust_tier, \
              initial_confidence, observed_at, created_at, updated_at, \
              CAST(extra_metadata AS CHAR) AS extra_meta, \
              MATCH(content) AGAINST('{safe_query}' IN BOOLEAN MODE) AS ft_score \
-             FROM {table} WHERE user_id = ? AND is_active = 1"
-        );
-        if let Some(types) = memory_types.filter(|types| !types.is_empty()) {
-            sql.push_str(" AND memory_type IN (");
-            sql.push_str(&vec!["?"; types.len()].join(", "));
-            sql.push(')');
-        }
-        if session_id.is_some() {
-            sql.push_str(" AND session_id = ?");
-        }
-        if trust_tier.is_some() {
-            sql.push_str(" AND trust_tier = ?");
-        }
-        if subject_id.is_some() {
-            sql.push_str(" AND subject_id = ?");
-        }
-        for (key, _) in &metadata_filters {
-            sql.push_str(&format!(
-                " AND json_extract(extra_metadata, '$.{key}') = CAST(? AS JSON)"
-            ));
-        }
-        sql.push_str(&format!(
-            " AND MATCH(content) AGAINST('{safe_query}' IN BOOLEAN MODE) \
-             ORDER BY ft_score DESC, memory_id DESC LIMIT ?"
+             FROM {table} WHERE user_id = "
         ));
-
-        let mut statement = sqlx::query(&sql).bind(user_id);
+        statement.push_bind(user_id).push(" AND is_active = 1");
         if let Some(types) = memory_types.filter(|types| !types.is_empty()) {
+            statement.push(" AND memory_type IN (");
+            let mut values = statement.separated(", ");
             for memory_type in types {
-                statement = statement.bind(memory_type.to_string());
+                values.push_bind(memory_type.to_string());
             }
+            values.push_unseparated(")");
         }
         if let Some(value) = session_id {
-            statement = statement.bind(value);
+            statement.push(" AND session_id = ").push_bind(value);
         }
         if let Some(value) = trust_tier {
-            statement = statement.bind(value);
+            statement.push(" AND trust_tier = ").push_bind(value);
         }
         if let Some(value) = subject_id {
-            statement = statement.bind(value);
+            statement.push(" AND subject_id = ").push_bind(value);
         }
-        for (_, value) in metadata_filters {
-            statement = statement.bind(serde_json::to_string(value)?);
+        for (key, value) in metadata_filters {
+            statement
+                .push(" AND json_extract(extra_metadata, ")
+                .push_bind(format!("$.{key}"))
+                .push(") = CAST(")
+                .push_bind(serde_json::to_string(value)?)
+                .push(" AS JSON)");
         }
-
-        let rows = fulltext_rows_or_empty(statement.bind(limit).fetch_all(&self.pool).await)?;
+        append_memory_filter(&mut statement, filter)?;
+        statement.push(format!(
+            " AND MATCH(content) AGAINST('{safe_query}' IN BOOLEAN MODE) \
+             ORDER BY ft_score DESC, memory_id DESC LIMIT "
+        ));
+        statement.push_bind(limit);
+        let rows = fulltext_rows_or_empty(statement.build().fetch_all(&self.pool).await)?;
         rows.iter()
             .map(|row| {
                 let mut memory = row_to_memory_lite(row)?;
@@ -6197,7 +6189,15 @@ impl SqlMemoryStore {
         session_id: Option<&str>,
     ) -> Result<Vec<Memory>, MemoriaError> {
         self.search_vector_from_filtered_scoped(
-            table, user_id, embedding, limit, None, session_id, None, None,
+            table,
+            user_id,
+            embedding,
+            limit,
+            None,
+            session_id,
+            None,
+            None,
+            &MemoryFilter::default(),
         )
         .await
     }
@@ -6212,7 +6212,15 @@ impl SqlMemoryStore {
         memory_type: Option<&str>,
     ) -> Result<Vec<Memory>, MemoriaError> {
         self.search_vector_from_filtered_scoped(
-            table, user_id, embedding, limit, memory_type, None, None, None,
+            table,
+            user_id,
+            embedding,
+            limit,
+            memory_type,
+            None,
+            None,
+            None,
+            &MemoryFilter::default(),
         )
         .await
     }
@@ -6231,7 +6239,15 @@ impl SqlMemoryStore {
         session_id: Option<&str>,
         subject_id: Option<&str>,
         memory_types: Option<&[MemoryType]>,
+        filter: &MemoryFilter,
     ) -> Result<Vec<Memory>, MemoriaError> {
+        if embedding.len() != self.embedding_dim || embedding.iter().any(|value| !value.is_finite())
+        {
+            return Err(MemoriaError::Validation(
+                "query_vector must have the configured dimension and finite components".into(),
+            ));
+        }
+        filter.validate()?;
         let vec_literal = vec_to_mo(embedding);
         let type_clause = match memory_type {
             Some(mt) => format!(" AND memory_type = '{}'", sanitize_sql_literal(mt)),
@@ -6248,13 +6264,23 @@ impl SqlMemoryStore {
             Some(sid) => format!(" AND subject_id = '{}'", sanitize_sql_literal(sid)),
             None => String::new(),
         };
-        let rank_mode = if session_id.is_some() { "pre" } else { "post" };
-        let build_sql = |rank_mode: Option<&str>| {
-            let limit_clause = match rank_mode {
-                Some(mode) => format!("LIMIT {limit} by rank with option 'mode={mode}'"),
-                None => format!("LIMIT {limit}"),
-            };
-            format!(
+        let rank_mode = if session_id.is_some()
+            || subject_id.is_some()
+            || memory_type.is_some()
+            || memory_types.is_some_and(|types| !types.is_empty())
+            || !filter.is_empty()
+        {
+            "pre"
+        } else {
+            "post"
+        };
+        let build_sql =
+            |rank_mode: Option<&str>| -> Result<QueryBuilder<'static, MySql>, MemoriaError> {
+                let limit_clause = match rank_mode {
+                    Some(mode) => format!("LIMIT {limit} by rank with option 'mode={mode}'"),
+                    None => format!("LIMIT {limit}"),
+                };
+                let mut statement = QueryBuilder::<MySql>::new(format!(
                 "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
                  session_id, \
                  CAST(source_event_ids AS CHAR) AS src_ids, \
@@ -6263,22 +6289,29 @@ impl SqlMemoryStore {
                  observed_at, created_at, updated_at, \
                  l2_distance(embedding, '{vec_literal}') AS l2_dist \
                  FROM {table} \
-                 WHERE user_id = '{}' AND is_active = 1 AND embedding IS NOT NULL{type_clause}{session_clause}{subject_clause} \
-                 ORDER BY l2_distance(embedding, '{vec_literal}') ASC \
-                 {limit_clause}",
+                 WHERE user_id = '{}' AND is_active = 1 AND embedding IS NOT NULL{type_clause}{session_clause}{subject_clause}",
                 sanitize_sql_literal(user_id),
-            )
-        };
-        // MatrixOne bug workaround: prepared statement with l2_distance in ORDER BY returns 0 rows
-        // Solution: inline all parameters instead of using bind()
-        let mut rows = sqlx::query(&build_sql(Some(rank_mode)))
+            ));
+                append_memory_filter(&mut statement, filter)?;
+                statement.push(format!(
+                    " ORDER BY l2_distance(embedding, '{vec_literal}') ASC {limit_clause}"
+                ));
+                Ok(statement)
+            };
+        // Retain the existing inline vector/scope expressions needed by
+        // MatrixOne's vector plan. Common predicate values remain bound.
+        let mut statement = build_sql(Some(rank_mode))?;
+        let mut rows = statement
+            .build()
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
         // Strict session retrieval must preserve session-scoped semantics even if
         // MatrixOne's IVF pre-filter path under-fills top_k on a tiny candidate set.
         if session_id.is_some() && rows.len() < limit as usize {
-            rows = sqlx::query(&build_sql(None))
+            let mut statement = build_sql(None)?;
+            rows = statement
+                .build()
                 .fetch_all(&self.pool)
                 .await
                 .map_err(db_err)?;
@@ -6337,6 +6370,7 @@ impl SqlMemoryStore {
                 session_id,
                 None,
                 None,
+                &MemoryFilter::default(),
             )
             .await?;
         Ok(mems)
@@ -6363,6 +6397,7 @@ impl SqlMemoryStore {
             None,
             None,
             None,
+            &MemoryFilter::default(),
         )
         .await
     }
@@ -6379,18 +6414,34 @@ impl SqlMemoryStore {
         session_id: Option<&str>,
         subject_id: Option<&str>,
         memory_types: Option<&[MemoryType]>,
+        filter: &MemoryFilter,
     ) -> Result<(Vec<Memory>, Vec<(String, f64, f64, f64, f64, f64)>), MemoriaError> {
         let fetch_k = (limit * 3).max(20);
         let (vec_results, ft_results) = tokio::join!(
             self.search_vector_from_filtered_scoped(
-                table, user_id, embedding, fetch_k, None, session_id, subject_id, memory_types
+                table,
+                user_id,
+                embedding,
+                fetch_k,
+                None,
+                session_id,
+                subject_id,
+                memory_types,
+                filter
             ),
             self.search_fulltext_from_scoped(
-                table, user_id, query, fetch_k, session_id, subject_id, memory_types
+                table,
+                user_id,
+                query,
+                fetch_k,
+                session_id,
+                subject_id,
+                memory_types,
+                filter
             )
         );
         let vec_results = vec_results?;
-        let ft_results = ft_results.unwrap_or_default();
+        let ft_results = ft_results?;
 
         let (mut candidates, ft_map) = merge_hybrid_results(vec_results, ft_results);
 
@@ -6996,7 +7047,10 @@ impl MemoryStore for SqlMemoryStore {
 
     /// Reads inactive history from main (`mem_memories`) only. For branch-scoped
     /// observe exclusions, use `observe_exclusion_content_from` with that table.
-    async fn get_including_inactive(&self, memory_id: &str) -> Result<Option<Memory>, MemoriaError> {
+    async fn get_including_inactive(
+        &self,
+        memory_id: &str,
+    ) -> Result<Option<Memory>, MemoriaError> {
         let table = self.t("mem_memories");
         let row = sqlx::query(&format!(
             "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \

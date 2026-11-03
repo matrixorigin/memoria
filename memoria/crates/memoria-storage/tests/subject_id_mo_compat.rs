@@ -183,7 +183,16 @@ async fn test_list_active_lite_filters_by_subject_id() {
         .unwrap();
 
     let alice = store
-        .list_active_lite("mem_memories", &uid, 20, None, None, None, None, Some(subject_a))
+        .list_active_lite(
+            "mem_memories",
+            &uid,
+            20,
+            None,
+            None,
+            None,
+            None,
+            Some(subject_a),
+        )
         .await
         .expect("list alice");
     assert_eq!(alice.len(), 2);
@@ -192,7 +201,16 @@ async fn test_list_active_lite_filters_by_subject_id() {
     }
 
     let bob = store
-        .list_active_lite("mem_memories", &uid, 20, None, None, None, None, Some(subject_b))
+        .list_active_lite(
+            "mem_memories",
+            &uid,
+            20,
+            None,
+            None,
+            None,
+            None,
+            Some(subject_b),
+        )
         .await
         .expect("list bob");
     assert_eq!(bob.len(), 1);
@@ -225,7 +243,16 @@ async fn test_list_active_lite_null_subject_excluded_when_filtering() {
         .unwrap();
 
     let scoped = store
-        .list_active_lite("mem_memories", &uid, 20, None, None, None, None, Some(subject))
+        .list_active_lite(
+            "mem_memories",
+            &uid,
+            20,
+            None,
+            None,
+            None,
+            None,
+            Some(subject),
+        )
         .await
         .expect("list scoped");
     assert_eq!(scoped.len(), 1);
@@ -326,11 +353,15 @@ async fn test_search_fulltext_scoped_subject_and_memory_types() {
             None,
             Some(subject),
             Some(&[MemoryType::Semantic]),
+            &memoria_core::MemoryFilter::default(),
         )
         .await
         .expect("fulltext scoped");
 
-    assert!(!results.is_empty(), "fulltext should match scoped semantic memory");
+    assert!(
+        !results.is_empty(),
+        "fulltext should match scoped semantic memory"
+    );
     for m in &results {
         assert_eq!(m.subject_id.as_deref(), Some(subject));
         assert_eq!(m.memory_type, MemoryType::Semantic);
@@ -402,6 +433,7 @@ async fn test_search_vector_scoped_subject_and_memory_types() {
             None,
             Some(subject),
             Some(&[MemoryType::Semantic]),
+            &memoria_core::MemoryFilter::default(),
         )
         .await
         .expect("vector scoped");
@@ -460,6 +492,7 @@ async fn test_search_hybrid_scoped_subject_isolation() {
             None,
             Some(subject),
             None,
+            &memoria_core::MemoryFilter::default(),
         )
         .await
         .expect("hybrid scoped");

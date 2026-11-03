@@ -2,7 +2,7 @@ use crate::content_filter::check_content_sensitivity;
 use chrono::{DateTime, Utc};
 use memoria_core::{
     interfaces::{EmbeddingProvider, MemoryStore},
-    MemoriaError, Memory, MemoryType, TrustTier,
+    MemoriaError, Memory, MemoryFilter, MemoryType, TrustTier,
 };
 use memoria_embedding::llm::ChatMessage;
 use memoria_embedding::LlmClient;
@@ -93,7 +93,7 @@ fn normalize_opt_string(s: Option<String>) -> Option<String> {
 }
 
 /// Extra retrieval controls that must be threaded through the full retrieval pipeline.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RetrieveOptions {
     session_id: Option<String>,
     session_scope: SessionScope,
@@ -101,6 +101,7 @@ pub struct RetrieveOptions {
     subject_id: Option<String>,
     /// Restrict results to these memory types. Empty/None means no type filter.
     memory_types: Option<Vec<MemoryType>>,
+    filter: MemoryFilter,
 }
 
 impl RetrieveOptions {
@@ -113,6 +114,7 @@ impl RetrieveOptions {
             session_scope: session_scope.unwrap_or(SessionScope::Prefer),
             subject_id: None,
             memory_types: None,
+            filter: MemoryFilter::default(),
         }
     }
 
@@ -124,6 +126,15 @@ impl RetrieveOptions {
     pub fn with_memory_types(mut self, memory_types: Option<Vec<MemoryType>>) -> Self {
         self.memory_types = memory_types.filter(|v| !v.is_empty());
         self
+    }
+
+    pub fn with_filter(mut self, filter: MemoryFilter) -> Self {
+        self.filter = filter;
+        self
+    }
+
+    pub fn filter(&self) -> &MemoryFilter {
+        &self.filter
     }
 
     pub fn session_id(&self) -> Option<&str> {
@@ -167,6 +178,7 @@ pub struct ListActiveOptions<'a> {
 /// keyword, graph, or relevance-scoring work.
 #[derive(Debug, Clone)]
 pub struct StructuredQueryOptions {
+    pub filter: MemoryFilter,
     pub limit: i64,
     pub memory_types: Option<Vec<MemoryType>>,
     pub session_id: Option<String>,
@@ -181,6 +193,7 @@ pub struct StructuredQueryOptions {
 /// unscoped memories.
 #[derive(Debug, Clone)]
 pub struct FulltextSearchOptions {
+    pub filter: MemoryFilter,
     pub limit: i64,
     pub memory_types: Option<Vec<MemoryType>>,
     pub session_id: Option<String>,
@@ -1863,7 +1876,7 @@ impl MemoryService {
         }
     }
 
-    #[tracing::instrument(skip(self), fields(user_id, top_k))]
+    #[tracing::instrument(skip(self, query, options), fields(user_id, top_k))]
     async fn retrieve_inner(
         &self,
         user_id: &str,
@@ -1873,6 +1886,12 @@ impl MemoryService {
         level: ExplainLevel,
         options: &RetrieveOptions,
     ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
+        options.filter.validate()?;
+        if self.sql_store.is_none() && !options.filter.is_empty() {
+            return Err(MemoriaError::Validation(
+                "structured retrieval filters require SQL storage".into(),
+            ));
+        }
         let total_start = std::time::Instant::now();
         let mut explain = RetrievalExplain {
             level,
@@ -1903,6 +1922,7 @@ impl MemoryService {
             if strict_session_id.is_none()
                 && subject_id.is_none()
                 && memory_types.is_none()
+                && options.filter.is_empty()
                 && table == main_table
             {
                 if let Some(ref embedding) = emb {
@@ -2001,6 +2021,7 @@ impl MemoryService {
                                     None,
                                     subject_id,
                                     memory_types,
+                                    &options.filter,
                                 )
                                 .await?;
                             explain.vector_ms = vs_start.elapsed().as_secs_f64() * 1000.0;
@@ -2078,6 +2099,7 @@ impl MemoryService {
                         strict_session_id,
                         subject_id,
                         memory_types,
+                        &options.filter,
                     )
                     .await?;
                 explain.vector_ms = vs_start.elapsed().as_secs_f64() * 1000.0;
@@ -2117,6 +2139,7 @@ impl MemoryService {
                     strict_session_id,
                     subject_id,
                     memory_types,
+                    &options.filter,
                 )
                 .await?;
             explain.fulltext_ms = ft_start.elapsed().as_secs_f64() * 1000.0;
@@ -2777,10 +2800,10 @@ impl MemoryService {
         // Normalize all string filters once at the boundary so that both the SQL
         // path and the fallback path treat "  alice  " and "" identically.
         let memory_type = options.memory_type.map(str::trim).filter(|s| !s.is_empty());
-        let session_id  = options.session_id.map(str::trim).filter(|s| !s.is_empty());
-        let trust_tier  = options.trust_tier.map(str::trim).filter(|s| !s.is_empty());
-        let subject_id  = options.subject_id.map(str::trim).filter(|s| !s.is_empty());
-        let cursor      = options.cursor.map(str::trim).filter(|s| !s.is_empty());
+        let session_id = options.session_id.map(str::trim).filter(|s| !s.is_empty());
+        let trust_tier = options.trust_tier.map(str::trim).filter(|s| !s.is_empty());
+        let subject_id = options.subject_id.map(str::trim).filter(|s| !s.is_empty());
+        let cursor = options.cursor.map(str::trim).filter(|s| !s.is_empty());
 
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
@@ -2844,6 +2867,7 @@ impl MemoryService {
                     options.cursor.as_deref(),
                     options.subject_id.as_deref(),
                     &options.extra_metadata_filter,
+                    &options.filter,
                 )
                 .await;
         }
@@ -2883,6 +2907,47 @@ impl MemoryService {
             trust_tier.as_deref(),
             options.subject_id.as_deref(),
             &options.extra_metadata_filter,
+            &options.filter,
+        )
+        .await
+    }
+
+    /// Search an externally produced query vector without embedding, fusion,
+    /// graph expansion, confidence weighting, or feedback mutations.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_query_vector_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        query_vector: &[f32],
+        top_k: i64,
+        subject_id: Option<&str>,
+        memory_types: Option<&[MemoryType]>,
+        filter: &MemoryFilter,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        if !(1..=100).contains(&top_k) {
+            return Err(MemoriaError::Validation(
+                "top_k must be between 1 and 100".into(),
+            ));
+        }
+        filter.validate()?;
+        if self.sql_store.is_none() {
+            return Err(MemoriaError::Validation(
+                "query vector search requires SQL storage".into(),
+            ));
+        }
+        let sql = self.user_sql_store(user_id).await?;
+        let table = sql.table_for_branch(user_id, branch).await?;
+        sql.search_vector_from_filtered_scoped(
+            &table,
+            user_id,
+            query_vector,
+            top_k,
+            None,
+            None,
+            subject_id,
+            memory_types,
+            filter,
         )
         .await
     }
@@ -3588,8 +3653,8 @@ mod tests {
 
     #[test]
     fn retrieve_options_with_subject_id_empty_becomes_none() {
-        let opts = RetrieveOptions::from_session_scope(None, None)
-            .with_subject_id(Some("  ".to_string()));
+        let opts =
+            RetrieveOptions::from_session_scope(None, None).with_subject_id(Some("  ".to_string()));
         assert_eq!(opts.subject_id(), None);
     }
 

@@ -212,7 +212,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/v1/memories/:id", delete(routes::memory::delete_memory))
         .route("/v1/observe", post(routes::memory::observe_turn))
-        .route("/v1/observe/deduplicated", post(routes::memory::observe_turn_deduplicated))
+        .route(
+            "/v1/observe/deduplicated",
+            post(routes::memory::observe_turn_deduplicated),
+        )
         .route(
             "/v1/sessions/:session_id/summary",
             post(routes::sessions::create_session_summary),
@@ -252,6 +255,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/v1/memories/retrieve", post(routes::memory::retrieve))
         .route("/v1/memories/search", post(routes::memory::search))
+        .route(
+            "/v1/memories/vector-search",
+            post(routes::memory::vector_search),
+        )
         .route("/v1/memories/:id", get(routes::memory::get_memory))
         .route(
             "/v1/memories/:id/history",

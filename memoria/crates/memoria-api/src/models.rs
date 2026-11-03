@@ -1,7 +1,7 @@
 //! Request/Response types for the REST API.
 //! Mirrors Python's api/models.py and api/_model_types.py.
 
-use memoria_core::{Memory, MemoryType, TrustTier};
+use memoria_core::{Memory, MemoryFilter, MemoryType, TrustTier};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -50,6 +50,8 @@ pub struct RetrieveRequest {
     pub subject_id: Option<String>,
     pub memory_types: Option<Vec<String>>,
     pub branch: Option<String>,
+    #[serde(default)]
+    pub filter: MemoryFilter,
     /// Explain level: false/"none" = off, true/"basic" = basic, "verbose" = per-candidate scores, "analyze" = full
     #[serde(default, deserialize_with = "deserialize_explain")]
     pub explain: String,
@@ -68,7 +70,7 @@ fn parse_session_scope(
         .transpose()
 }
 
-fn parse_memory_types_opt(
+pub(crate) fn parse_memory_types_opt(
     types: Option<&Vec<String>>,
 ) -> Result<Option<Vec<MemoryType>>, String> {
     let mut parsed = types
@@ -110,15 +112,15 @@ impl RetrieveRequest {
     }
 
     pub fn retrieve_options(&self) -> Result<memoria_service::RetrieveOptions, String> {
+        self.filter.validate().map_err(|error| error.to_string())?;
         let memory_types = parse_memory_types_opt(self.memory_types.as_ref())?;
-        Ok(
-            memoria_service::RetrieveOptions::from_session_scope(
-                self.session_id.as_deref(),
-                self.session_scope()?,
-            )
-            .with_subject_id(self.subject_id.clone())
-            .with_memory_types(memory_types),
+        Ok(memoria_service::RetrieveOptions::from_session_scope(
+            self.session_id.as_deref(),
+            self.session_scope()?,
         )
+        .with_subject_id(self.subject_id.clone())
+        .with_memory_types(memory_types)
+        .with_filter(self.filter.clone()))
     }
 }
 
@@ -132,6 +134,8 @@ pub struct SearchRequest {
     pub subject_id: Option<String>,
     pub memory_types: Option<Vec<String>>,
     pub branch: Option<String>,
+    #[serde(default)]
+    pub filter: MemoryFilter,
     #[serde(default, deserialize_with = "deserialize_explain")]
     pub explain: String,
 }
@@ -149,20 +153,34 @@ impl SearchRequest {
     }
 
     pub fn retrieve_options(&self) -> Result<memoria_service::RetrieveOptions, String> {
+        self.filter.validate().map_err(|error| error.to_string())?;
         let memory_types = parse_memory_types_opt(self.memory_types.as_ref())?;
-        Ok(
-            memoria_service::RetrieveOptions::from_session_scope(
-                self.session_id.as_deref(),
-                self.session_scope()?,
-            )
-            .with_subject_id(self.subject_id.clone())
-            .with_memory_types(memory_types),
+        Ok(memoria_service::RetrieveOptions::from_session_scope(
+            self.session_id.as_deref(),
+            self.session_scope()?,
         )
+        .with_subject_id(self.subject_id.clone())
+        .with_memory_types(memory_types)
+        .with_filter(self.filter.clone()))
     }
 }
 
 fn default_structured_query_limit() -> i64 {
     100
+}
+
+/// The vector must be generated with the same embedding model and dimension as
+/// stored memories. Dimension equality alone does not imply model compatibility.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VectorSearchRequest {
+    pub query_vector: Vec<f32>,
+    pub top_k: i64,
+    pub subject_id: Option<String>,
+    pub memory_types: Option<Vec<String>>,
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub filter: MemoryFilter,
 }
 
 /// A pure structured query. All supplied selectors are combined with AND.
@@ -171,6 +189,8 @@ fn default_structured_query_limit() -> i64 {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StructuredQueryRequest {
+    #[serde(default)]
+    pub filter: MemoryFilter,
     #[serde(default)]
     pub extra_metadata_filter: HashMap<String, serde_json::Value>,
     pub subject_id: Option<String>,
@@ -185,6 +205,7 @@ pub struct StructuredQueryRequest {
 
 impl StructuredQueryRequest {
     pub fn structured_options(&self) -> Result<memoria_service::StructuredQueryOptions, String> {
+        self.filter.validate().map_err(|err| err.to_string())?;
         if !(1..=500).contains(&self.limit) {
             return Err("limit must be between 1 and 500".to_string());
         }
@@ -193,8 +214,7 @@ impl StructuredQueryRequest {
 
         let subject_id = normalized_filter("subject_id", self.subject_id.as_deref())?;
         let session_id = normalized_filter("session_id", self.session_id.as_deref())?;
-        let normalized_trust_tier =
-            normalized_filter("trust_tier", self.trust_tier.as_deref())?;
+        let normalized_trust_tier = normalized_filter("trust_tier", self.trust_tier.as_deref())?;
         let branch = normalized_filter("branch", self.branch.as_deref())?;
         let trust_tier = normalized_trust_tier
             .as_deref()
@@ -209,6 +229,7 @@ impl StructuredQueryRequest {
         }
         let memory_types = parse_memory_types_opt(self.memory_types.as_ref())?;
         if self.extra_metadata_filter.is_empty()
+            && self.filter.is_empty()
             && subject_id.is_none()
             && session_id.is_none()
             && trust_tier.is_none()
@@ -234,6 +255,7 @@ impl StructuredQueryRequest {
             cursor,
             subject_id,
             extra_metadata_filter: self.extra_metadata_filter.clone(),
+            filter: self.filter.clone(),
         })
     }
 }
@@ -247,6 +269,8 @@ fn default_fulltext_search_limit() -> i64 {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FulltextSearchRequest {
+    #[serde(default)]
+    pub filter: MemoryFilter,
     pub query: String,
     #[serde(default)]
     pub extra_metadata_filter: HashMap<String, serde_json::Value>,
@@ -261,6 +285,7 @@ pub struct FulltextSearchRequest {
 
 impl FulltextSearchRequest {
     pub fn fulltext_options(&self) -> Result<memoria_service::FulltextSearchOptions, String> {
+        self.filter.validate().map_err(|err| err.to_string())?;
         if !(1..=memoria_storage::FULLTEXT_SEARCH_MAX_LIMIT).contains(&self.limit) {
             return Err(format!(
                 "limit must be between 1 and {}",
@@ -284,6 +309,7 @@ impl FulltextSearchRequest {
             trust_tier,
             subject_id,
             extra_metadata_filter: self.extra_metadata_filter.clone(),
+            filter: self.filter.clone(),
         })
     }
 
@@ -349,14 +375,12 @@ impl CorrectByQueryRequest {
 
     pub fn retrieve_options(&self) -> Result<memoria_service::RetrieveOptions, String> {
         let memory_types = parse_memory_types_opt(self.memory_types.as_ref())?;
-        Ok(
-            memoria_service::RetrieveOptions::from_session_scope(
-                self.session_id.as_deref(),
-                parse_session_scope(self.session_scope.as_deref())?,
-            )
-            .with_subject_id(self.subject_id.clone())
-            .with_memory_types(memory_types),
+        Ok(memoria_service::RetrieveOptions::from_session_scope(
+            self.session_id.as_deref(),
+            parse_session_scope(self.session_scope.as_deref())?,
         )
+        .with_subject_id(self.subject_id.clone())
+        .with_memory_types(memory_types))
     }
 }
 

@@ -370,7 +370,15 @@ pub async fn batch_store(
     for (content, mt_result, tier_result, session_id, branch, subject_id, extra_metadata) in items {
         let mt = mt_result?;
         let tier = tier_result?;
-        validated.push((content, mt, session_id, tier, branch, subject_id, extra_metadata));
+        validated.push((
+            content,
+            mt,
+            session_id,
+            tier,
+            branch,
+            subject_id,
+            extra_metadata,
+        ));
     }
 
     let author = if auth.group_id.is_some() {
@@ -380,9 +388,11 @@ pub async fn batch_store(
     };
     let batch_items = validated
         .into_iter()
-        .map(|(content, mt, session_id, tier, _branch, subject_id, extra_metadata)| {
-            (content, mt, session_id, tier, subject_id, extra_metadata)
-        })
+        .map(
+            |(content, mt, session_id, tier, _branch, subject_id, extra_metadata)| {
+                (content, mt, session_id, tier, subject_id, extra_metadata)
+            },
+        )
         .collect();
     let results = state
         .service
@@ -493,6 +503,61 @@ pub async fn search(
             .map(Into::into)
             .collect::<Vec<MemoryResponse>>())))
     }
+}
+
+pub async fn vector_search(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    request: Result<Json<VectorSearchRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<Vec<MemoryResponse>>, (StatusCode, Json<serde_json::Value>)> {
+    let Json(req) = request.map_err(|_| {
+        vector_query_error(memoria_core::MemoriaError::Validation(
+            "invalid query body".into(),
+        ))
+    })?;
+    let memory_types = parse_memory_types_opt(req.memory_types.as_ref()).map_err(|_| {
+        vector_query_error(memoria_core::MemoriaError::Validation(
+            "invalid memory type".into(),
+        ))
+    })?;
+    let results = state
+        .service
+        .search_query_vector_on_branch(
+            auth.scope_id(),
+            branch_param(req.branch.as_deref()),
+            &req.query_vector,
+            req.top_k,
+            req.subject_id.as_deref(),
+            memory_types.as_deref(),
+            &req.filter,
+        )
+        .await
+        .map_err(vector_query_error)?;
+    Ok(Json(results.into_iter().map(Into::into).collect()))
+}
+
+// Reuse the owner's existing status classification, but do not expose database
+// diagnostics on the new public query primitive.
+fn vector_query_error(error: memoria_core::MemoriaError) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, _) = api_err_typed(error);
+    let (code, message) = match status {
+        StatusCode::UNPROCESSABLE_ENTITY => {
+            ("memory_query_invalid", "The memory query is invalid.")
+        }
+        StatusCode::NOT_FOUND => (
+            "memory_resource_not_found",
+            "The requested memory resource was not found.",
+        ),
+        StatusCode::FORBIDDEN => ("memory_query_denied", "The memory query is not permitted."),
+        _ => (
+            "memory_query_unavailable",
+            "The memory query could not be completed.",
+        ),
+    };
+    (
+        status,
+        Json(serde_json::json!({"code": code, "message": message})),
+    )
 }
 
 pub async fn get_memory(
@@ -764,10 +829,7 @@ pub async fn get_profile(
         )
         .await
         .map_err(api_err)?;
-    let profile: Vec<_> = memories
-        .iter()
-        .map(|m| m.content.as_str())
-        .collect();
+    let profile: Vec<_> = memories.iter().map(|m| m.content.as_str()).collect();
 
     // Stats enrichment follows the same subject_id scope as the profile query.
     let stats_rows = if let Some(sid) = subject_id {
@@ -777,7 +839,11 @@ pub async fn get_profile(
              MIN(observed_at) as oldest, MAX(observed_at) as newest \
              FROM {table} WHERE user_id = ? AND subject_id = ? AND is_active = 1 GROUP BY memory_type"
         );
-        sqlx::query(&q).bind(&resolved).bind(sid).fetch_all(sql.pool()).await
+        sqlx::query(&q)
+            .bind(&resolved)
+            .bind(sid)
+            .fetch_all(sql.pool())
+            .await
     } else {
         let q = format!(
             "SELECT memory_type, COUNT(*) as cnt, \

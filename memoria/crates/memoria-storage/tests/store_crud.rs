@@ -243,6 +243,7 @@ async fn test_fulltext_batches_merge_scores_limit_and_scopes() {
                 Some(session),
                 Some(subject),
                 Some(&types),
+                &memoria_core::MemoryFilter::default(),
             )
             .await
             .expect("single batch");
@@ -270,6 +271,7 @@ async fn test_fulltext_batches_merge_scores_limit_and_scopes() {
             Some(session),
             Some(subject),
             Some(&types),
+            &memoria_core::MemoryFilter::default(),
         )
         .await
         .expect("merged fulltext search");
@@ -492,6 +494,7 @@ async fn test_search_vector_from_filtered_scoped_prefilters_by_session() {
             None,
             None,
             None,
+            &memoria_core::MemoryFilter::default(),
         )
         .await
         .expect("global vector search");
@@ -511,6 +514,7 @@ async fn test_search_vector_from_filtered_scoped_prefilters_by_session() {
             Some("sess-target"),
             None,
             None,
+            &memoria_core::MemoryFilter::default(),
         )
         .await
         .expect("session-scoped vector search");
@@ -574,6 +578,7 @@ async fn test_search_vector_from_filtered_scoped_fills_limit_with_session_candid
             Some("sess-target"),
             None,
             None,
+            &memoria_core::MemoryFilter::default(),
         )
         .await
         .expect("session-scoped vector search");
@@ -794,13 +799,12 @@ async fn test_insert_normalizes_empty_nullable_strings() {
         .await
         .expect("insert empty nullable strings");
 
-    let stored: (Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT session_id, superseded_by FROM mem_memories WHERE memory_id = ?",
-    )
-    .bind(&id)
-    .fetch_one(store.pool())
-    .await
-    .expect("read raw nullable strings");
+    let stored: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT session_id, superseded_by FROM mem_memories WHERE memory_id = ?")
+            .bind(&id)
+            .fetch_one(store.pool())
+            .await
+            .expect("read raw nullable strings");
     assert_eq!(stored, (None, None), "empty strings must be stored as NULL");
 }
 
@@ -853,13 +857,12 @@ async fn test_batch_insert_normalizes_empty_nullable_strings() {
         .await
         .expect("batch insert empty nullable strings");
 
-    let stored: (Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT session_id, superseded_by FROM mem_memories WHERE memory_id = ?",
-    )
-    .bind(&id)
-    .fetch_one(store.pool())
-    .await
-    .expect("read raw batch nullable strings");
+    let stored: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT session_id, superseded_by FROM mem_memories WHERE memory_id = ?")
+            .bind(&id)
+            .fetch_one(store.pool())
+            .await
+            .expect("read raw batch nullable strings");
     assert_eq!(stored, (None, None), "empty strings must be stored as NULL");
 }
 
@@ -1128,10 +1131,14 @@ async fn test_topic_purge_fallback_exceeds_500_matches() {
         .find_ids_by_topic("mem_memories", &uid, ":::")
         .await
         .expect("find literal topic matches");
-    let expected: std::collections::HashSet<_> =
-        memories[..501].iter().map(|m| m.memory_id.clone()).collect();
+    let expected: std::collections::HashSet<_> = memories[..501]
+        .iter()
+        .map(|m| m.memory_id.clone())
+        .collect();
     assert_eq!(
-        ids.iter().cloned().collect::<std::collections::HashSet<_>>(),
+        ids.iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>(),
         expected,
         "topic purge must not silently truncate matches at 500"
     );

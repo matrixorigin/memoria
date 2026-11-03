@@ -176,6 +176,7 @@ fn required_scope_for_request(method: &axum::http::Method, path: &str) -> Option
                     | "/v1/memories/fulltext-search"
                     | "/v1/memories/retrieve"
                     | "/v1/memories/search"
+                    | "/v1/memories/vector-search"
             ))
     {
         Some(SCOPE_MEMORY_READ)
@@ -1490,7 +1491,8 @@ mod tests {
             &axum::http::Method::POST,
             "/v1/observe/deduplicated",
             &parse_scopes("memory:read")
-        ).is_err());
+        )
+        .is_err());
         assert_eq!(
             required_scope_for_request(&axum::http::Method::POST, "/v1/memories/retrieve"),
             Some(SCOPE_MEMORY_READ)
@@ -1665,10 +1667,7 @@ mod tests {
         assert_eq!(resolve_personal_user_id(&headers, None).unwrap(), "alice");
 
         let headers = axum::http::HeaderMap::new();
-        assert_eq!(
-            resolve_personal_user_id(&headers, None).unwrap(),
-            "default"
-        );
+        assert_eq!(resolve_personal_user_id(&headers, None).unwrap(), "default");
     }
 
     #[test]

@@ -1,9 +1,11 @@
 pub mod error;
 pub mod interfaces;
+pub mod query;
 pub mod sensitivity;
 pub mod types;
 
 pub use error::MemoriaError;
+pub use query::{MemoryFilter, MetadataOperator, MetadataPredicate};
 pub use sensitivity::{check_sensitivity, SensitivityResult, SensitivityTier};
 pub use types::{Memory, MemoryType, TrustTier, FEEDBACK_SIGNALS};
 
