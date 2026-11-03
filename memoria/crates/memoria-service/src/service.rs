@@ -1411,7 +1411,7 @@ impl MemoryService {
             let table = sql
                 .table_for_branch(user_id, Some(&resolved_branch))
                 .await?;
-            if let Some(existing) = sql.get_from(&table, &id).await? {
+            if let Some(existing) = sql.get_retry_receipt_from(&table, &id, user_id).await? {
                 return validate_idempotent_receipt(existing, user_id, &hash);
             }
             extra_metadata
@@ -1487,7 +1487,8 @@ impl MemoryService {
                     return Ok(memory);
                 }
                 Err(error) => {
-                    if let Some(existing) = sql.get_from(&table, &id).await? {
+                    if let Some(existing) = sql.get_retry_receipt_from(&table, &id, user_id).await?
+                    {
                         return validate_idempotent_receipt(existing, user_id, &hash);
                     }
                     return Err(error);
@@ -2363,7 +2364,7 @@ impl MemoryService {
                 })
                 .transpose()?;
             if let Some((id, hash)) = &receipt {
-                if let Some(existing) = sql.get_from(&table, id).await? {
+                if let Some(existing) = sql.get_retry_receipt_from(&table, id, user_id).await? {
                     if existing.subject_id.as_deref() != subject_id {
                         return Err(MemoriaError::NotFound("memory".into()));
                     }
@@ -2379,7 +2380,7 @@ impl MemoryService {
                 // A concurrent request can commit between the receipt and old
                 // lookups. Confirm the same durable result, never invent a retry.
                 if let Some((id, hash)) = &receipt {
-                    if let Some(existing) = sql.get_from(&table, id).await? {
+                    if let Some(existing) = sql.get_retry_receipt_from(&table, id, user_id).await? {
                         if existing.subject_id.as_deref() != subject_id {
                             return Err(MemoriaError::NotFound("memory".into()));
                         }
@@ -2425,7 +2426,7 @@ impl MemoryService {
                 // This also confirms an uncertain COMMIT acknowledgement when
                 // the exact durable receipt is already visible.
                 if let Some((id, hash)) = &receipt {
-                    if let Some(existing) = sql.get_from(&table, id).await? {
+                    if let Some(existing) = sql.get_retry_receipt_from(&table, id, user_id).await? {
                         if existing.subject_id.as_deref() != subject_id {
                             return Err(MemoriaError::NotFound("memory".into()));
                         }

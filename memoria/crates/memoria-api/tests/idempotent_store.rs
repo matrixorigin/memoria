@@ -425,6 +425,34 @@ async fn owner_scoped_store_replays_real_receipts_and_rejects_missing_keys() {
         .unwrap();
     assert!(response.get("extra_metadata").is_none());
     assert!(response["memory_id"].as_str().is_some());
+    let retired_id = id.as_ref().unwrap().as_str().unwrap();
+    server
+        .client
+        .delete(format!(
+            "{}/v1/memories/{retired_id}?branch=main",
+            server.base
+        ))
+        .header("Authorization", format!("Memoria-Owner {master}"))
+        .header("X-User-Id", &owner)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let rejected = server
+        .client
+        .post(&url)
+        .header("Authorization", format!("Memoria-Owner {master}"))
+        .header("X-User-Id", &owner)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        rejected.status(),
+        409,
+        "inactive receipts must not become database errors or resurrect"
+    );
     let other = format!("idem_other_{}", uuid::Uuid::new_v4().simple());
     let response: Value = server
         .client

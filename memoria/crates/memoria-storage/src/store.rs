@@ -5389,6 +5389,26 @@ impl SqlMemoryStore {
         row.map(|r| row_to_memory(&r)).transpose()
     }
 
+    /// Retry receipts survive soft deletion/supersession. Reading only active
+    /// rows would turn an already-consumed key into an INSERT collision and a
+    /// database error. This lookup is internal and always fenced by its owner.
+    pub async fn get_retry_receipt_from(
+        &self,
+        table: &str,
+        memory_id: &str,
+        owner: &str,
+    ) -> Result<Option<Memory>, MemoriaError> {
+        let row = sqlx::query(&format!(
+            "SELECT {FULLTEXT_MEMORY_COLUMNS} FROM {table} WHERE memory_id = ? AND user_id = ?"
+        ))
+        .bind(memory_id)
+        .bind(owner)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|row| row_to_memory(&row)).transpose()
+    }
+
     /// Internal observe lookup: inactive facts still need to be excluded after
     /// correction/deletion. Scope predicates apply before content leaves storage.
     pub async fn observe_exclusion_content_from(

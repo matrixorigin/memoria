@@ -93,6 +93,32 @@ async fn correction_receipt_is_atomic_scoped_and_replayable() {
             .len(),
         1
     );
+    request(
+        reqwest::Method::DELETE,
+        &format!(
+            "/v1/memories/{}?branch=main",
+            corrected["memory_id"].as_str().unwrap()
+        ),
+    )
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+    assert_eq!(
+        request(reqwest::Method::PUT, &path)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        409
+    );
+    assert!(sql
+        .list_active_from(&table, &owner, 100)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
