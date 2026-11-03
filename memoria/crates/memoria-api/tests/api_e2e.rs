@@ -6006,6 +6006,137 @@ async fn test_admin_set_user_params() {
 // ── Snapshot: GET detail (time-travel) ───────────────────────────────────────
 
 #[tokio::test]
+async fn test_single_snapshot_delete_does_not_split_comma() {
+    use std::collections::HashSet;
+
+    async fn snapshot_names(
+        client: &reqwest::Client,
+        base: &str,
+        uid: &str,
+    ) -> Result<HashSet<String>, String> {
+        let response = client
+            .get(format!("{base}/v1/snapshots?resolve_memory_counts=false"))
+            .header("X-User-Id", uid)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        if response.status() != 200 {
+            return Err(format!("snapshot listing returned {}", response.status()));
+        }
+        let body: Value = response.json().await.map_err(|error| error.to_string())?;
+        let snapshots = body["snapshots"]
+            .as_array()
+            .ok_or_else(|| format!("missing snapshots array: {body}"))?;
+        Ok(snapshots
+            .iter()
+            .filter_map(|snapshot| snapshot["name"].as_str().map(str::to_owned))
+            .collect())
+    }
+
+    let (base, client, _server) = spawn_server().await;
+    let uid = uid();
+    let stem = format!(
+        "literal_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
+    let first = format!("{stem}_a");
+    let second = format!("{stem}_b");
+
+    // Save failures until after cleanup, including failures after only one create.
+    let outcome: Result<(), String> = async {
+        for name in [&first, &second] {
+            let response = client
+                .post(format!("{base}/v1/snapshots"))
+                .header("X-User-Id", &uid)
+                .json(&json!({"name": name}))
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            if response.status() != 201 {
+                return Err(format!("creating {name} returned {}", response.status()));
+            }
+        }
+        let before = snapshot_names(&client, &base, &uid).await?;
+        if !before.contains(&first) || !before.contains(&second) {
+            return Err(format!("test snapshots absent before delete: {before:?}"));
+        }
+
+        let response = client
+            .delete(format!("{base}/v1/snapshots/{first}%2C{second}"))
+            .header("X-User-Id", &uid)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        if response.status() != 204 {
+            return Err(format!("comma-name delete returned {}", response.status()));
+        }
+        let after = snapshot_names(&client, &base, &uid).await?;
+        if !after.contains(&first) || !after.contains(&second) {
+            return Err(format!("comma-name delete removed snapshots: {after:?}"));
+        }
+
+        let response = client
+            .delete(format!("{base}/v1/snapshots/{first}"))
+            .header("X-User-Id", &uid)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        if response.status() != 204 {
+            return Err(format!("single-name delete returned {}", response.status()));
+        }
+        let after_single = snapshot_names(&client, &base, &uid).await?;
+        if after_single.contains(&first) || !after_single.contains(&second) {
+            return Err(format!(
+                "single-name deletion was incorrect: {after_single:?}"
+            ));
+        }
+
+        let response = client
+            .post(format!("{base}/v1/snapshots/delete"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"names": [&second]}))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        if response.status() != 200 {
+            return Err(format!("bulk-name delete returned {}", response.status()));
+        }
+        let after_bulk = snapshot_names(&client, &base, &uid).await?;
+        if after_bulk.contains(&second) {
+            return Err(format!(
+                "bulk-name deletion left a snapshot: {after_bulk:?}"
+            ));
+        }
+        Ok(())
+    }
+    .await;
+
+    let mut cleanup_errors = Vec::new();
+    for name in [&first, &second] {
+        match client
+            .delete(format!("{base}/v1/snapshots/{name}"))
+            .header("X-User-Id", &uid)
+            .send()
+            .await
+        {
+            Ok(response) if response.status() == 204 => {}
+            Ok(response) => cleanup_errors.push(format!("{name}: {}", response.status())),
+            Err(error) => cleanup_errors.push(format!("{name}: {error}")),
+        }
+    }
+    match snapshot_names(&client, &base, &uid).await {
+        Ok(remaining) if !remaining.contains(&first) && !remaining.contains(&second) => {}
+        Ok(remaining) => cleanup_errors.push(format!("snapshots remain: {remaining:?}")),
+        Err(error) => cleanup_errors.push(error),
+    }
+    assert!(
+        cleanup_errors.is_empty(),
+        "cleanup failed: {cleanup_errors:?}"
+    );
+    assert!(outcome.is_ok(), "regression failed: {outcome:?}");
+}
+
+#[tokio::test]
 async fn test_snapshot_get_detail() {
     let (base, client, _server) = spawn_server().await;
     let uid = uid();
