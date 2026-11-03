@@ -281,8 +281,11 @@ impl MemorySqlGateway {
                 },
             }
         };
-        close_bounded(connection).await?;
+        let closed = close_bounded(connection).await;
+        // A confirmed cancellation deliberately destroys the connection. Its
+        // subsequent close error must not replace the established timeout.
         let (columns, rows) = result?;
+        closed?;
         let result = MemorySqlResult {
             query_id: query_id.into(),
             fingerprint: plan.fingerprint,
@@ -312,8 +315,12 @@ impl MemorySqlGateway {
             let mut control = MySqlConnection::connect_with(options)
                 .await
                 .map_err(|_| MemorySqlError::Unavailable)?;
-            let killed = sqlx::query(&format!("KILL QUERY {id}"))
-                .execute(&mut control)
+            // Kill this request's entire, unpooled reader connection, not only
+            // the currently executing statement. Otherwise a suspended prepare
+            // future can begin its SELECT after KILL QUERY has already returned.
+            // Text protocol is required for MatrixOne's administrative syntax.
+            let killed = control
+                .execute(format!("KILL CONNECTION {id}").as_str())
                 .await;
             control
                 .close()
@@ -469,6 +476,7 @@ fn finite_number(value: f64) -> Result<Value, MemorySqlError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn non_finite_results_are_not_silently_reported_as_null() {
@@ -476,5 +484,170 @@ mod tests {
         for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             assert_eq!(finite_number(value), Err(MemorySqlError::Unsupported));
         }
+    }
+
+    /// Selected explicitly by the real-DB acceptance runner, not counted as a
+    /// passing offline unit test when DATABASE_URL is absent.
+    #[tokio::test]
+    #[ignore = "dedicated real MatrixOne acceptance; run explicitly with --ignored"]
+    async fn cancellation_fences_a_query_that_has_not_started_yet() {
+        let url = std::env::var("DATABASE_URL").expect("dedicated test DATABASE_URL");
+        let admin_options = MySqlConnectOptions::from_str(&url)
+            .unwrap()
+            .database("mo_catalog")
+            .disable_statement_logging();
+        let mut admin = MySqlConnection::connect_with(&admin_options).await.unwrap();
+        let database = format!("sql_cancel_{}", uuid::Uuid::new_v4().simple());
+        admin
+            .execute(format!("CREATE DATABASE `{database}`").as_str())
+            .await
+            .unwrap();
+        let options = admin_options.clone().database(&database);
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .unwrap();
+        pool.execute("CREATE TABLE mem_memories (memory_id VARCHAR(128), user_id VARCHAR(128), subject_id VARCHAR(128), content TEXT, memory_type VARCHAR(32), trust_tier VARCHAR(8), initial_confidence FLOAT, session_id VARCHAR(128), observed_at DATETIME, created_at DATETIME, extra_metadata JSON, embedding VECF32(4), is_active TINYINT)").await.unwrap();
+        let store = Arc::new(SqlMemoryStore::new(
+            pool.clone(),
+            4,
+            "sql-cancel-test".into(),
+        ));
+        let gateway = MemorySqlGateway::new(vec![41; 32]).unwrap();
+        let scope = "synthetic_cancel_owner";
+        let (options, _) = gateway.reader_options(&store, scope).await.unwrap();
+        let mut connection = MySqlConnection::connect_with(&options).await.unwrap();
+        let (id,): (u64,) = sqlx::query_as("SELECT CONNECTION_ID()")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+        // Model a timeout before prepare/execute has sent the actual SELECT.
+        // KILL QUERY alone cannot fence this future: resuming it starts SLEEP
+        // after cancellation, which the old implementation failed to drain.
+        let cancelled = {
+            let pending = async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                fetch_bounded(&mut connection, "SELECT SLEEP(30)", &[]).await
+            };
+            gateway.cancel_and_drain(&options, id, pending).await
+        };
+        let healthy = gateway.healthy.load(Ordering::Acquire);
+        // Always clean the exact fixture connection, even on the red path.
+        let _ = admin
+            .execute(format!("KILL CONNECTION {id}").as_str())
+            .await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), connection.close()).await;
+        let mut active = MySqlConnection::connect_with(&options).await.unwrap();
+        let (active_id,): (u64,) = sqlx::query_as("SELECT CONNECTION_ID()")
+            .fetch_one(&mut active)
+            .await
+            .unwrap();
+        let (was_pending, active_cancelled) = {
+            let fetch = fetch_bounded(&mut active, "SELECT SLEEP(30)", &[]);
+            tokio::pin!(fetch);
+            let pending = tokio::time::timeout(Duration::from_millis(100), &mut fetch)
+                .await
+                .is_err();
+            let outcome = if pending {
+                gateway
+                    .cancel_and_drain(&options, active_id, &mut fetch)
+                    .await
+            } else {
+                Err(MemorySqlError::Invalid)
+            };
+            (pending, outcome)
+        };
+        let _ = admin
+            .execute(format!("KILL CONNECTION {active_id}").as_str())
+            .await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), active.close()).await;
+        let resumed = gateway
+            .execute(
+                store.clone(),
+                scope.into(),
+                PreparedMemoryQuery::parse("SELECT memory_id FROM memories LIMIT 1").unwrap(),
+                vec![],
+            )
+            .await;
+        // Hold only preparation, then disconnect four admitted callers. The
+        // spawned cleanup tasks must retain and eventually release all permits;
+        // a fifth caller must be rejected rather than queued without a bound.
+        let preparation = gateway.ready.lock().await;
+        let mut callers = Vec::new();
+        for _ in 0..4 {
+            let gateway = gateway.clone();
+            let store = store.clone();
+            callers.push(tokio::spawn(async move {
+                gateway
+                    .execute(
+                        store,
+                        scope.into(),
+                        PreparedMemoryQuery::parse("SELECT memory_id FROM memories LIMIT 1")
+                            .unwrap(),
+                        vec![],
+                    )
+                    .await
+            }));
+        }
+        let admitted = tokio::time::timeout(Duration::from_secs(1), async {
+            while gateway.permits.available_permits() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let excess = gateway
+            .execute(
+                store.clone(),
+                scope.into(),
+                PreparedMemoryQuery::parse("SELECT memory_id FROM memories LIMIT 1").unwrap(),
+                vec![],
+            )
+            .await
+            .err();
+        for caller in callers {
+            caller.abort();
+            let _ = caller.await;
+        }
+        drop(preparation);
+        let released = tokio::time::timeout(Duration::from_secs(3), async {
+            while gateway.permits.available_permits() != 4 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(format!("{database}\0{scope}").as_bytes())
+        );
+        admin
+            .execute(format!("DROP USER `memq_{}`", &digest[..32]).as_str())
+            .await
+            .unwrap();
+        admin
+            .execute(format!("DROP ROLE `memqr_{}`", &digest[..32]).as_str())
+            .await
+            .unwrap();
+        pool.close().await;
+        admin
+            .execute(format!("DROP DATABASE `{database}`").as_str())
+            .await
+            .unwrap();
+        admin.close().await.unwrap();
+        assert!(
+            cancelled.is_ok() && healthy,
+            "Cancellation did not fence and drain the pending query: {cancelled:?}"
+        );
+        assert!(
+            was_pending && active_cancelled.is_ok(),
+            "In-flight query cancellation failed: {active_cancelled:?}"
+        );
+        let resumed = resumed.expect("fresh reader query after cancellation");
+        assert_eq!(resumed.columns, vec!["memory_id"]);
+        assert!(resumed.rows.is_empty());
+        assert!(admitted && excess == Some(MemorySqlError::Busy) && released,
+            "Caller cancellation leaked a permit or exceeded admission: admitted={admitted}, excess={excess:?}, released={released}");
     }
 }
