@@ -54,6 +54,15 @@ async with AsyncMemoriaClient(base_url="http://localhost:8100", api_key="sk-..."
     result = await client.memories.retrieve(query="...")
 ```
 
+### Retry configuration
+
+Both clients accept `max_retries` (default: `3`), the number of retries after the
+initial request. Set it to `0` to send a single attempt without retries. It must
+be a non-negative integer; negative values, booleans, and non-integer values raise
+`MemoriaValidationError` when the client is constructed, before an HTTP client is
+allocated. This setting only limits attempts permitted by the existing retry
+policy; it does not enable retries of unsafe writes.
+
 ## Resources
 
 ### memories
