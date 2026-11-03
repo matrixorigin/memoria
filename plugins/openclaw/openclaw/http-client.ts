@@ -460,16 +460,20 @@ export class MemoriaHttpTransport {
   // also understands the Rust MCP binary's legacy text format.
 
   private formatMemoryList(data: unknown): string {
-    // The retrieve/search endpoints return either an array or { results: [...] }
+    // The retrieve/search endpoints return an array or a results/items envelope.
     const rec = this.asRecord(data);
-    const items = Array.isArray(data)
-      ? data
-      : Array.isArray(rec?.results)
-        ? rec!.results
-        : Array.isArray(rec?.items)
-          ? rec!.items
-          : [];
-    return this.formatMemoryItems(items);
+    if (Array.isArray(data)) {
+      return this.formatMemoryItems(data);
+    }
+    if (Array.isArray(rec?.results)) {
+      return this.formatMemoryItems(rec.results);
+    }
+    if (Array.isArray(rec?.items)) {
+      return this.formatMemoryItems(rec.items);
+    }
+    throw new Error(
+      "Invalid Memoria API memory list response: expected an array or an object with a results/items array",
+    );
   }
 
   private formatMemoryItems(items: unknown[]): string {
