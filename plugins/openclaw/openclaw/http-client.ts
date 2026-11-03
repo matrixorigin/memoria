@@ -122,7 +122,10 @@ export class MemoriaHttpTransport {
     if (args.trust_tier) body.trust_tier = args.trust_tier;
     const data = await this.post("/v1/memories", body);
     const rec = this.asRecord(data);
-    const id = rec?.memory_id ?? "";
+    const id = rec?.memory_id;
+    if (typeof id !== "string" || !id.trim()) {
+      throw new Error("Memoria API returned invalid store response: missing memory_id");
+    }
     const content = rec?.content ?? args.content ?? "";
     return `Stored memory ${id}: ${content}`;
   }
