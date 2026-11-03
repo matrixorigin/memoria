@@ -24,6 +24,8 @@ use crate::state::{AppState, CachedApiKeyPrincipal};
 pub const SCOPE_IDENTITY_READ: &str = "identity:read";
 pub const SCOPE_MEMORY_READ: &str = "memory:read";
 pub const SCOPE_MEMORY_WRITE: &str = "memory:write";
+// Privileged SQL is explicitly issued; never part of default read/write scopes.
+pub const SCOPE_MEMORY_SQL: &str = "memory:sql";
 pub const SCOPE_KEYS_MANAGE: &str = "keys:manage";
 pub const DEFAULT_API_KEY_SCOPES: &str = "identity:read,memory:read,memory:write,keys:manage";
 const OWNER_SCOPED_MASTER_SCOPES: &[&str] =
@@ -130,6 +132,9 @@ pub(crate) fn request_tool_name(headers: &axum::http::HeaderMap) -> Option<Strin
 }
 
 fn required_scope_for_request(method: &axum::http::Method, path: &str) -> Option<&'static str> {
+    if method == axum::http::Method::POST && path == "/v1/memories/sql-query" {
+        return Some(SCOPE_MEMORY_SQL);
+    }
     let under = |prefix: &str| path == prefix || path.starts_with(&format!("{prefix}/"));
     if (path == "/auth/whoami" && method == axum::http::Method::GET)
         || (path == "/mcp" && method == axum::http::Method::POST)
@@ -398,7 +403,8 @@ pub async fn group_main_write_guard(
                                 | "/v1/observe"
                                 | "/v1/observe/deduplicated"
                         ) || (path.starts_with("/v1/memories/")
-                            && path.ends_with("/correct"));
+                            && (path.ends_with("/correct")
+                                || path.ends_with("/correct-idempotent")));
                         if !branch_aware_body_route {
                             return (
                                 StatusCode::FORBIDDEN,

@@ -256,6 +256,7 @@ pub fn build_router(state: AppState) -> Router {
         // Memory reads
         .route("/v1/memories", get(routes::memory::list_memories))
         .route("/v1/memories/query", post(routes::memory::query_memories))
+        .route("/v1/memories/sql-query", post(routes::memory_sql::query))
         .route(
             "/v1/memories/fulltext-search",
             post(routes::memory::fulltext_search_memories),

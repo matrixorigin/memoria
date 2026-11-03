@@ -4,6 +4,7 @@ pub mod graph;
 mod keyed_gates;
 pub mod migration;
 pub mod pool_config;
+pub mod readonly_sql;
 pub mod router;
 pub mod store;
 pub mod table_schema;

@@ -17,6 +17,8 @@ tokio = { workspace = true }
 futures = { workspace = true }
 moka = { version = "0.12", features = ["future", "sync"] }
 sha2 = "0.10"
+sqlparser = "=0.53.0"
+hmac = "0.12"
 
 [dev-dependencies]
 chrono = { workspace = true }

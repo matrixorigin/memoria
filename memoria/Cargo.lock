@@ -2118,6 +2118,7 @@ dependencies = [
  "chrono",
  "clap",
  "ed25519-dalek",
+ "hmac",
  "memoria-core",
  "memoria-embedding",
  "memoria-git",
@@ -2294,11 +2295,13 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "hmac",
  "memoria-core",
  "moka",
  "serde",
  "serde_json",
  "sha2",
+ "sqlparser",
  "sqlx",
  "thiserror 1.0.69",
  "tokio",
@@ -3932,6 +3935,15 @@ dependencies = [
  "nom 7.1.3",
  "serde",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "sqlparser"
+version = "0.53.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05a528114c392209b3264855ad491fcce534b94a38771b0a0b97a79379275ce8"
+dependencies = [
+ "log",
 ]
 
 [[package]]
