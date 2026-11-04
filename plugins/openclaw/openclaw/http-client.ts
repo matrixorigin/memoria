@@ -209,7 +209,10 @@ export class MemoriaHttpTransport {
       if (args.reason) body.reason = args.reason;
       const data = await this.put(this.memoryPath(args.memory_id, "/correct"), body);
       const rec = this.asRecord(data);
-      return `Corrected memory ${rec?.memory_id ?? args.memory_id}: ${rec?.content ?? args.new_content}`;
+      if (typeof rec?.memory_id !== "string" || !rec.memory_id.trim()) {
+        throw new Error("Memoria API returned invalid correction response: missing memory_id");
+      }
+      return `Corrected memory ${rec.memory_id}: ${rec.content ?? args.new_content}`;
     }
     // Correct by query
     const body: Record<string, unknown> = {
@@ -219,7 +222,10 @@ export class MemoriaHttpTransport {
     if (args.reason) body.reason = args.reason;
     const data = await this.post("/v1/memories/correct", body);
     const rec = this.asRecord(data);
-    return `Corrected memory ${rec?.memory_id ?? ""}: ${rec?.content ?? args.new_content}`;
+    if (typeof rec?.memory_id !== "string" || !rec.memory_id.trim()) {
+      throw new Error("Memoria API returned invalid correction response: missing memory_id");
+    }
+    return `Corrected memory ${rec.memory_id}: ${rec.content ?? args.new_content}`;
   }
 
   private async purge(args: Record<string, unknown>) {
