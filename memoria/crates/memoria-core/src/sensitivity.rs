@@ -42,7 +42,7 @@ static PATTERNS: &[Pattern] = &[
     Pattern {
         label: "private_key",
         tier: SensitivityTier::High,
-        regex: r"-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----",
+        regex: r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----",
         replacement: "",
     },
     Pattern {
@@ -163,6 +163,39 @@ mod tests {
     fn test_private_key_blocked() {
         let r = check_sensitivity("-----BEGIN RSA PRIVATE KEY-----\nMIIE...");
         assert!(r.blocked);
+    }
+
+    #[test]
+    fn modern_private_key_armor_is_blocked() {
+        for header in [
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "-----BEGIN EC PRIVATE KEY-----",
+            "-----BEGIN DSA PRIVATE KEY-----",
+            "-----BEGIN PRIVATE KEY-----",
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----",
+        ] {
+            let result = check_sensitivity(&format!("{header}\nsynthetic-test-payload"));
+            assert!(result.blocked, "private key not blocked: {header}");
+            assert_eq!(result.matched_labels, vec!["private_key"]);
+            assert!(result.redacted_content.is_none());
+        }
+    }
+
+    #[test]
+    fn non_private_key_armor_is_not_blocked() {
+        for text in [
+            "-----BEGIN PUBLIC KEY-----",
+            "-----BEGIN PGP PUBLIC KEY BLOCK-----",
+            "-----BEGIN CERTIFICATE-----",
+            "-----BEGIN PGP MESSAGE-----",
+            "Ordinary prose about private keys",
+        ] {
+            let result = check_sensitivity(text);
+            assert!(!result.blocked, "safe text blocked: {text}");
+            assert!(result.redacted_content.is_none());
+        }
     }
 
     #[test]
