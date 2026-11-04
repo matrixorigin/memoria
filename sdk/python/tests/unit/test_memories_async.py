@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from pytest_httpx import HTTPXMock
 
@@ -21,6 +23,38 @@ async def test_store_happy_path(httpx_mock: HTTPXMock, client: AsyncMemoriaClien
     mem = await client.memories.store(content="test content")
     assert isinstance(mem, Memory)
     assert mem.memory_id == "mem_abc123"
+    request = httpx_mock.get_request()
+    assert request is not None
+    assert request.url.path == "/v1/memories"
+    assert "idempotency_key" not in json.loads(request.content)
+
+
+@pytest.mark.asyncio
+async def test_store_with_idempotency_key_retries_on_safe_endpoint(
+    httpx_mock: HTTPXMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("memoria._http._backoff", lambda _: 0)
+    httpx_mock.add_response(status_code=503, text="temporarily unavailable")
+    httpx_mock.add_response(status_code=201, json=MEMORY_STUB)
+
+    async with AsyncMemoriaClient(
+        base_url=BASE_URL,
+        api_key=API_KEY,
+        max_retries=1,
+    ) as client:
+        mem = await client.memories.store(
+            content="test content",
+            idempotency_key="session-1:turn-2",
+        )
+
+    assert mem.memory_id == "mem_abc123"
+    requests = httpx_mock.get_requests()
+    assert len(requests) == 2
+    assert all(request.url.path == "/v1/memories/idempotent" for request in requests)
+    assert all(
+        json.loads(request.content)["idempotency_key"] == "session-1:turn-2"
+        for request in requests
+    )
 
 
 @pytest.mark.asyncio
