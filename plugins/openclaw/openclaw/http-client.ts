@@ -520,6 +520,9 @@ export class MemoriaHttpTransport {
       if (Array.isArray(rec.branches)) branches = rec.branches;
       else if (Array.isArray(rec.items)) branches = rec.items;
       else if (typeof rec.result === "string") return rec.result as string;
+      else throw new Error("Invalid Memoria API branch list response: expected branches/items array");
+    } else {
+      throw new Error("Invalid Memoria API branch list response: expected branches/items array");
     }
     if (branches.length === 0) {
       return "Branches:\n  main ← active";
