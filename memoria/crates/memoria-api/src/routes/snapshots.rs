@@ -688,13 +688,20 @@ pub async fn get_snapshot(
     Path(name): Path<String>,
     Query(q): Query<GetSnapshotQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let limit = q.limit.unwrap_or(50);
+    let offset = q.offset.unwrap_or(0);
+    if limit < 0 || offset < 0 {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "limit and offset must be non-negative".to_string(),
+        ));
+    }
+    let limit = limit.min(500);
     let sql = user_snapshot_store(&state, auth.scope_id()).await?;
     let pool = sql.pool();
     let table = sql.active_table(auth.scope_id()).await.map_err(api_err)?;
 
     let snap_name = resolve_snapshot_internal(&state, auth.scope_id(), &name).await?;
-    let limit = q.limit.unwrap_or(50).min(500);
-    let offset = q.offset.unwrap_or(0);
     let detail = q.detail.as_deref().unwrap_or("brief");
 
     // Total count via time-travel
@@ -736,13 +743,19 @@ pub async fn get_snapshot(
         "SELECT memory_id, user_id, content, memory_type, trust_tier, initial_confidence, is_active, session_id, observed_at, created_at FROM {table} {{SNAPSHOT = '{snap_name}'}} \
           WHERE user_id = ? AND is_active > 0 ORDER BY observed_at DESC LIMIT ? OFFSET ?"
     );
-    let rows = sqlx::query(&mem_sql)
-        .bind(auth.scope_id())
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await
-        .map_err(api_err)?;
+    // The snapshot count is immutable, so empty and out-of-range pages
+    // do not need a row query.
+    let rows = if limit == 0 || offset >= total {
+        Vec::new()
+    } else {
+        sqlx::query(&mem_sql)
+            .bind(auth.scope_id())
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await
+            .map_err(api_err)?
+    };
 
     let memories: Vec<serde_json::Value> = rows
         .iter()
@@ -795,7 +808,7 @@ pub async fn get_snapshot(
         "memories": memories,
         "limit": limit,
         "offset": offset,
-        "has_more": offset + limit < total,
+        "has_more": offset.saturating_add(limit) < total,
     })))
 }
 
@@ -806,12 +819,19 @@ pub async fn diff_snapshot(
     Path(name): Path<String>,
     Query(q): Query<DiffSnapshotQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let limit = q.limit.unwrap_or(50);
+    if limit < 0 {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "limit must be non-negative".to_string(),
+        ));
+    }
+    let limit = limit.min(200);
     let sql = user_snapshot_store(&state, auth.scope_id()).await?;
     let pool = sql.pool();
     let table = sql.active_table(auth.scope_id()).await.map_err(api_err)?;
 
     let snap_name = resolve_snapshot_internal(&state, auth.scope_id(), &name).await?;
-    let limit = q.limit.unwrap_or(50).min(200);
 
     // Counts
     let snap_count: i64 = sqlx::query_scalar(&format!(
