@@ -118,8 +118,10 @@ describe("Group 3: Cloud API Communication", () => {
       it(`${id} ${tool} → ${method} ${pathPattern.source}`, async () => {
         fetchMock.respondWith(200, tool === "memory_store"
           ? { memory_id: "new-id", content: args.content ?? "" }
-          : tool.includes("retrieve") || tool.includes("search") || tool === "memory_list"
-            ? { results: [] }
+          : tool === "memory_list"
+            ? { items: [] }
+            : tool.includes("retrieve") || tool.includes("search")
+              ? { results: [] }
             : tool === "memory_profile"
               ? { profile: "test" }
               : tool === "memory_purge"
