@@ -99,6 +99,12 @@ static PATTERNS: &[Pattern] = &[
 use once_cell::sync::Lazy;
 use regex::Regex;
 
+// Use the same Unicode-aware word-boundary semantics as the original card
+// regex, while scanning starts independently so a failed candidate cannot
+// consume a later valid one.
+static WORD_BOUNDARY: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\b").expect("valid word-boundary regex"));
+
 static COMPILED: Lazy<Vec<(&'static Pattern, Regex)>> = Lazy::new(|| {
     PATTERNS
         .iter()
@@ -106,9 +112,17 @@ static COMPILED: Lazy<Vec<(&'static Pattern, Regex)>> = Lazy::new(|| {
         .collect()
 });
 
-/// Luhn checksum over the digits of `candidate`, ignoring separators.
-fn luhn_valid(candidate: &str) -> bool {
-    let digits: Vec<u32> = candidate.chars().filter_map(|c| c.to_digit(10)).collect();
+/// Decimal value for ASCII and fullwidth digits accepted in card numbers.
+fn decimal_digit(c: char) -> Option<u32> {
+    c.to_digit(10).or_else(|| {
+        ('\u{FF10}'..='\u{FF19}')
+            .contains(&c)
+            .then(|| c as u32 - '\u{FF10}' as u32)
+    })
+}
+
+/// Luhn checksum over decimal digits.
+fn luhn_valid_digits(digits: &[u32]) -> bool {
     let sum: u32 = digits
         .iter()
         .rev()
@@ -127,6 +141,76 @@ fn luhn_valid(candidate: &str) -> bool {
         })
         .sum();
     digits.len() >= 13 && sum % 10 == 0
+}
+
+/// Find Luhn-valid card candidates, including candidates that overlap an
+/// earlier invalid numeric match. The regex `replace_all` API consumes a
+/// failed match, which can hide a valid card beginning later in that match.
+fn luhn_valid_card_spans(text: &str) -> Vec<(usize, usize, usize)> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let word_boundaries: std::collections::HashSet<usize> =
+        WORD_BOUNDARY.find_iter(text).map(|m| m.start()).collect();
+    let mut candidates = Vec::new();
+
+    for start_index in 0..chars.len() {
+        let (start, first) = chars[start_index];
+        if decimal_digit(first).is_none() || !word_boundaries.contains(&start) {
+            continue;
+        }
+
+        let mut digits = Vec::new();
+        for index in start_index..chars.len() {
+            let (byte, c) = chars[index];
+            if let Some(digit) = decimal_digit(c) {
+                digits.push(digit);
+                let end = byte + c.len_utf8();
+                if digits.len() > 19 {
+                    break;
+                }
+
+                if (13..=19).contains(&digits.len())
+                    && word_boundaries.contains(&(end))
+                    && luhn_valid_digits(&digits)
+                {
+                    candidates.push((start, end, digits.len()));
+                }
+            } else if !matches!(c, ' ' | '-') {
+                break;
+            }
+        }
+    }
+
+    // Prefer the longest valid candidate at a shared start. Then choose
+    // non-overlapping spans; later starts remain available when an earlier
+    // prefix fails Luhn and therefore produced no candidate.
+    candidates.sort_by_key(|(start, _, digit_count)| (*start, std::cmp::Reverse(*digit_count)));
+    let mut selected = Vec::new();
+    let mut last_end = 0;
+    for (start, end, digit_count) in candidates {
+        if start < last_end {
+            continue;
+        }
+        selected.push((start, end, digit_count));
+        last_end = end;
+    }
+    selected
+}
+
+fn redact_luhn_valid_cards(text: &str, replacement: &str) -> String {
+    let spans = luhn_valid_card_spans(text);
+    if spans.is_empty() {
+        return text.to_owned();
+    }
+
+    let mut redacted = String::with_capacity(text.len());
+    let mut last_end = 0;
+    for (start, end, _) in spans {
+        redacted.push_str(&text[last_end..start]);
+        redacted.push_str(replacement);
+        last_end = end;
+    }
+    redacted.push_str(&text[last_end..]);
+    redacted
 }
 
 /// Check content for PII/credentials. Returns a `SensitivityResult`.
@@ -150,13 +234,7 @@ pub fn check_sensitivity(text: &str) -> SensitivityResult {
         if p.tier == SensitivityTier::Medium {
             let result = if p.label == "credit_card" {
                 // Only redact digit runs that pass Luhn; keep timestamps and IDs.
-                re.replace_all(&redacted, |caps: &regex::Captures| {
-                    if luhn_valid(&caps[0]) {
-                        p.replacement.to_string()
-                    } else {
-                        caps[0].to_string()
-                    }
-                })
+                Cow::Owned(redact_luhn_valid_cards(&redacted, p.replacement))
             } else {
                 re.replace_all(&redacted, p.replacement)
             };
@@ -185,6 +263,21 @@ pub fn check_sensitivity(text: &str) -> SensitivityResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn luhn_card(length: usize) -> String {
+        let mut digits = vec![0; length];
+        digits[0] = 4;
+        for check_digit in 0..=9 {
+            digits[length - 1] = check_digit;
+            if luhn_valid_digits(&digits) {
+                return digits
+                    .iter()
+                    .map(|digit| char::from_digit(*digit, 10).unwrap())
+                    .collect();
+            }
+        }
+        unreachable!("a Luhn check digit exists for every card length")
+    }
 
     #[test]
     fn test_aws_key_blocked() {
@@ -431,11 +524,90 @@ mod tests {
     fn credit_card_redaction_requires_luhn_valid_number() {
         // Epoch-millisecond timestamps and 64-bit snowflake IDs are 13-19 digits
         // but fail the Luhn check, so they must not be redacted as cards.
-        for text in ["event at 1730284800123 ms", "snowflake id 1849203948572039485"] {
+        for text in [
+            "event at 1730284800123 ms",
+            "snowflake id 1849203948572039485",
+        ] {
             let r = check_sensitivity(text);
             assert_eq!(r.redacted_content, None, "non-card digits redacted: {text}");
         }
         let r = check_sensitivity("card 4111 1111 1111 1111 on file");
         assert_eq!(r.redacted_content.as_deref(), Some("card [card] on file"));
+    }
+
+    #[test]
+    fn credit_card_redaction_checks_overlapping_candidates() {
+        let result = check_sensitivity("payment 1 4111 1111 1111 1111 on file");
+        assert_eq!(
+            result.redacted_content.as_deref(),
+            Some("payment 1 [card] on file")
+        );
+    }
+
+    #[test]
+    fn credit_card_redaction_supports_valid_lengths_and_separators() {
+        for length in 13..=19 {
+            let number = luhn_card(length);
+            let result = check_sensitivity(&format!("card {number} on file"));
+            assert_eq!(
+                result.redacted_content.as_deref(),
+                Some("card [card] on file"),
+                "valid {length}-digit card was not redacted"
+            );
+        }
+
+        for number in ["4111 1111 1111 1111", "4111-1111-1111-1111"] {
+            let result = check_sensitivity(&format!("card {number} on file"));
+            assert_eq!(
+                result.redacted_content.as_deref(),
+                Some("card [card] on file"),
+                "valid separated card was not redacted: {number}"
+            );
+        }
+    }
+
+    #[test]
+    fn credit_card_redaction_supports_fullwidth_digits() {
+        let result = check_sensitivity("card ４１１１ １１１１ １１１１ １１１１ on file");
+        assert_eq!(
+            result.redacted_content.as_deref(),
+            Some("card [card] on file")
+        );
+    }
+
+    #[test]
+    fn credit_card_redaction_preserves_adjacent_numeric_fields() {
+        let result = check_sensitivity(
+            "event 1730284800123; card 4111 1111 1111 1111; reference 1849203948572039485",
+        );
+        assert_eq!(
+            result.redacted_content.as_deref(),
+            Some("event 1730284800123; card [card]; reference 1849203948572039485")
+        );
+    }
+
+    #[test]
+    fn credit_card_redaction_preserves_original_word_boundaries() {
+        for text in [
+            "x4111111111111111 on file",
+            "_4111111111111111 on file",
+            "4111111111111111x on file",
+            "4111111111111111_ on file",
+        ] {
+            let result = check_sensitivity(text);
+            assert_eq!(
+                result.redacted_content, None,
+                "unexpected redaction: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn credit_card_redaction_preserves_grouped_19_digit_cards() {
+        let result = check_sensitivity("card 4000 0000 0000 0000 006 on file");
+        assert_eq!(
+            result.redacted_content.as_deref(),
+            Some("card [card] on file")
+        );
     }
 }
