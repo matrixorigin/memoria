@@ -11,6 +11,9 @@ pub enum MemoriaError {
     #[error("Memory not found: {0}")]
     NotFound(String),
 
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
     #[error("Database error: {0}")]
     Database(String),
 

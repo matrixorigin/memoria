@@ -67,6 +67,38 @@ class Memory:
 
 
 @dataclass
+class DisabledMemory:
+    """A memory an operator disabled: out of retrieval, restorable."""
+
+    memory: Memory
+    disabled_at: datetime | None = None
+    disabled_reason: str | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> DisabledMemory:
+        return cls(
+            memory=Memory.from_dict(d),
+            disabled_at=_parse_dt(d.get("disabled_at")),
+            disabled_reason=d.get("disabled_reason"),
+        )
+
+
+@dataclass
+class DisabledMemoryPage:
+    """A bounded page of disabled records; pass next_cursor to continue."""
+
+    items: list[DisabledMemory]
+    next_cursor: str | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> DisabledMemoryPage:
+        return cls(
+            items=[DisabledMemory.from_dict(item) for item in d["items"]],
+            next_cursor=d.get("next_cursor"),
+        )
+
+
+@dataclass
 class MemoryPage:
     """Paginated list of memories."""
 

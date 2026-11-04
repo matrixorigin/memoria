@@ -45,9 +45,31 @@ pub fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
 /// Reserved persistence fingerprint for atomic store receipts; not caller metadata.
 pub const STORE_REQUEST_HASH_FIELD: &str = "_memoria_store_request_sha256";
 
+/// Reserved marker of an operator-disabled memory, `{"at": RFC 3339, "reason": string}`.
+/// Only the disable and restore operations write it; it is never caller metadata.
+pub const DISABLED_FIELD: &str = "_memoria_disabled";
+
+/// Content-free receipt retained after explicitly erasing an idempotent memory.
+pub const ERASED_FIELD: &str = "_memoria_erased";
+
+/// Metadata keys owned by Memoria itself: callers can neither write nor query them.
+pub fn is_reserved_metadata_key(key: &str) -> bool {
+    key == STORE_REQUEST_HASH_FIELD || key == DISABLED_FIELD || key == ERASED_FIELD
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn governance_marker_is_reserved_without_reserving_business_metadata() {
+        assert!(is_reserved_metadata_key(DISABLED_FIELD));
+        assert!(is_reserved_metadata_key(ERASED_FIELD));
+        assert!(is_reserved_metadata_key(STORE_REQUEST_HASH_FIELD));
+        for key in ["scene", "agent_id", "project_space", "disabled_reason"] {
+            assert!(!is_reserved_metadata_key(key));
+        }
+    }
 
     #[test]
     fn safe_sql_identifier_accepts_alphanumeric_and_underscore_only() {

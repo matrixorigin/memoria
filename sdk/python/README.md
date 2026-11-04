@@ -111,6 +111,19 @@ mem = client.memories.correct_by_query(query="old content", new_content="new con
 # Delete
 client.memories.delete("mem_id", reason="done")
 
+# Operator disable/restore (distinct from the existing delete/purge lifecycle)
+client.memories.disable("mem_id", subject_id="customer-a", branch="main", reason="reviewed")
+page = client.memories.list_disabled(subject_id="customer-a", branch="main", limit=100)
+while page.next_cursor:
+    page = client.memories.list_disabled(
+        subject_id="customer-a", branch="main", limit=100, cursor=page.next_cursor
+    )
+client.memories.restore("mem_id", subject_id="customer-a", branch="main")
+
+# Erase this branch row's content; idempotent rows retain a content-free receipt.
+# Not a graph/edit-log/history/backup purge; replaying the erased key returns 409.
+client.memories.erase("mem_id", subject_id="customer-a", branch="main")
+
 # Purge (choose one selector)
 result = client.memories.purge(memory_ids=["id1", "id2"], reason="cleanup")
 result = client.memories.purge(topic="debug session", reason="done")
