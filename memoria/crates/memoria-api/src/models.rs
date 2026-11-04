@@ -512,15 +512,23 @@ impl From<Memory> for MemoryResponse {
     }
 }
 
-/// Operator governance of one memory (disable / restore / erase). `subject_id`, when set,
+/// Operator disable. `subject_id`, when set,
 /// fences the target: a memory of another subject is reported as not found.
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryGovernanceRequest {
     pub subject_id: Option<String>,
-    /// Recorded with a disable; ignored by restore and erase.
+    /// Recorded with the disable marker.
     #[serde(default)]
     pub reason: String,
+    pub branch: Option<String>,
+}
+
+/// Restore and erase do not record a reason; reject it rather than silently ignoring it.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryLifecycleRequest {
+    pub subject_id: Option<String>,
     pub branch: Option<String>,
 }
 

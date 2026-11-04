@@ -374,6 +374,23 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Restore existing nodes instead of creating duplicate active nodes during backfill.
+    pub async fn reactivate_by_memory_id(&self, memory_id: &str) -> Result<(), MemoriaError> {
+        sqlx::query(&format!(
+            "UPDATE {} SET is_active = 1 WHERE memory_id = ? \
+             AND (superseded_by IS NULL OR superseded_by = '') \
+             AND EXISTS (SELECT 1 FROM {} WHERE memory_id = ? AND is_active = 1)",
+            self.t("memory_graph_nodes"),
+            self.t("mem_memories")
+        ))
+        .bind(memory_id)
+        .bind(memory_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     /// Update content (and optionally confidence) of a graph node by memory_id.
     pub async fn update_content_by_memory_id(
         &self,

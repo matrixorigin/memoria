@@ -772,10 +772,54 @@ const DISABLE_REASON_MAX_CHARS: usize = 512;
 const DISABLED_LIST_DEFAULT_LIMIT: i64 = 100;
 const DISABLED_LIST_MAX_LIMIT: i64 = 500;
 
-fn governance_subject(subject_id: Option<&str>) -> Option<&str> {
-    subject_id
-        .map(str::trim)
-        .filter(|subject| !subject.is_empty())
+fn governance_subject(subject_id: Option<&str>) -> Result<Option<&str>, (StatusCode, String)> {
+    match subject_id.map(str::trim) {
+        Some("") => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subject_id must not be blank".into(),
+        )),
+        subject => Ok(subject),
+    }
+}
+
+/// Resolve once and pin the write to that branch. The middleware's active-branch
+/// shortcut is not sufficient when a group member explicitly targets main.
+async fn governance_branch(
+    state: &AppState,
+    auth: &AuthUser,
+    branch: Option<&str>,
+) -> Result<String, (StatusCode, String)> {
+    let sql = state
+        .service
+        .user_sql_store(auth.scope_id())
+        .await
+        .map_err(api_err_typed)?;
+    let branch = match branch_param(branch) {
+        Some(branch) => branch.to_owned(),
+        None => memoria_storage::ACTOR_USER_ID
+            .scope(
+                auth.user_id.clone(),
+                sql.active_branch_name(auth.scope_id()),
+            )
+            .await
+            .map_err(api_err_typed)?,
+    };
+    let table = sql
+        .table_for_branch(auth.scope_id(), Some(&branch))
+        .await
+        .map_err(api_err_typed)?;
+    if let Some(group_id) = auth.group_id.as_deref() {
+        if table == sql.t("mem_memories")
+            && !crate::auth::group_main_write_allowed_for_solo_owner(state, group_id, &auth.user_id)
+                .await
+        {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "main is read-only in group mode".into(),
+            ));
+        }
+    }
+    Ok(branch)
 }
 
 /// Operator disable: the memory leaves retrieval but stays restorable.
@@ -785,6 +829,8 @@ pub async fn disable_memory(
     Path(id): Path<String>,
     Json(req): Json<MemoryGovernanceRequest>,
 ) -> ApiResult<MemoryResponse> {
+    let subject = governance_subject(req.subject_id.as_deref())?;
+    let branch = governance_branch(&state, &auth, req.branch.as_deref()).await?;
     if req.reason.chars().count() > DISABLE_REASON_MAX_CHARS {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -795,8 +841,8 @@ pub async fn disable_memory(
         .service
         .disable_on_branch(
             auth.scope_id(),
-            branch_param(req.branch.as_deref()),
-            governance_subject(req.subject_id.as_deref()),
+            Some(&branch),
+            subject,
             &id,
             req.reason.trim(),
         )
@@ -809,36 +855,30 @@ pub async fn restore_memory(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(id): Path<String>,
-    Json(req): Json<MemoryGovernanceRequest>,
+    Json(req): Json<MemoryLifecycleRequest>,
 ) -> ApiResult<MemoryResponse> {
+    let subject = governance_subject(req.subject_id.as_deref())?;
+    let branch = governance_branch(&state, &auth, req.branch.as_deref()).await?;
     let memory = state
         .service
-        .restore_on_branch(
-            auth.scope_id(),
-            branch_param(req.branch.as_deref()),
-            governance_subject(req.subject_id.as_deref()),
-            &id,
-        )
+        .restore_on_branch(auth.scope_id(), Some(&branch), subject, &id)
         .await
         .map_err(api_err_typed)?;
     Ok(Json(memory.into()))
 }
 
-/// Permanent removal of one active or disabled memory, unlike the restorable purge.
+/// Remove one non-superseded memory, retaining only an idempotency tombstone when needed.
 pub async fn erase_memory(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(id): Path<String>,
-    Json(req): Json<MemoryGovernanceRequest>,
+    Json(req): Json<MemoryLifecycleRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    let subject = governance_subject(req.subject_id.as_deref())?;
+    let branch = governance_branch(&state, &auth, req.branch.as_deref()).await?;
     state
         .service
-        .erase_on_branch(
-            auth.scope_id(),
-            branch_param(req.branch.as_deref()),
-            governance_subject(req.subject_id.as_deref()),
-            &id,
-        )
+        .erase_on_branch(auth.scope_id(), Some(&branch), subject, &id)
         .await
         .map_err(api_err_typed)?;
     Ok(StatusCode::NO_CONTENT)
@@ -861,7 +901,7 @@ pub async fn list_disabled_memories(
         .list_disabled_on_branch(
             auth.scope_id(),
             branch_param(q.branch.as_deref()),
-            governance_subject(q.subject_id.as_deref()),
+            governance_subject(q.subject_id.as_deref())?,
             limit,
             q.cursor.as_deref(),
         )

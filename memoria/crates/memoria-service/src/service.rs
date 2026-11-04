@@ -2557,6 +2557,12 @@ impl MemoryService {
     ) -> Result<Memory, MemoriaError> {
         sql.get_owned_from(table, memory_id, user_id)
             .await?
+            .filter(|memory| {
+                !memory
+                    .extra_metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.contains_key(memoria_core::ERASED_FIELD))
+            })
             .filter(|memory| subject_id.is_none() || memory.subject_id.as_deref() == subject_id)
             .ok_or_else(|| MemoriaError::NotFound(memory_id.to_string()))
     }
@@ -2602,9 +2608,7 @@ impl MemoryService {
             });
             Self::cleanup_entity_data_for_memory(sql.as_ref(), memory_id, "disable").await;
         }
-        memory.extra_metadata = Some(metadata);
-        memory.is_active = false;
-        Ok(memory)
+        Self::owned_governance_target(&sql, &table, user_id, subject_id, memory_id).await
     }
 
     /// Reactivate an operator-disabled memory.
@@ -2637,15 +2641,14 @@ impl MemoryService {
         }
         self.send_edit_log(user_id, "restore", Some(memory_id), None, "", None);
         if table == sql.t("mem_memories") {
+            sql.graph_store().reactivate_by_memory_id(memory_id).await?;
             self.report(StatsEvent::MemoryActivated {
                 user_id: user_id.to_string(),
             });
             self.enqueue_entity_extraction(user_id, memory_id, &memory.content)
                 .await;
         }
-        memory.extra_metadata = Some(metadata);
-        memory.is_active = true;
-        Ok(memory)
+        Self::owned_governance_target(&sql, &table, user_id, subject_id, memory_id).await
     }
 
     /// Permanently remove one active or disabled memory. Superseded revisions belong to the
@@ -4101,8 +4104,12 @@ fn validate_idempotent_receipt(
     owner: &str,
     request_hash: &str,
 ) -> Result<Memory, MemoriaError> {
+    if !memory.is_active {
+        return Err(MemoriaError::Conflict(
+            "idempotency_key belongs to an inactive or erased receipt".into(),
+        ));
+    }
     if memory.user_id != owner
-        || !memory.is_active
         || memory
             .extra_metadata
             .as_ref()

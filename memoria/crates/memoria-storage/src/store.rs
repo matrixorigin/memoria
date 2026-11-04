@@ -3685,6 +3685,7 @@ impl SqlMemoryStore {
                 "DELETE FROM {memories_table} WHERE user_id = ? AND is_active = 0 \
                   AND (superseded_by IS NULL OR superseded_by = '') \
                   AND JSON_EXTRACT(extra_metadata, '$._memoria_disabled') IS NULL \
+                  AND JSON_EXTRACT(extra_metadata, '$._memoria_erased') IS NULL \
                   AND updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR) LIMIT 500"
             ))
             .bind(user_id)
@@ -3733,6 +3734,8 @@ impl SqlMemoryStore {
             let res = sqlx::query(&format!(
                 "DELETE FROM {memories_table} \
                  WHERE memory_type = 'tool_result' \
+                   AND JSON_EXTRACT(extra_metadata, '$._memoria_disabled') IS NULL \
+                   AND JSON_EXTRACT(extra_metadata, '$._memoria_erased') IS NULL \
                    AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > ? \
                  LIMIT 5000"
             ))
@@ -4931,6 +4934,8 @@ impl SqlMemoryStore {
         let (inactive,): (i64,) = sqlx::query_as(&format!(
             "SELECT COUNT(*) FROM {memories_table} WHERE user_id = ? AND is_active = 0 \
              AND (superseded_by IS NULL OR superseded_by = '') \
+             AND JSON_EXTRACT(extra_metadata, '$._memoria_disabled') IS NULL \
+             AND JSON_EXTRACT(extra_metadata, '$._memoria_erased') IS NULL \
              AND updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)"
         ))
         .bind(user_id)
@@ -4998,6 +5003,8 @@ impl SqlMemoryStore {
         let (inactive,): (i64,) = sqlx::query_as(&format!(
             "SELECT COUNT(*) FROM {memories_table} WHERE is_active = 0 \
              AND (superseded_by IS NULL OR superseded_by = '') \
+             AND JSON_EXTRACT(extra_metadata, '$._memoria_disabled') IS NULL \
+             AND JSON_EXTRACT(extra_metadata, '$._memoria_erased') IS NULL \
              AND updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)"
         ))
         .fetch_one(&mut *conn)
@@ -5376,26 +5383,54 @@ impl SqlMemoryStore {
         Ok(res.rows_affected())
     }
 
-    /// Physically delete one row.
+    /// Erase content. Idempotent rows retain a content-free, inactive receipt so
+    /// at-least-once clients cannot recreate an erased memory with the same key.
     pub async fn erase_from(&self, table: &str, expected: &Memory) -> Result<u64, MemoriaError> {
         let table = self.t(table);
-        let res = sqlx::query(&format!(
-            "DELETE FROM {table} WHERE memory_id = ? AND user_id = ? \
-            AND updated_at = ? AND (superseded_by IS NULL OR superseded_by = '')"
-        ))
-        .bind(&expected.memory_id)
-        .bind(&expected.user_id)
-        .bind(
-            expected
-                .updated_at
-                .ok_or_else(|| {
-                    MemoriaError::Validation("memory revision timestamp is missing".into())
-                })?
-                .naive_utc(),
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
+        let receipt = expected
+            .extra_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(memoria_core::STORE_REQUEST_HASH_FIELD));
+        let statement = if receipt.is_some() {
+            format!(
+                "UPDATE {table} SET content = '', embedding = NULL, session_id = NULL, \
+                author_id = NULL, subject_id = NULL, source_event_ids = '[]', \
+                extra_metadata = ?, is_active = 0, updated_at = ? "
+            )
+        } else {
+            format!("DELETE FROM {table} ")
+        };
+        let statement = format!(
+            "{statement}WHERE memory_id = ? AND user_id = ? \
+            AND updated_at = ? AND (superseded_by IS NULL OR superseded_by = '') \
+            AND JSON_EXTRACT(extra_metadata, '$._memoria_erased') IS NULL"
+        );
+        let mut query = sqlx::query(&statement);
+        if let Some(receipt) = receipt {
+            query = query
+                .bind(
+                    serde_json::json!({
+                    (memoria_core::STORE_REQUEST_HASH_FIELD): receipt,
+                    (memoria_core::ERASED_FIELD): true,
+                        })
+                    .to_string(),
+                )
+                .bind(Utc::now().naive_utc());
+        }
+        let res = query
+            .bind(&expected.memory_id)
+            .bind(&expected.user_id)
+            .bind(
+                expected
+                    .updated_at
+                    .ok_or_else(|| {
+                        MemoriaError::Validation("memory revision timestamp is missing".into())
+                    })?
+                    .naive_utc(),
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
         Ok(res.rows_affected())
     }
 

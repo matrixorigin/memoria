@@ -403,8 +403,15 @@ pub async fn group_main_write_guard(
                                 | "/v1/observe"
                                 | "/v1/observe/deduplicated"
                         ) || (path.starts_with("/v1/memories/")
-                            && (path.ends_with("/correct")
-                                || path.ends_with("/correct-idempotent")));
+                            && [
+                                "/correct",
+                                "/correct-idempotent",
+                                "/disable",
+                                "/restore",
+                                "/erase",
+                            ]
+                            .iter()
+                            .any(|suffix| path.ends_with(suffix)));
                         if !branch_aware_body_route {
                             return (
                                 StatusCode::FORBIDDEN,
@@ -1486,6 +1493,26 @@ fn authorize_api_key_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_governance_requires_memory_scopes() {
+        use axum::http::Method;
+        let read_only = parse_scopes(SCOPE_MEMORY_READ);
+        assert!(authorize_api_key_route(&Method::GET, "/v1/memories/disabled", &read_only).is_ok());
+        for action in ["disable", "restore", "erase"] {
+            let path = format!("/v1/memories/synthetic/{action}");
+            assert_eq!(
+                required_scope_for_request(&Method::POST, &path),
+                Some(SCOPE_MEMORY_WRITE)
+            );
+            assert_eq!(
+                authorize_api_key_route(&Method::POST, &path, &read_only)
+                    .unwrap_err()
+                    .0,
+                StatusCode::FORBIDDEN
+            );
+        }
+    }
 
     #[test]
     fn classifies_memory_read_and_write_routes() {

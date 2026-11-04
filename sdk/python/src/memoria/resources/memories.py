@@ -600,7 +600,10 @@ class MemoriesResource:
         subject_id: str | None = None,
         branch: str | None = None,
     ) -> None:
-        """Permanently remove one active or disabled memory."""
+        """Erase a non-superseded row's content, retaining an idempotency receipt if needed.
+
+        This is not deletion across graph data, edit logs, history, branches or backups.
+        """
         body = _strip_none({"subject_id": subject_id, "branch": branch})
         self._client._request("POST", _memory_path(id, "/erase"), json=body, idempotent=False)
 
@@ -952,6 +955,7 @@ class AsyncMemoriesResource:
         subject_id: str | None = None,
         branch: str | None = None,
     ) -> None:
+        """Erase row content (retaining an idempotency receipt), not all historical copies."""
         body = _strip_none({"subject_id": subject_id, "branch": branch})
         await self._client._arequest(
             "POST", _memory_path(id, "/erase"), json=body, idempotent=False
