@@ -68,9 +68,7 @@ fn parse_session_scope(
         .transpose()
 }
 
-fn parse_memory_types_opt(
-    types: Option<&Vec<String>>,
-) -> Result<Option<Vec<MemoryType>>, String> {
+fn parse_memory_types_opt(types: Option<&Vec<String>>) -> Result<Option<Vec<MemoryType>>, String> {
     let mut parsed = types
         .map(|ts| {
             ts.iter()
@@ -111,14 +109,12 @@ impl RetrieveRequest {
 
     pub fn retrieve_options(&self) -> Result<memoria_service::RetrieveOptions, String> {
         let memory_types = parse_memory_types_opt(self.memory_types.as_ref())?;
-        Ok(
-            memoria_service::RetrieveOptions::from_session_scope(
-                self.session_id.as_deref(),
-                self.session_scope()?,
-            )
-            .with_subject_id(self.subject_id.clone())
-            .with_memory_types(memory_types),
+        Ok(memoria_service::RetrieveOptions::from_session_scope(
+            self.session_id.as_deref(),
+            self.session_scope()?,
         )
+        .with_subject_id(self.subject_id.clone())
+        .with_memory_types(memory_types))
     }
 }
 
@@ -150,14 +146,12 @@ impl SearchRequest {
 
     pub fn retrieve_options(&self) -> Result<memoria_service::RetrieveOptions, String> {
         let memory_types = parse_memory_types_opt(self.memory_types.as_ref())?;
-        Ok(
-            memoria_service::RetrieveOptions::from_session_scope(
-                self.session_id.as_deref(),
-                self.session_scope()?,
-            )
-            .with_subject_id(self.subject_id.clone())
-            .with_memory_types(memory_types),
+        Ok(memoria_service::RetrieveOptions::from_session_scope(
+            self.session_id.as_deref(),
+            self.session_scope()?,
         )
+        .with_subject_id(self.subject_id.clone())
+        .with_memory_types(memory_types))
     }
 }
 
@@ -193,8 +187,7 @@ impl StructuredQueryRequest {
 
         let subject_id = normalized_filter("subject_id", self.subject_id.as_deref())?;
         let session_id = normalized_filter("session_id", self.session_id.as_deref())?;
-        let normalized_trust_tier =
-            normalized_filter("trust_tier", self.trust_tier.as_deref())?;
+        let normalized_trust_tier = normalized_filter("trust_tier", self.trust_tier.as_deref())?;
         let branch = normalized_filter("branch", self.branch.as_deref())?;
         let trust_tier = normalized_trust_tier
             .as_deref()
@@ -349,14 +342,12 @@ impl CorrectByQueryRequest {
 
     pub fn retrieve_options(&self) -> Result<memoria_service::RetrieveOptions, String> {
         let memory_types = parse_memory_types_opt(self.memory_types.as_ref())?;
-        Ok(
-            memoria_service::RetrieveOptions::from_session_scope(
-                self.session_id.as_deref(),
-                parse_session_scope(self.session_scope.as_deref())?,
-            )
-            .with_subject_id(self.subject_id.clone())
-            .with_memory_types(memory_types),
+        Ok(memoria_service::RetrieveOptions::from_session_scope(
+            self.session_id.as_deref(),
+            parse_session_scope(self.session_scope.as_deref())?,
         )
+        .with_subject_id(self.subject_id.clone())
+        .with_memory_types(memory_types))
     }
 }
 
@@ -479,15 +470,23 @@ impl From<Memory> for MemoryResponse {
     }
 }
 
-/// Operator governance of one memory (disable / restore / erase). `subject_id`, when set,
+/// Operator disable. `subject_id`, when set,
 /// fences the target: a memory of another subject is reported as not found.
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryGovernanceRequest {
     pub subject_id: Option<String>,
-    /// Recorded with a disable; ignored by restore and erase.
+    /// Recorded with the disable marker.
     #[serde(default)]
     pub reason: String,
+    pub branch: Option<String>,
+}
+
+/// Restore and erase do not record a reason; reject it rather than silently ignoring it.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryLifecycleRequest {
+    pub subject_id: Option<String>,
     pub branch: Option<String>,
 }
 

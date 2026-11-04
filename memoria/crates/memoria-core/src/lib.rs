@@ -49,9 +49,12 @@ pub const STORE_REQUEST_HASH_FIELD: &str = "_memoria_store_request_sha256";
 /// Only the disable and restore operations write it; it is never caller metadata.
 pub const DISABLED_FIELD: &str = "_memoria_disabled";
 
+/// Content-free receipt retained after explicitly erasing an idempotent memory.
+pub const ERASED_FIELD: &str = "_memoria_erased";
+
 /// Metadata keys owned by Memoria itself: callers can neither write nor query them.
 pub fn is_reserved_metadata_key(key: &str) -> bool {
-    key == STORE_REQUEST_HASH_FIELD || key == DISABLED_FIELD
+    key == STORE_REQUEST_HASH_FIELD || key == DISABLED_FIELD || key == ERASED_FIELD
 }
 
 #[cfg(test)]
@@ -61,6 +64,7 @@ mod tests {
     #[test]
     fn governance_marker_is_reserved_without_reserving_business_metadata() {
         assert!(is_reserved_metadata_key(DISABLED_FIELD));
+        assert!(is_reserved_metadata_key(ERASED_FIELD));
         assert!(is_reserved_metadata_key(STORE_REQUEST_HASH_FIELD));
         for key in ["scene", "agent_id", "project_space", "disabled_reason"] {
             assert!(!is_reserved_metadata_key(key));

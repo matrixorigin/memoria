@@ -397,7 +397,9 @@ pub async fn group_main_write_guard(
                                 | "/v1/observe"
                                 | "/v1/observe/deduplicated"
                         ) || (path.starts_with("/v1/memories/")
-                            && path.ends_with("/correct"));
+                            && ["/correct", "/disable", "/restore", "/erase"]
+                                .iter()
+                                .any(|suffix| path.ends_with(suffix)));
                         if !branch_aware_body_route {
                             return (
                                 StatusCode::FORBIDDEN,
@@ -1484,9 +1486,7 @@ mod tests {
     fn manual_governance_requires_memory_scopes() {
         use axum::http::Method;
         let read_only = parse_scopes(SCOPE_MEMORY_READ);
-        assert!(
-            authorize_api_key_route(&Method::GET, "/v1/memories/disabled", &read_only).is_ok()
-        );
+        assert!(authorize_api_key_route(&Method::GET, "/v1/memories/disabled", &read_only).is_ok());
         for action in ["disable", "restore", "erase"] {
             let path = format!("/v1/memories/synthetic/{action}");
             assert_eq!(
@@ -1512,7 +1512,8 @@ mod tests {
             &axum::http::Method::POST,
             "/v1/observe/deduplicated",
             &parse_scopes("memory:read")
-        ).is_err());
+        )
+        .is_err());
         assert_eq!(
             required_scope_for_request(&axum::http::Method::POST, "/v1/memories/retrieve"),
             Some(SCOPE_MEMORY_READ)
@@ -1687,10 +1688,7 @@ mod tests {
         assert_eq!(resolve_personal_user_id(&headers, None).unwrap(), "alice");
 
         let headers = axum::http::HeaderMap::new();
-        assert_eq!(
-            resolve_personal_user_id(&headers, None).unwrap(),
-            "default"
-        );
+        assert_eq!(resolve_personal_user_id(&headers, None).unwrap(), "default");
     }
 
     #[test]

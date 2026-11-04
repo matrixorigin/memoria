@@ -1398,7 +1398,7 @@ impl MemoryService {
             let table = sql
                 .table_for_branch(user_id, Some(&resolved_branch))
                 .await?;
-            if let Some(existing) = sql.get_from(&table, &id).await? {
+            if let Some(existing) = sql.get_owned_from(&table, &id, user_id).await? {
                 return validate_idempotent_receipt(existing, user_id, &hash);
             }
             extra_metadata
@@ -1474,7 +1474,7 @@ impl MemoryService {
                     return Ok(memory);
                 }
                 Err(error) => {
-                    if let Some(existing) = sql.get_from(&table, &id).await? {
+                    if let Some(existing) = sql.get_owned_from(&table, &id, user_id).await? {
                         return validate_idempotent_receipt(existing, user_id, &hash);
                     }
                     return Err(error);
@@ -2306,13 +2306,8 @@ impl MemoryService {
                 subject_id: old.subject_id.clone(),
             };
 
-            sql.insert_into(&table, &new_mem).await?;
-            // Supersede + cleanup are independent — run in parallel
-            let (sup_res, _) = tokio::join!(
-                sql.supersede_memory(&table, memory_id, &new_mem.memory_id),
-                Self::cleanup_entity_data_for_memory(sql.as_ref(), memory_id, "correct"),
-            );
-            sup_res?;
+            sql.replace_active_revision(&table, &old, &new_mem).await?;
+            Self::cleanup_entity_data_for_memory(sql.as_ref(), memory_id, "correct").await;
 
             self.report(StatsEvent::MemoryStored {
                 user_id: user_id.to_string(),
@@ -2433,6 +2428,12 @@ impl MemoryService {
     ) -> Result<Memory, MemoriaError> {
         sql.get_owned_from(table, memory_id, user_id)
             .await?
+            .filter(|memory| {
+                !memory
+                    .extra_metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.contains_key(memoria_core::ERASED_FIELD))
+            })
             .filter(|memory| subject_id.is_none() || memory.subject_id.as_deref() == subject_id)
             .ok_or_else(|| MemoriaError::NotFound(memory_id.to_string()))
     }
@@ -2478,9 +2479,7 @@ impl MemoryService {
             });
             Self::cleanup_entity_data_for_memory(sql.as_ref(), memory_id, "disable").await;
         }
-        memory.extra_metadata = Some(metadata);
-        memory.is_active = false;
-        Ok(memory)
+        Self::owned_governance_target(&sql, &table, user_id, subject_id, memory_id).await
     }
 
     /// Reactivate an operator-disabled memory.
@@ -2513,15 +2512,14 @@ impl MemoryService {
         }
         self.send_edit_log(user_id, "restore", Some(memory_id), None, "", None);
         if table == sql.t("mem_memories") {
+            sql.graph_store().reactivate_by_memory_id(memory_id).await?;
             self.report(StatsEvent::MemoryActivated {
                 user_id: user_id.to_string(),
             });
             self.enqueue_entity_extraction(user_id, memory_id, &memory.content)
                 .await;
         }
-        memory.extra_metadata = Some(metadata);
-        memory.is_active = true;
-        Ok(memory)
+        Self::owned_governance_target(&sql, &table, user_id, subject_id, memory_id).await
     }
 
     /// Permanently remove one active or disabled memory. Superseded revisions belong to the
@@ -2962,10 +2960,10 @@ impl MemoryService {
         // Normalize all string filters once at the boundary so that both the SQL
         // path and the fallback path treat "  alice  " and "" identically.
         let memory_type = options.memory_type.map(str::trim).filter(|s| !s.is_empty());
-        let session_id  = options.session_id.map(str::trim).filter(|s| !s.is_empty());
-        let trust_tier  = options.trust_tier.map(str::trim).filter(|s| !s.is_empty());
-        let subject_id  = options.subject_id.map(str::trim).filter(|s| !s.is_empty());
-        let cursor      = options.cursor.map(str::trim).filter(|s| !s.is_empty());
+        let session_id = options.session_id.map(str::trim).filter(|s| !s.is_empty());
+        let trust_tier = options.trust_tier.map(str::trim).filter(|s| !s.is_empty());
+        let subject_id = options.subject_id.map(str::trim).filter(|s| !s.is_empty());
+        let cursor = options.cursor.map(str::trim).filter(|s| !s.is_empty());
 
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
@@ -3773,8 +3771,8 @@ mod tests {
 
     #[test]
     fn retrieve_options_with_subject_id_empty_becomes_none() {
-        let opts = RetrieveOptions::from_session_scope(None, None)
-            .with_subject_id(Some("  ".to_string()));
+        let opts =
+            RetrieveOptions::from_session_scope(None, None).with_subject_id(Some("  ".to_string()));
         assert_eq!(opts.subject_id(), None);
     }
 
@@ -3935,8 +3933,12 @@ fn validate_idempotent_receipt(
     owner: &str,
     request_hash: &str,
 ) -> Result<Memory, MemoriaError> {
+    if !memory.is_active {
+        return Err(MemoriaError::Conflict(
+            "idempotency_key belongs to an inactive or erased receipt".into(),
+        ));
+    }
     if memory.user_id != owner
-        || !memory.is_active
         || memory
             .extra_metadata
             .as_ref()
