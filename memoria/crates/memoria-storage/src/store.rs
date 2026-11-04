@@ -38,9 +38,9 @@ pub fn validate_extra_metadata_filter(
         )));
     }
     for (key, value) in filter {
-        if key == memoria_core::STORE_REQUEST_HASH_FIELD {
+        if memoria_core::is_reserved_metadata_key(key) {
             return Err(MemoriaError::Validation(
-                "reserved receipt metadata is not queryable".into(),
+                "reserved metadata is not queryable".into(),
             ));
         }
         let mut chars = key.chars();
@@ -5290,6 +5290,110 @@ impl SqlMemoryStore {
         .await
         .map_err(db_err)?;
         Ok(res.rows_affected())
+    }
+
+    /// An owned row in any state; operator governance must see disabled rows.
+    pub async fn get_owned_from(
+        &self,
+        table: &str,
+        memory_id: &str,
+        owner: &str,
+    ) -> Result<Option<Memory>, MemoriaError> {
+        let table = self.t(table);
+        let row = sqlx::query(&format!(
+            "SELECT {FULLTEXT_MEMORY_COLUMNS} FROM {table} WHERE memory_id = ? AND user_id = ?"
+        ))
+        .bind(memory_id)
+        .bind(owner)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|row| row_to_memory(&row)).transpose()
+    }
+
+    /// Deactivate an active memory and store the caller-built metadata that marks it disabled.
+    /// Returns the number of rows changed: 0 when the row was no longer active.
+    pub async fn disable_in(
+        &self,
+        table: &str,
+        memory_id: &str,
+        extra_metadata: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<u64, MemoriaError> {
+        let table = self.t(table);
+        let res = sqlx::query(&format!(
+            "UPDATE {table} SET is_active = 0, extra_metadata = ?, updated_at = ? \
+             WHERE memory_id = ? AND is_active = 1"
+        ))
+        .bind(serde_json::to_string(extra_metadata)?)
+        .bind(Utc::now().naive_utc())
+        .bind(memory_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected())
+    }
+
+    /// Reactivate a disabled memory with its marker removed. A superseded revision is never
+    /// reactivated. Returns the number of rows changed.
+    pub async fn restore_in(
+        &self,
+        table: &str,
+        memory_id: &str,
+        extra_metadata: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<u64, MemoriaError> {
+        let table = self.t(table);
+        let res = sqlx::query(&format!(
+            "UPDATE {table} SET is_active = 1, extra_metadata = ?, updated_at = ? \
+             WHERE memory_id = ? AND is_active = 0 AND (superseded_by IS NULL OR superseded_by = '')"
+        ))
+        .bind(serde_json::to_string(extra_metadata)?)
+        .bind(Utc::now().naive_utc())
+        .bind(memory_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected())
+    }
+
+    /// Physically delete one row.
+    pub async fn erase_from(&self, table: &str, memory_id: &str) -> Result<u64, MemoriaError> {
+        let table = self.t(table);
+        let res = sqlx::query(&format!("DELETE FROM {table} WHERE memory_id = ?"))
+            .bind(memory_id)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected())
+    }
+
+    /// Disabled memories of one owner, most recently disabled first.
+    pub async fn list_disabled_from(
+        &self,
+        table: &str,
+        user_id: &str,
+        subject_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        let table = self.t(table);
+        let subject_clause = if subject_id.is_some() { " AND subject_id = ?" } else { "" };
+        let sql = format!(
+            "SELECT {FULLTEXT_MEMORY_COLUMNS} FROM {table} \
+             WHERE user_id = ? AND is_active = 0 \
+               AND (superseded_by IS NULL OR superseded_by = '') \
+               AND JSON_EXTRACT(extra_metadata, '$.{disabled}') IS NOT NULL{subject_clause} \
+             ORDER BY updated_at DESC LIMIT ?",
+            disabled = memoria_core::DISABLED_FIELD,
+        );
+        let mut query = sqlx::query(&sql).bind(user_id);
+        if let Some(subject_id) = subject_id {
+            query = query.bind(subject_id);
+        }
+        let rows = query
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+        rows.iter().map(row_to_memory).collect()
     }
 
     /// Batch soft-delete: deactivate multiple memories in one round trip per chunk.

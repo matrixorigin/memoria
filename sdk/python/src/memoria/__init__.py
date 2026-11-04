@@ -34,6 +34,7 @@ from .exceptions import (
 from .models import (
     ApplyResult,
     Branch,
+    DisabledMemory,
     GovernanceResult,
     Memory,
     MemoryPage,
@@ -67,6 +68,7 @@ __all__ = [
     "MemoriaValidationError",
     # models
     "Memory",
+    "DisabledMemory",
     "MemoryPage",
     "RetrieveResult",
     "PurgeResult",

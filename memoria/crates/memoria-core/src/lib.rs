@@ -47,6 +47,15 @@ pub fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
 /// Reserved persistence fingerprint for atomic store receipts; not caller metadata.
 pub const STORE_REQUEST_HASH_FIELD: &str = "_memoria_store_request_sha256";
 
+/// Reserved marker of an operator-disabled memory, `{"at": RFC 3339, "reason": string}`.
+/// Only the disable and restore operations write it; it is never caller metadata.
+pub const DISABLED_FIELD: &str = "_memoria_disabled";
+
+/// Metadata keys owned by Memoria itself: callers can neither write nor query them.
+pub fn is_reserved_metadata_key(key: &str) -> bool {
+    key == STORE_REQUEST_HASH_FIELD || key == DISABLED_FIELD
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

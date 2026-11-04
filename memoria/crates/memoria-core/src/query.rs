@@ -33,7 +33,7 @@ pub fn valid_metadata_path(path: &str) -> bool {
                 .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
                 && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
         })
-        && path.split('.').next() != Some(crate::STORE_REQUEST_HASH_FIELD)
+        && !path.split('.').next().is_some_and(crate::is_reserved_metadata_key)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
