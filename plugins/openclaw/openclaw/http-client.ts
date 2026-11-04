@@ -483,18 +483,18 @@ export class MemoriaHttpTransport {
   private formatSnapshotList(data: unknown): string {
     // Produce text matching Rust MCP format: "Snapshots (N):\n  name (timestamp)\n  ..."
     const rec = this.asRecord(data);
-    const items = rec?.result ? this.asRecord(rec.result) : rec;
-    // The API may return an array or an object with items/snapshots
-    let snapshots: unknown[] = [];
+    // Accept the documented API envelopes and legacy unpaginated formats.
+    let snapshots: unknown[];
     if (Array.isArray(data)) {
       snapshots = data;
-    } else if (items && Array.isArray(items)) {
-      snapshots = items;
-    } else if (rec) {
-      // Try common response shapes
-      if (Array.isArray(rec.snapshots)) snapshots = rec.snapshots;
-      else if (Array.isArray(rec.items)) snapshots = rec.items;
-      else if (typeof rec.result === "string") return rec.result as string;
+    } else if (Array.isArray(rec?.snapshots)) {
+      snapshots = rec.snapshots;
+    } else if (Array.isArray(rec?.items)) {
+      snapshots = rec.items;
+    } else if (typeof rec?.result === "string") {
+      return rec.result;
+    } else {
+      throw new Error("Memoria snapshot listing returned a malformed page");
     }
     if (snapshots.length === 0) {
       return "Snapshots (0):";
