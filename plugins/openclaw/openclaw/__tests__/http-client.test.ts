@@ -198,6 +198,19 @@ describe("Group 3: Cloud API Communication", () => {
       expect(result.content[0].text).toBe("Stored memory m1: hello world");
     });
 
+    it.each([
+      ["empty object", {}],
+      ["null", null],
+      ["array", []],
+      ["numeric memory ID", { memory_id: 42 }],
+      ["blank memory ID", { memory_id: "   " }],
+      ["empty HTTP body", ""],
+    ])("3.34a memory_store rejects %s", async (_case, response) => {
+      fetchMock.respondWith(200, response);
+      await expect(transport.callTool("memory_store", { content: "fixture" }))
+        .rejects.toThrow(/invalid store response/i);
+    });
+
     it("3.35 memory_retrieve preserves structured records", async () => {
       fetchMock.respondWith(200, {
         results: [
@@ -217,6 +230,29 @@ describe("Group 3: Cloud API Communication", () => {
       const result = await transport.callTool("memory_retrieve", { query: "q" }) as any;
       expect(result.content[0].text).toBe("[]");
     });
+
+    it.each(["memory_retrieve", "memory_search"])(
+      "3.36a %s rejects malformed successful responses",
+      async (tool) => {
+        for (const response of [null, {}, { error: "upstream failed" }, { results: null }, "invalid", 42]) {
+          fetchMock.respondWith(200, response);
+          await expect(transport.callTool(tool, { query: "q" }))
+            .rejects.toThrow(/invalid memoria api memory list response/i);
+        }
+      },
+    );
+
+    it.each(["memory_retrieve", "memory_search"])(
+      "3.36b %s accepts every documented list envelope",
+      async (tool) => {
+        const item = { memory_id: "m1", content: "remember this" };
+        for (const response of [[item], { results: [item] }, { items: [item] }]) {
+          fetchMock.respondWith(200, response);
+          const result = await transport.callTool(tool, { query: "q" }) as any;
+          expect(JSON.parse(result.content[0].text)).toEqual([item]);
+        }
+      },
+    );
 
     it("3.38 memory_profile with profile → profile text", async () => {
       fetchMock.respondWith(200, { profile: "Likes TypeScript" });

@@ -122,7 +122,10 @@ export class MemoriaHttpTransport {
     if (args.trust_tier) body.trust_tier = args.trust_tier;
     const data = await this.post("/v1/memories", body);
     const rec = this.asRecord(data);
-    const id = rec?.memory_id ?? "";
+    const id = rec?.memory_id;
+    if (typeof id !== "string" || !id.trim()) {
+      throw new Error("Memoria API returned invalid store response: missing memory_id");
+    }
     const content = rec?.content ?? args.content ?? "";
     return `Stored memory ${id}: ${content}`;
   }
@@ -457,16 +460,20 @@ export class MemoriaHttpTransport {
   // also understands the Rust MCP binary's legacy text format.
 
   private formatMemoryList(data: unknown): string {
-    // The retrieve/search endpoints return either an array or { results: [...] }
+    // The retrieve/search endpoints return an array or a results/items envelope.
     const rec = this.asRecord(data);
-    const items = Array.isArray(data)
-      ? data
-      : Array.isArray(rec?.results)
-        ? rec!.results
-        : Array.isArray(rec?.items)
-          ? rec!.items
-          : [];
-    return this.formatMemoryItems(items);
+    if (Array.isArray(data)) {
+      return this.formatMemoryItems(data);
+    }
+    if (Array.isArray(rec?.results)) {
+      return this.formatMemoryItems(rec.results);
+    }
+    if (Array.isArray(rec?.items)) {
+      return this.formatMemoryItems(rec.items);
+    }
+    throw new Error(
+      "Invalid Memoria API memory list response: expected an array or an object with a results/items array",
+    );
   }
 
   private formatMemoryItems(items: unknown[]): string {
