@@ -23,6 +23,7 @@ pub fn api_err_typed(e: memoria_core::MemoriaError) -> (StatusCode, String) {
     use memoria_core::MemoriaError::*;
     let status = match &e {
         NotFound(_) => StatusCode::NOT_FOUND,
+        Conflict(_) => StatusCode::CONFLICT,
         Validation(_) | InvalidMemoryType(_) | InvalidTrustTier(_) => {
             StatusCode::UNPROCESSABLE_ENTITY
         }
@@ -642,6 +643,111 @@ pub async fn delete_memory(
     }
     .map_err(api_err_typed)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+const DISABLE_REASON_MAX_CHARS: usize = 512;
+const DISABLED_LIST_DEFAULT_LIMIT: i64 = 100;
+const DISABLED_LIST_MAX_LIMIT: i64 = 500;
+
+fn governance_subject(subject_id: Option<&str>) -> Option<&str> {
+    subject_id
+        .map(str::trim)
+        .filter(|subject| !subject.is_empty())
+}
+
+/// Operator disable: the memory leaves retrieval but stays restorable.
+pub async fn disable_memory(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    Json(req): Json<MemoryGovernanceRequest>,
+) -> ApiResult<MemoryResponse> {
+    if req.reason.chars().count() > DISABLE_REASON_MAX_CHARS {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("reason must be at most {DISABLE_REASON_MAX_CHARS} characters"),
+        ));
+    }
+    let memory = state
+        .service
+        .disable_on_branch(
+            auth.scope_id(),
+            branch_param(req.branch.as_deref()),
+            governance_subject(req.subject_id.as_deref()),
+            &id,
+            req.reason.trim(),
+        )
+        .await
+        .map_err(api_err_typed)?;
+    Ok(Json(memory.into()))
+}
+
+pub async fn restore_memory(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    Json(req): Json<MemoryGovernanceRequest>,
+) -> ApiResult<MemoryResponse> {
+    let memory = state
+        .service
+        .restore_on_branch(
+            auth.scope_id(),
+            branch_param(req.branch.as_deref()),
+            governance_subject(req.subject_id.as_deref()),
+            &id,
+        )
+        .await
+        .map_err(api_err_typed)?;
+    Ok(Json(memory.into()))
+}
+
+/// Permanent removal of one active or disabled memory, unlike the restorable purge.
+pub async fn erase_memory(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    Json(req): Json<MemoryGovernanceRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    state
+        .service
+        .erase_on_branch(
+            auth.scope_id(),
+            branch_param(req.branch.as_deref()),
+            governance_subject(req.subject_id.as_deref()),
+            &id,
+        )
+        .await
+        .map_err(api_err_typed)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn list_disabled_memories(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Query(q): Query<DisabledMemoriesQuery>,
+) -> ApiResult<crate::models::DisabledMemoriesResponse> {
+    let limit = q.limit.unwrap_or(DISABLED_LIST_DEFAULT_LIMIT);
+    if !(1..=DISABLED_LIST_MAX_LIMIT).contains(&limit) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("limit must be between 1 and {DISABLED_LIST_MAX_LIMIT}"),
+        ));
+    }
+    let (memories, next_cursor) = state
+        .service
+        .list_disabled_on_branch(
+            auth.scope_id(),
+            branch_param(q.branch.as_deref()),
+            governance_subject(q.subject_id.as_deref()),
+            limit,
+            q.cursor.as_deref(),
+        )
+        .await
+        .map_err(api_err_typed)?;
+    Ok(Json(crate::models::DisabledMemoriesResponse {
+        items: memories.into_iter().map(Into::into).collect(),
+        next_cursor,
+    }))
 }
 
 pub async fn purge_memories(

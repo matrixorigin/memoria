@@ -144,6 +144,12 @@ fn should_mark_metrics_dirty(
                 // Dynamic path patterns
                 if path.starts_with("/v1/memories/") && path.ends_with("/feedback") {
                     Some(DirtyMask::FEEDBACK)
+                } else if path.starts_with("/v1/memories/")
+                    && (path.ends_with("/disable")
+                        || path.ends_with("/restore")
+                        || path.ends_with("/erase"))
+                {
+                    Some(DirtyMask::MEMORY)
                 } else if path.starts_with("/v1/snapshots/") && path.ends_with("/rollback")
                     || path.starts_with("/v1/branches/") && path.ends_with("/checkout")
                     || path.starts_with("/v1/branches/") && path.ends_with("/merge")
@@ -211,6 +217,15 @@ pub fn build_router(state: AppState) -> Router {
             put(routes::memory::correct_memory),
         )
         .route("/v1/memories/:id", delete(routes::memory::delete_memory))
+        .route(
+            "/v1/memories/:id/disable",
+            post(routes::memory::disable_memory),
+        )
+        .route(
+            "/v1/memories/:id/restore",
+            post(routes::memory::restore_memory),
+        )
+        .route("/v1/memories/:id/erase", post(routes::memory::erase_memory))
         .route("/v1/observe", post(routes::memory::observe_turn))
         .route("/v1/observe/deduplicated", post(routes::memory::observe_turn_deduplicated))
         .route(
@@ -252,6 +267,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/v1/memories/retrieve", post(routes::memory::retrieve))
         .route("/v1/memories/search", post(routes::memory::search))
+        .route(
+            "/v1/memories/disabled",
+            get(routes::memory::list_disabled_memories),
+        )
         .route("/v1/memories/:id", get(routes::memory::get_memory))
         .route(
             "/v1/memories/:id/history",

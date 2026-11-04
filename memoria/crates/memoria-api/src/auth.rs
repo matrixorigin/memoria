@@ -1481,6 +1481,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn manual_governance_requires_memory_scopes() {
+        use axum::http::Method;
+        let read_only = parse_scopes(SCOPE_MEMORY_READ);
+        assert!(
+            authorize_api_key_route(&Method::GET, "/v1/memories/disabled", &read_only).is_ok()
+        );
+        for action in ["disable", "restore", "erase"] {
+            let path = format!("/v1/memories/synthetic/{action}");
+            assert_eq!(
+                required_scope_for_request(&Method::POST, &path),
+                Some(SCOPE_MEMORY_WRITE)
+            );
+            assert_eq!(
+                authorize_api_key_route(&Method::POST, &path, &read_only)
+                    .unwrap_err()
+                    .0,
+                StatusCode::FORBIDDEN
+            );
+        }
+    }
+
+    #[test]
     fn classifies_memory_read_and_write_routes() {
         assert_eq!(
             required_scope_for_request(&axum::http::Method::POST, "/v1/observe/deduplicated"),

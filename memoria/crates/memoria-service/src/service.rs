@@ -2423,6 +2423,191 @@ impl MemoryService {
         }
     }
 
+    /// An owned memory in any state, fenced to `subject_id` when the caller names one.
+    async fn owned_governance_target(
+        sql: &SqlMemoryStore,
+        table: &str,
+        user_id: &str,
+        subject_id: Option<&str>,
+        memory_id: &str,
+    ) -> Result<Memory, MemoriaError> {
+        sql.get_owned_from(table, memory_id, user_id)
+            .await?
+            .filter(|memory| subject_id.is_none() || memory.subject_id.as_deref() == subject_id)
+            .ok_or_else(|| MemoriaError::NotFound(memory_id.to_string()))
+    }
+
+    /// Operator disable: the memory leaves retrieval but stays restorable, unlike a purge.
+    /// Its marker lets an extraction pipeline recognise the content as rejected.
+    pub async fn disable_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        subject_id: Option<&str>,
+        memory_id: &str,
+        reason: &str,
+    ) -> Result<Memory, MemoriaError> {
+        if self.sql_store.is_none() {
+            return Err(MemoriaError::Internal(
+                "memory governance requires a SQL-backed memory store".to_string(),
+            ));
+        }
+        let sql = self.user_sql_store(user_id).await?;
+        let table = sql.table_for_branch(user_id, branch).await?;
+        let mut memory =
+            Self::owned_governance_target(&sql, &table, user_id, subject_id, memory_id).await?;
+        if !memory.is_active {
+            return Err(MemoriaError::Conflict(format!(
+                "memory {memory_id} is not active"
+            )));
+        }
+        let mut metadata = memory.extra_metadata.take().unwrap_or_default();
+        metadata.insert(
+            DISABLED_FIELD.into(),
+            serde_json::json!({"at": Utc::now().to_rfc3339(), "reason": reason}),
+        );
+        if sql.disable_in(&table, &memory, &metadata).await? == 0 {
+            return Err(MemoriaError::Conflict(format!(
+                "memory {memory_id} is not active"
+            )));
+        }
+        self.send_edit_log(user_id, "disable", Some(memory_id), None, reason, None);
+        if table == sql.t("mem_memories") {
+            self.report(StatsEvent::MemoryDeactivated {
+                user_id: user_id.to_string(),
+            });
+            Self::cleanup_entity_data_for_memory(sql.as_ref(), memory_id, "disable").await;
+        }
+        memory.extra_metadata = Some(metadata);
+        memory.is_active = false;
+        Ok(memory)
+    }
+
+    /// Reactivate an operator-disabled memory.
+    pub async fn restore_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        subject_id: Option<&str>,
+        memory_id: &str,
+    ) -> Result<Memory, MemoriaError> {
+        if self.sql_store.is_none() {
+            return Err(MemoriaError::Internal(
+                "memory governance requires a SQL-backed memory store".to_string(),
+            ));
+        }
+        let sql = self.user_sql_store(user_id).await?;
+        let table = sql.table_for_branch(user_id, branch).await?;
+        let mut memory =
+            Self::owned_governance_target(&sql, &table, user_id, subject_id, memory_id).await?;
+        let mut metadata = memory.extra_metadata.take().unwrap_or_default();
+        if memory.is_active || metadata.remove(DISABLED_FIELD).is_none() {
+            return Err(MemoriaError::Conflict(format!(
+                "memory {memory_id} is not disabled"
+            )));
+        }
+        if sql.restore_in(&table, &memory, &metadata).await? == 0 {
+            return Err(MemoriaError::Conflict(format!(
+                "memory {memory_id} is not disabled"
+            )));
+        }
+        self.send_edit_log(user_id, "restore", Some(memory_id), None, "", None);
+        if table == sql.t("mem_memories") {
+            self.report(StatsEvent::MemoryActivated {
+                user_id: user_id.to_string(),
+            });
+            self.enqueue_entity_extraction(user_id, memory_id, &memory.content)
+                .await;
+        }
+        memory.extra_metadata = Some(metadata);
+        memory.is_active = true;
+        Ok(memory)
+    }
+
+    /// Permanently remove one active or disabled memory. Superseded revisions belong to the
+    /// history of their successor and are not erased one by one.
+    pub async fn erase_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        subject_id: Option<&str>,
+        memory_id: &str,
+    ) -> Result<(), MemoriaError> {
+        if self.sql_store.is_none() {
+            return Err(MemoriaError::Internal(
+                "memory governance requires a SQL-backed memory store".to_string(),
+            ));
+        }
+        let sql = self.user_sql_store(user_id).await?;
+        let table = sql.table_for_branch(user_id, branch).await?;
+        let memory =
+            Self::owned_governance_target(&sql, &table, user_id, subject_id, memory_id).await?;
+        if memory
+            .superseded_by
+            .as_deref()
+            .is_some_and(|next| !next.is_empty())
+        {
+            return Err(MemoriaError::Conflict(format!(
+                "memory {memory_id} is a superseded revision"
+            )));
+        }
+        if sql.erase_from(&table, &memory).await? != 1 {
+            return Err(MemoriaError::Conflict("memory changed during erase".into()));
+        }
+        self.send_edit_log(user_id, "erase", Some(memory_id), None, "", None);
+        if memory.is_active && table == sql.t("mem_memories") {
+            self.report(StatsEvent::MemoryDeactivated {
+                user_id: user_id.to_string(),
+            });
+        }
+        if table == sql.t("mem_memories") {
+            Self::cleanup_entity_data_for_memory(sql.as_ref(), memory_id, "erase").await;
+        }
+        Ok(())
+    }
+
+    /// Operator-disabled memories, most recently disabled first.
+    pub async fn list_disabled_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        subject_id: Option<&str>,
+        limit: i64,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<Memory>, Option<String>), MemoriaError> {
+        if !(1..=500).contains(&limit) {
+            return Err(MemoriaError::Validation(
+                "disabled memory limit must be between 1 and 500".into(),
+            ));
+        }
+        if self.sql_store.is_none() {
+            return Err(MemoriaError::Internal(
+                "memory governance requires a SQL-backed memory store".to_string(),
+            ));
+        }
+        let sql = self.user_sql_store(user_id).await?;
+        let table = sql.table_for_branch(user_id, branch).await?;
+        let mut memories = sql
+            .list_disabled_from(&table, user_id, subject_id, limit + 1, cursor)
+            .await?;
+        let has_more = memories.len() > limit as usize;
+        memories.truncate(limit as usize);
+        let next_cursor = if has_more {
+            let last = memories
+                .last()
+                .ok_or_else(|| MemoriaError::Internal("missing disabled page boundary".into()))?;
+            Some(serde_json::to_string(&(
+                last.updated_at.ok_or_else(|| {
+                    MemoriaError::Internal("missing disabled memory timestamp".into())
+                })?,
+                &last.memory_id,
+            ))?)
+        } else {
+            None
+        };
+        Ok((memories, next_cursor))
+    }
+
     /// Purge multiple memories by IDs with a single audit log entry.
     pub async fn purge_batch(
         &self,
@@ -3701,14 +3886,15 @@ impl MemoryService {
     }
 }
 
-use memoria_core::STORE_REQUEST_HASH_FIELD;
+use memoria_core::{is_reserved_metadata_key, DISABLED_FIELD, STORE_REQUEST_HASH_FIELD};
 
 // Business metadata belongs to the memory across content revisions. The store
-// request fingerprint certifies only the original write, not this replacement.
+// request fingerprint certifies only the original write, not this replacement,
+// and a revision is never born disabled.
 fn correction_metadata(memory: &Memory) -> Option<HashMap<String, serde_json::Value>> {
     memory.extra_metadata.as_ref().map(|metadata| {
         let mut metadata = metadata.clone();
-        metadata.remove(STORE_REQUEST_HASH_FIELD);
+        metadata.retain(|key, _| !is_reserved_metadata_key(key));
         metadata
     })
 }
@@ -3716,10 +3902,8 @@ fn correction_metadata(memory: &Memory) -> Option<HashMap<String, serde_json::Va
 fn reject_reserved_metadata(
     metadata: Option<&HashMap<String, serde_json::Value>>,
 ) -> Result<(), MemoriaError> {
-    if metadata.is_some_and(|metadata| metadata.contains_key(STORE_REQUEST_HASH_FIELD)) {
-        return Err(MemoriaError::Validation(
-            "reserved idempotency metadata field".into(),
-        ));
+    if metadata.is_some_and(|metadata| metadata.keys().any(|key| is_reserved_metadata_key(key))) {
+        return Err(MemoriaError::Validation("reserved metadata field".into()));
     }
     Ok(())
 }
