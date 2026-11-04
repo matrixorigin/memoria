@@ -624,7 +624,12 @@ fn redact_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_string();
     };
-    let Some((userinfo, host)) = rest.split_once('@') else {
+    // Only the authority may contain credentials: path/query '@' is not userinfo.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, suffix) = rest.split_at(authority_end);
+    // Passwords can themselves contain '@'; the authority's last '@' separates
+    // userinfo from host (the first one can be part of the secret).
+    let Some((userinfo, host)) = authority.rsplit_once('@') else {
         return url.to_string();
     };
     if userinfo.is_empty() {
@@ -635,7 +640,7 @@ fn redact_url(url: &str) -> String {
     } else {
         "***"
     };
-    format!("{scheme}://{redacted_userinfo}@{host}")
+    format!("{scheme}://{redacted_userinfo}@{host}{suffix}")
 }
 
 fn normalize_tool_name(tool: Option<String>) -> Option<String> {
@@ -3883,6 +3888,43 @@ mod tests {
             redact_url("mysql://localhost:6001/memoria"),
             "mysql://localhost:6001/memoria"
         );
+    }
+
+    #[test]
+    fn redact_url_masks_at_signs_inside_passwords() {
+        for (source, expected) in [
+            (
+                "mysql://root:p@ss@db.example.com:6001/memoria",
+                "mysql://***:***@db.example.com:6001/memoria",
+            ),
+            (
+                "mysql://root:s3cr3t@x@localhost:6001/memoria",
+                "mysql://***:***@localhost:6001/memoria",
+            ),
+            (
+                "mysql://root:p@ss@localhost:6001/memoria?tag=a@b",
+                "mysql://***:***@localhost:6001/memoria?tag=a@b",
+            ),
+            (
+                "mysql://username@localhost:6001/memoria",
+                "mysql://***@localhost:6001/memoria",
+            ),
+        ] {
+            assert_eq!(redact_url(source), expected);
+        }
+    }
+
+    #[test]
+    fn redact_url_does_not_confuse_path_query_or_fragment_with_userinfo() {
+        for url in [
+            "mysql://localhost:6001/memoria?note=a@b",
+            "mysql://localhost:6001/memoria@archive",
+            "mysql://localhost:6001/memoria#info@label",
+            "mysql://localhost:6001?note=a@b",
+            "opaque@value",
+        ] {
+            assert_eq!(redact_url(url), url);
+        }
     }
 
     #[test]
