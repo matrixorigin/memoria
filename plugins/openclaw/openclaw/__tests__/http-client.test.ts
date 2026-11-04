@@ -274,6 +274,32 @@ describe("Group 3: Cloud API Communication", () => {
       expect(result.content[0].text).toBe("Corrected memory m1: updated");
     });
 
+    it.each([{ memory_id: "old-id" }, { query: "old memory" }])(
+      "rejects invalid correction receipts without replay for %j",
+      async (selector) => {
+        for (const response of [null, {}, { error: "private upstream detail" },
+          { memory_id: "" }, { memory_id: "  " }, { memory_id: 42 }, [], "invalid"]) {
+          fetchMock.respondWith(200, response);
+          const before = fetchMock.calls.length;
+          await expect(transport.callTool("memory_correct", {
+            ...selector, new_content: "replacement",
+          })).rejects.toThrow("Memoria API returned invalid correction response: missing memory_id");
+          expect(fetchMock.calls).toHaveLength(before + 1);
+        }
+      },
+    );
+
+    it.each([{ memory_id: "old-id" }, { query: "old memory" }])(
+      "reports the authoritative replacement ID for %j",
+      async (selector) => {
+        fetchMock.respondWith(200, { memory_id: "replacement-id", content: "server content" });
+        const result = await transport.callTool("memory_correct", {
+          ...selector, new_content: "requested content",
+        }) as any;
+        expect(result.content[0].text).toBe("Corrected memory replacement-id: server content");
+      },
+    );
+
     it("3.41 memory_purge → 'Purged N memory(ies).'", async () => {
       fetchMock.respondWith(200, { purged: 3 });
       const result = await transport.callTool("memory_purge", { topic: "old" }) as any;
