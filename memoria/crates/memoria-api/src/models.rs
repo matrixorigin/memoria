@@ -489,7 +489,7 @@ pub struct MemoryResponse {
 impl From<Memory> for MemoryResponse {
     fn from(mut m: Memory) -> Self {
         if let Some(metadata) = m.extra_metadata.as_mut() {
-            metadata.remove(memoria_core::STORE_REQUEST_HASH_FIELD);
+            metadata.retain(|key, _| !memoria_core::is_reserved_metadata_key(key));
         }
         Self {
             memory_id: m.memory_id,
@@ -508,6 +508,63 @@ impl From<Memory> for MemoryResponse {
             // 空 map 在响应里归一为 None（省略），与读取侧「"{}" → None」一致：新写记录直接
             // 返回内存对象时也不会出现「POST 带 {} 而后续 list/get 无该字段」的不一致。
             extra_metadata: m.extra_metadata.filter(|md| !md.is_empty()),
+        }
+    }
+}
+
+/// Operator governance of one memory (disable / restore / erase). `subject_id`, when set,
+/// fences the target: a memory of another subject is reported as not found.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryGovernanceRequest {
+    pub subject_id: Option<String>,
+    /// Recorded with a disable; ignored by restore and erase.
+    #[serde(default)]
+    pub reason: String,
+    pub branch: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct DisabledMemoriesQuery {
+    pub subject_id: Option<String>,
+    pub limit: Option<i64>,
+    pub branch: Option<String>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct DisabledMemoriesResponse {
+    pub items: Vec<DisabledMemoryResponse>,
+    pub next_cursor: Option<String>,
+}
+
+/// A disabled memory with its disable marker lifted out of the (reserved) metadata.
+#[derive(Serialize)]
+pub struct DisabledMemoryResponse {
+    #[serde(flatten)]
+    pub memory: MemoryResponse,
+    pub disabled_at: Option<String>,
+    pub disabled_reason: Option<String>,
+}
+
+impl From<Memory> for DisabledMemoryResponse {
+    fn from(memory: Memory) -> Self {
+        let marker = memory
+            .extra_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(memoria_core::DISABLED_FIELD))
+            .cloned();
+        let field = |name: &str| {
+            marker
+                .as_ref()
+                .and_then(|marker| marker.get(name))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        Self {
+            disabled_at: field("at"),
+            disabled_reason: field("reason").filter(|reason| !reason.is_empty()),
+            memory: memory.into(),
         }
     }
 }
