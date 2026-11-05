@@ -112,13 +112,25 @@ static COMPILED: Lazy<Vec<(&'static Pattern, Regex)>> = Lazy::new(|| {
         .collect()
 });
 
-/// Decimal value for ASCII and fullwidth digits accepted in card numbers.
+/// Unicode 17.0 code points for the zero digit in each decimal-digit block.
+/// Each decimal digit set contains ten consecutive code points starting here.
+const DECIMAL_DIGIT_ZEROES: [u32; 77] = [
+    0x0030, 0x0660, 0x06F0, 0x07C0, 0x0966, 0x09E6, 0x0A66, 0x0AE6, 0x0B66, 0x0BE6, 0x0C66, 0x0CE6,
+    0x0D66, 0x0DE6, 0x0E50, 0x0ED0, 0x0F20, 0x1040, 0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80,
+    0x1A90, 0x1B50, 0x1BB0, 0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0, 0xA9F0, 0xAA50, 0xABF0,
+    0xFF10, 0x104A0, 0x10D30, 0x10D40, 0x11066, 0x110F0, 0x11136, 0x111D0, 0x112F0, 0x11450,
+    0x114D0, 0x11650, 0x116C0, 0x116D0, 0x116DA, 0x11730, 0x118E0, 0x11950, 0x11BF0, 0x11C50,
+    0x11D50, 0x11DA0, 0x11DE0, 0x11F50, 0x16130, 0x16A60, 0x16AC0, 0x16B50, 0x16D70, 0x1CCF0,
+    0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6, 0x1E140, 0x1E2F0, 0x1E4F0, 0x1E5F1, 0x1E950,
+    0x1FBF0,
+];
+
+/// Decimal value for Unicode decimal digits accepted in card numbers.
 fn decimal_digit(c: char) -> Option<u32> {
-    c.to_digit(10).or_else(|| {
-        ('\u{FF10}'..='\u{FF19}')
-            .contains(&c)
-            .then(|| c as u32 - '\u{FF10}' as u32)
-    })
+    let codepoint = c as u32;
+    DECIMAL_DIGIT_ZEROES
+        .iter()
+        .find_map(|&zero| codepoint.checked_sub(zero).filter(|&value| value < 10))
 }
 
 /// Luhn checksum over decimal digits.
@@ -152,15 +164,13 @@ fn luhn_valid_card_spans(text: &str) -> Vec<(usize, usize, usize)> {
         WORD_BOUNDARY.find_iter(text).map(|m| m.start()).collect();
     let mut candidates = Vec::new();
 
-    for start_index in 0..chars.len() {
-        let (start, first) = chars[start_index];
+    for (start_index, &(start, first)) in chars.iter().enumerate() {
         if decimal_digit(first).is_none() || !word_boundaries.contains(&start) {
             continue;
         }
 
         let mut digits = Vec::new();
-        for index in start_index..chars.len() {
-            let (byte, c) = chars[index];
+        for &(byte, c) in chars.iter().skip(start_index) {
             if let Some(digit) = decimal_digit(c) {
                 digits.push(digit);
                 let end = byte + c.len_utf8();
@@ -573,6 +583,22 @@ mod tests {
             result.redacted_content.as_deref(),
             Some("card [card] on file")
         );
+    }
+
+    #[test]
+    fn credit_card_redaction_supports_unicode_decimal_digits() {
+        for number in [
+            "٤١١١ ١١١١ ١١١١ ١١١١", // Arabic-Indic
+            "४१११ ११११ ११११ ११११", // Devanagari
+            "٤111 1١11 ١1١1 111١", // Mixed ASCII and Arabic-Indic
+        ] {
+            let result = check_sensitivity(&format!("card {number} on file"));
+            assert_eq!(
+                result.redacted_content.as_deref(),
+                Some("card [card] on file"),
+                "valid Unicode decimal card was not redacted: {number}"
+            );
+        }
     }
 
     #[test]
