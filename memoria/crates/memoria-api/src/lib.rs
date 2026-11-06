@@ -226,6 +226,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/v1/memories/:id", delete(routes::memory::delete_memory))
         .route(
+            "/v1/memories/:id/retire-extracted",
+            post(routes::memory::retire_extracted_memory),
+        )
+        .route(
             "/v1/memories/:id/disable",
             post(routes::memory::disable_memory),
         )

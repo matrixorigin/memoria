@@ -8,6 +8,110 @@ use support::multi_db::ApiTestServer;
 
 const MASTER: &str = "synthetic-governance-test-master";
 
+#[tokio::test]
+async fn extraction_cleanup_retains_disabled_restored_and_changed_revisions() {
+    let server = server().await;
+    let owner = format!("cleanup_{}", uuid::Uuid::new_v4().simple());
+    for action in [
+        "unchanged",
+        "disable",
+        "restore",
+        "correct",
+        "foreign-subject",
+        "foreign-session",
+    ] {
+        let response = request(&server, &owner, Method::POST, "/v1/memories")
+            .json(
+                &json!({"content":format!("Synthetic cleanup fact {action}"),
+                "memory_type":"semantic", "subject_id":"subject-a", "session_id":"session-a",
+                "extra_metadata":{"source_job_id":"run-a", "connector_id":"connector-a"}}),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let stored: Value = response.json().await.unwrap();
+        let id = stored["memory_id"].as_str().unwrap();
+        // Read the persisted revision (DB timestamp precision can differ from the write response).
+        let memory: Value = request(
+            &server,
+            &owner,
+            Method::GET,
+            &format!("/v1/memories/{id}?branch=main"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert!(memory["updated_at"].is_string());
+        if action == "disable" || action == "restore" {
+            let disabled = request(
+                &server,
+                &owner,
+                Method::POST,
+                &format!("/v1/memories/{id}/disable"),
+            )
+            .json(&json!({"subject_id":"subject-a", "branch":"main"}))
+            .send()
+            .await
+            .unwrap();
+            assert!(disabled.status().is_success());
+        }
+        if action == "restore" {
+            let restored = request(
+                &server,
+                &owner,
+                Method::POST,
+                &format!("/v1/memories/{id}/restore"),
+            )
+            .json(&json!({"subject_id":"subject-a", "branch":"main"}))
+            .send()
+            .await
+            .unwrap();
+            assert!(restored.status().is_success());
+        }
+        if action == "correct" {
+            server
+                .service()
+                .correct_on_branch(&owner, Some("main"), id, "Synthetic operator correction")
+                .await
+                .unwrap();
+        }
+        let response = request(
+            &server,
+            &owner,
+            Method::POST,
+            &format!("/v1/memories/{id}/retire-extracted"),
+        )
+        .json(
+            &json!({"subject_id":if action == "foreign-subject" {"other"} else {"subject-a"},
+                "session_id":if action == "foreign-session" {"other"} else {"session-a"},
+                "expected_updated_at":memory["updated_at"]}),
+        )
+        .send()
+        .await
+        .unwrap();
+        if action.starts_with("foreign-") {
+            assert_eq!(response.status(), 404);
+        } else {
+            assert_eq!(response.status(), 200);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["deleted"],
+                action == "unchanged"
+            );
+        }
+        let sql = server.user_store(&owner).await;
+        let table = sql.table_for_branch(&owner, Some("main")).await.unwrap();
+        let retained = sql.get_owned_from(&table, id, &owner).await.unwrap();
+        assert_eq!(retained.is_some(), action != "unchanged");
+        if action == "restore" {
+            assert!(retained.unwrap().is_active);
+        }
+    }
+}
+
 fn request(server: &ApiTestServer, owner: &str, method: Method, path: &str) -> RequestBuilder {
     server
         .client

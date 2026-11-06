@@ -2664,6 +2664,71 @@ impl MemoryService {
             .await
     }
 
+    /// Retire only the exact active derived revision inspected by the caller.
+    pub async fn retire_extracted_memory(
+        &self,
+        user_id: &str,
+        subject_id: &str,
+        session_id: &str,
+        memory_id: &str,
+        expected_updated_at: DateTime<Utc>,
+    ) -> Result<bool, MemoriaError> {
+        if subject_id.trim().is_empty() || session_id.trim().is_empty() {
+            return Err(MemoriaError::Validation("cleanup scope is required".into()));
+        }
+        if self.sql_store.is_none() {
+            return Err(MemoriaError::Internal(
+                "cleanup requires SQL storage".into(),
+            ));
+        }
+        let sql = self.user_sql_store(user_id).await?;
+        let table = sql.table_for_branch(user_id, Some("main")).await?;
+        let Some(memory) = sql.get_owned_from(&table, memory_id, user_id).await? else {
+            return Ok(false);
+        };
+        if memory.subject_id.as_deref() != Some(subject_id)
+            || memory.session_id.as_deref() != Some(session_id)
+        {
+            return Err(MemoriaError::NotFound(memory_id.into()));
+        }
+        let derived = memory.extra_metadata.as_ref().is_some_and(|metadata| {
+            ["source_job_id", "connector_id"].iter().all(|key| {
+                metadata
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+            })
+        });
+        if !derived
+            || !memory.is_active
+            || memory.updated_at != Some(expected_updated_at)
+            || memory
+                .superseded_by
+                .as_deref()
+                .is_some_and(|id| !id.is_empty())
+        {
+            return Ok(false);
+        }
+        // erase_from compares the exact persisted revision again in its DML.
+        // Concurrent disable/restore/correction therefore cannot be overwritten.
+        if sql.erase_from(&table, &memory).await? == 0 {
+            return Ok(false);
+        }
+        self.send_edit_log(
+            user_id,
+            "erase",
+            Some(memory_id),
+            None,
+            "extraction cleanup",
+            None,
+        );
+        self.report(StatsEvent::MemoryDeactivated {
+            user_id: user_id.into(),
+        });
+        Self::cleanup_entity_data_for_memory(sql.as_ref(), memory_id, "erase").await;
+        Ok(true)
+    }
+
     /// Explicit cleanup of a confidence-expired main memory, never an active record.
     pub async fn erase_confidence_inactive(
         &self,

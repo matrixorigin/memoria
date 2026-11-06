@@ -769,6 +769,42 @@ pub async fn delete_memory(
 }
 
 const DISABLE_REASON_MAX_CHARS: usize = 512;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetireExtractedRequest {
+    subject_id: String,
+    session_id: String,
+    expected_updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Compare-and-swap cleanup for derived memories. A changed record is retained.
+/// The separate route prevents clients from sending ignored preconditions to purge.
+pub async fn retire_extracted_memory(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    request: Result<Json<RetireExtractedRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let Json(request) = request.map_err(|_| {
+        memory_record_error(memoria_core::MemoriaError::Validation(
+            "invalid cleanup request".into(),
+        ))
+    })?;
+    let deleted = state
+        .service
+        .retire_extracted_memory(
+            auth.scope_id(),
+            &request.subject_id,
+            &request.session_id,
+            &id,
+            request.expected_updated_at,
+        )
+        .await
+        .map_err(memory_record_error)?;
+    Ok(Json(serde_json::json!({"deleted": deleted})))
+}
+
 const DISABLED_LIST_DEFAULT_LIMIT: i64 = 100;
 const DISABLED_LIST_MAX_LIMIT: i64 = 500;
 

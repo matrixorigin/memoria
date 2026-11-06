@@ -479,6 +479,7 @@ pub struct MemoryResponse {
     pub session_id: Option<String>,
     pub observed_at: Option<String>,
     pub created_at: Option<String>,
+    pub updated_at: Option<String>,
     pub retrieval_score: Option<f64>,
     /// 业务元数据（如 scene/agent）从 memories.extra_metadata 原样透传回给调用方；结构化 query
     /// 可做精确过滤，但不参与相关性检索或打分。
@@ -504,6 +505,7 @@ impl From<Memory> for MemoryResponse {
             session_id: m.session_id,
             observed_at: m.observed_at.map(|dt| dt.to_rfc3339()),
             created_at: m.created_at.map(|dt| dt.to_rfc3339()),
+            updated_at: m.updated_at.map(|dt| dt.to_rfc3339()),
             retrieval_score: m.retrieval_score,
             // 空 map 在响应里归一为 None（省略），与读取侧「"{}" → None」一致：新写记录直接
             // 返回内存对象时也不会出现「POST 带 {} 而后续 list/get 无该字段」的不一致。
