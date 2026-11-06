@@ -2384,6 +2384,8 @@ impl SqlMemoryStore {
         let schema_name = self.current_schema_name().await?;
         let schema_name = schema_name.as_ref();
         let mut conn = self.conn().await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS mem_confidence_policy (user_id VARCHAR(64) PRIMARY KEY, enabled BOOLEAN NOT NULL, half_life_days DOUBLE NOT NULL, inactive_threshold DOUBLE NOT NULL)")
+            .execute(&mut *conn).await.map_err(db_err)?;
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_user_registry (
                 user_id     VARCHAR(64)  PRIMARY KEY,
@@ -3639,6 +3641,132 @@ impl SqlMemoryStore {
         Ok(())
     }
 
+    fn confidence_policy_table(&self) -> String {
+        match &self.db_router {
+            Some(router) => format!("`{}`.mem_confidence_policy", router.shared_db_name()),
+            None => "mem_confidence_policy".into(),
+        }
+    }
+
+    pub async fn confidence_policy(
+        &self,
+        scope: &str,
+    ) -> Result<memoria_core::ConfidenceDecayPolicy, MemoriaError> {
+        let row = sqlx::query(&format!(
+            "SELECT enabled, half_life_days, inactive_threshold FROM {} WHERE user_id = ?",
+            self.confidence_policy_table()
+        ))
+        .bind(scope)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let policy = match row {
+            Some(row) => memoria_core::ConfidenceDecayPolicy {
+                enabled: row.try_get::<i8, _>("enabled").map_err(db_err)? != 0,
+                half_life_days: row.try_get("half_life_days").map_err(db_err)?,
+                inactive_threshold: row.try_get("inactive_threshold").map_err(db_err)?,
+            },
+            None => memoria_core::ConfidenceDecayPolicy::default(),
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub async fn set_confidence_policy(
+        &self,
+        scope: &str,
+        policy: &memoria_core::ConfidenceDecayPolicy,
+    ) -> Result<(), MemoriaError> {
+        policy.validate()?;
+        sqlx::query(&format!("INSERT INTO {} (user_id, enabled, half_life_days, inactive_threshold) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE enabled=VALUES(enabled), half_life_days=VALUES(half_life_days), inactive_threshold=VALUES(inactive_threshold)", self.confidence_policy_table()))
+            .bind(scope).bind(policy.enabled).bind(policy.half_life_days).bind(policy.inactive_threshold)
+            .execute(&self.pool).await.map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Scoped opt-in policies include groups, unlike the personal-user registry.
+    pub async fn apply_confidence_policies(&self) -> Result<u64, MemoriaError> {
+        // Do not provision a database for a deleted scope left in the policy table.
+        let scope_clause = if self.db_router.is_some() {
+            " AND (EXISTS (SELECT 1 FROM mem_user_registry u WHERE u.user_id = p.user_id AND u.status = 'active') OR EXISTS (SELECT 1 FROM mem_groups g WHERE g.group_id = p.user_id AND g.status = 'active'))"
+        } else {
+            ""
+        };
+        let scopes: Vec<(String,)> = sqlx::query_as(&format!(
+            "SELECT p.user_id FROM {} p WHERE p.enabled = 1{scope_clause} ORDER BY p.user_id",
+            self.confidence_policy_table()
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut total = 0;
+        for (scope,) in scopes {
+            let store = match &self.db_router {
+                Some(router) => router.scope_store(&scope).await?,
+                None => Arc::new(self.clone()),
+            };
+            loop {
+                let changed = store.apply_confidence_policy(&scope).await?;
+                total += changed;
+                if changed < 500 {
+                    break;
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// Only mark inactive. Never overwrite initial confidence or delete evidence.
+    /// The policy row lock serializes this operation with policy changes.
+    pub async fn apply_confidence_policy(&self, scope: &str) -> Result<u64, MemoriaError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let row = sqlx::query(&format!("SELECT enabled, half_life_days, inactive_threshold FROM {} WHERE user_id = ? FOR UPDATE", self.confidence_policy_table()))
+            .bind(scope).fetch_optional(&mut *tx).await.map_err(db_err)?;
+        let Some(row) = row else {
+            tx.commit().await.map_err(db_err)?;
+            return Ok(0);
+        };
+        let policy = memoria_core::ConfidenceDecayPolicy {
+            enabled: row.try_get::<i8, _>("enabled").map_err(db_err)? != 0,
+            half_life_days: row.try_get("half_life_days").map_err(db_err)?,
+            inactive_threshold: row.try_get("inactive_threshold").map_err(db_err)?,
+        };
+        policy.validate()?;
+        if !policy.enabled {
+            tx.commit().await.map_err(db_err)?;
+            return Ok(0);
+        }
+        let table = self.t("mem_memories");
+        let marker = memoria_core::CONFIDENCE_INACTIVE_FIELD;
+        let now = Utc::now().naive_utc();
+        let changed = sqlx::query(&format!(
+            "UPDATE {table} SET is_active = 0, extra_metadata = JSON_SET(COALESCE(extra_metadata, JSON_OBJECT()), '$.{marker}', true), updated_at = ? \
+             WHERE user_id = ? AND is_active = 1 AND observed_at IS NOT NULL \
+             AND (superseded_by IS NULL OR superseded_by = '') \
+             AND initial_confidence * EXP(-GREATEST(0, TIMESTAMPDIFF(SECOND, observed_at, ?)) * ? / ?) < ? LIMIT 500"
+        ))
+            .bind(now).bind(scope).bind(now).bind(std::f64::consts::LN_2)
+            .bind(policy.half_life_days * 86400.0).bind(policy.inactive_threshold)
+            .execute(&mut *tx).await.map_err(db_err)?.rows_affected();
+        tx.commit().await.map_err(db_err)?;
+        Ok(changed)
+    }
+
+    /// Governance view: expired confidence values, not operator-disabled rows.
+    pub async fn list_confidence_inactive(
+        &self,
+        scope: &str,
+        subject: &str,
+        after: &str,
+        limit: i64,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        let table = self.t("mem_memories");
+        let marker = memoria_core::CONFIDENCE_INACTIVE_FIELD;
+        let rows = sqlx::query(&format!("SELECT {FULLTEXT_MEMORY_COLUMNS} FROM {table} WHERE user_id = ? AND subject_id = ? AND is_active = 0 AND memory_id > ? AND (superseded_by IS NULL OR superseded_by = '') AND JSON_EXTRACT(extra_metadata, '$.{marker}') IS NOT NULL ORDER BY memory_id LIMIT ?"))
+            .bind(scope).bind(subject).bind(after).bind(limit).fetch_all(&self.pool).await.map_err(db_err)?;
+        rows.iter().map(row_to_memory).collect()
+    }
+
     /// Quarantine memories whose effective confidence has decayed below threshold.
     /// effective_confidence = initial_confidence * EXP(-age_days / half_life)
     pub async fn quarantine_low_confidence(&self, user_id: &str) -> Result<i64, MemoriaError> {
@@ -3686,6 +3814,7 @@ impl SqlMemoryStore {
                   AND (superseded_by IS NULL OR superseded_by = '') \
                   AND JSON_EXTRACT(extra_metadata, '$._memoria_disabled') IS NULL \
                   AND JSON_EXTRACT(extra_metadata, '$._memoria_erased') IS NULL \
+                  AND JSON_EXTRACT(extra_metadata, '$._memoria_confidence_inactive') IS NULL \
                   AND updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR) LIMIT 500"
             ))
             .bind(user_id)

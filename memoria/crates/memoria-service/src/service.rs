@@ -2660,6 +2660,29 @@ impl MemoryService {
         subject_id: Option<&str>,
         memory_id: &str,
     ) -> Result<(), MemoriaError> {
+        self.erase_governance_target(user_id, branch, subject_id, memory_id, false)
+            .await
+    }
+
+    /// Explicit cleanup of a confidence-expired main memory, never an active record.
+    pub async fn erase_confidence_inactive(
+        &self,
+        user_id: &str,
+        subject_id: &str,
+        memory_id: &str,
+    ) -> Result<(), MemoriaError> {
+        self.erase_governance_target(user_id, Some("main"), Some(subject_id), memory_id, true)
+            .await
+    }
+
+    async fn erase_governance_target(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        subject_id: Option<&str>,
+        memory_id: &str,
+        confidence_inactive_only: bool,
+    ) -> Result<(), MemoriaError> {
         if self.sql_store.is_none() {
             return Err(MemoriaError::Internal(
                 "memory governance requires a SQL-backed memory store".to_string(),
@@ -2669,6 +2692,16 @@ impl MemoryService {
         let table = sql.table_for_branch(user_id, branch).await?;
         let memory =
             Self::owned_governance_target(&sql, &table, user_id, subject_id, memory_id).await?;
+        if confidence_inactive_only
+            && (memory.is_active
+                || !memory.extra_metadata.as_ref().is_some_and(|metadata| {
+                    metadata.contains_key(memoria_core::CONFIDENCE_INACTIVE_FIELD)
+                }))
+        {
+            return Err(MemoriaError::Conflict(
+                "memory is not confidence-inactive".into(),
+            ));
+        }
         if memory
             .superseded_by
             .as_deref()

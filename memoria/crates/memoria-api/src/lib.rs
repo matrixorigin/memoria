@@ -147,7 +147,8 @@ fn should_mark_metrics_dirty(
                 } else if path.starts_with("/v1/memories/")
                     && (path.ends_with("/disable")
                         || path.ends_with("/restore")
-                        || path.ends_with("/erase"))
+                        || path.ends_with("/erase")
+                        || path.ends_with("/cleanup-confidence"))
                 {
                     Some(DirtyMask::MEMORY)
                 } else if path.starts_with("/v1/snapshots/") && path.ends_with("/rollback")
@@ -233,6 +234,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::memory::restore_memory),
         )
         .route("/v1/memories/:id/erase", post(routes::memory::erase_memory))
+        .route(
+            "/v1/memories/:id/cleanup-confidence",
+            post(routes::memory::cleanup_confidence_inactive),
+        )
         .route("/v1/observe", post(routes::memory::observe_turn))
         .route(
             "/v1/observe/deduplicated",
@@ -319,6 +324,15 @@ pub fn build_router(state: AppState) -> Router {
         )
         // Governance
         .route("/v1/governance", post(routes::governance::governance))
+        .route(
+            "/v1/governance/confidence-policy",
+            get(routes::governance::get_confidence_policy)
+                .put(routes::governance::set_confidence_policy),
+        )
+        .route(
+            "/v1/memories/confidence-inactive",
+            get(routes::governance::list_confidence_inactive),
+        )
         .route("/v1/consolidate", post(routes::governance::consolidate))
         .route("/v1/reflect", post(routes::governance::reflect))
         .route(

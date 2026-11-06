@@ -884,6 +884,31 @@ pub async fn erase_memory(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub async fn cleanup_confidence_inactive(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    Json(req): Json<MemoryLifecycleRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let subject = governance_subject(req.subject_id.as_deref())?.ok_or((
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "subject_id is required".into(),
+    ))?;
+    if req.branch.as_deref().is_some_and(|branch| branch != "main") {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "confidence lifecycle applies to main".into(),
+        ));
+    }
+    governance_branch(&state, &auth, Some("main")).await?;
+    state
+        .service
+        .erase_confidence_inactive(auth.scope_id(), subject, &id)
+        .await
+        .map_err(api_err_typed)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn list_disabled_memories(
     State(state): State<AppState>,
     auth: AuthUser,

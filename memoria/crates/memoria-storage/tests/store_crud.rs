@@ -1157,3 +1157,176 @@ async fn test_topic_purge_fallback_exceeds_500_matches() {
     assert!(store.get(&other_id).await.unwrap().is_some());
     assert!(store.get(&inactive_id).await.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn confidence_lifecycle_is_scoped_opt_in_and_never_auto_erases() {
+    use memoria_core::{ConfidenceDecayPolicy, CONFIDENCE_INACTIVE_FIELD};
+    let (store, uid) = setup().await;
+    assert_eq!(
+        store.confidence_policy(&uid).await.unwrap(),
+        ConfidenceDecayPolicy::default()
+    );
+    let mut expired: Vec<_> = (0..502)
+        .map(|i| {
+            let mut m = make_memory(&format!("decay-{i:03}-{uid}"), "evidence retained", &uid);
+            m.embedding = None;
+            m.subject_id = Some("consumer".into());
+            m.observed_at = Some(Utc::now() - chrono::Duration::days(60));
+            m.extra_metadata = Some(std::collections::HashMap::from([(
+                "label".into(),
+                serde_json::json!("keep"),
+            )]));
+            m
+        })
+        .collect();
+    let mut fresh = expired[0].clone();
+    fresh.memory_id = format!("fresh-{uid}");
+    fresh.observed_at = Some(Utc::now() - chrono::Duration::days(30));
+    let mut unknown = fresh.clone();
+    unknown.memory_id = format!("unknown-{uid}");
+    unknown.observed_at = None;
+    let mut future = fresh.clone();
+    future.memory_id = format!("future-{uid}");
+    future.observed_at = Some(Utc::now() + chrono::Duration::days(30));
+    let mut other = expired[0].clone();
+    other.memory_id = format!("other-{uid}");
+    other.user_id = format!("other_{uid}");
+    expired.extend([
+        fresh.clone(),
+        unknown.clone(),
+        future.clone(),
+        other.clone(),
+    ]);
+    store
+        .batch_insert_into("mem_memories", &expired.iter().collect::<Vec<_>>())
+        .await
+        .unwrap();
+    assert_eq!(store.apply_confidence_policy(&uid).await.unwrap(), 0);
+    let policy = ConfidenceDecayPolicy {
+        enabled: true,
+        ..Default::default()
+    };
+    store.set_confidence_policy(&uid, &policy).await.unwrap();
+    assert_eq!(store.confidence_policy(&uid).await.unwrap(), policy);
+    // The worker drains multiple bounded batches, not just the first 500.
+    assert_eq!(store.apply_confidence_policies().await.unwrap(), 502);
+    assert_eq!(store.apply_confidence_policy(&uid).await.unwrap(), 0);
+    for control in [&fresh, &unknown, &future, &other] {
+        assert!(store.get(&control.memory_id).await.unwrap().is_some());
+    }
+    assert!(store.get(&expired[0].memory_id).await.unwrap().is_none());
+    assert!(store
+        .get_by_ids(&[expired[0].memory_id.clone()])
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .list_confidence_inactive(&uid, "another-consumer", "", 10)
+        .await
+        .unwrap()
+        .is_empty());
+    let first = store
+        .list_confidence_inactive(&uid, "consumer", "", 1)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    let m = &first[0];
+    assert!(!m.is_active);
+    // The persisted column is FLOAT; lifecycle must preserve that original value.
+    assert_eq!(m.initial_confidence, 0.8_f32 as f64);
+    assert_eq!(m.content, "evidence retained");
+    assert_eq!(m.source_event_ids, vec!["evt-1"]);
+    let metadata = m.extra_metadata.as_ref().unwrap();
+    assert!(metadata.contains_key(CONFIDENCE_INACTIVE_FIELD));
+    assert_eq!(metadata["label"], "keep");
+    assert!(store
+        .list_disabled_from("mem_memories", &uid, Some("consumer"), 10, None)
+        .await
+        .unwrap()
+        .is_empty());
+    let next = store
+        .list_confidence_inactive(&uid, "consumer", &m.memory_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(next.len(), 10);
+    assert!(next.iter().all(|next| next.memory_id > m.memory_id));
+    // Even explicit legacy cleanup must not remove confidence-inactive evidence.
+    sqlx::query("UPDATE mem_memories SET updated_at = DATE_SUB(NOW(), INTERVAL 48 HOUR) WHERE user_id = ? AND is_active = 0")
+        .bind(&uid).execute(store.pool()).await.unwrap();
+    store.cleanup_stale(&uid).await.unwrap();
+    assert_eq!(
+        store
+            .list_confidence_inactive(&uid, "consumer", "", 600)
+            .await
+            .unwrap()
+            .len(),
+        502
+    );
+    store
+        .set_confidence_policy(&uid, &ConfidenceDecayPolicy::default())
+        .await
+        .unwrap();
+    assert_eq!(store.apply_confidence_policy(&uid).await.unwrap(), 0);
+    assert!(
+        store.get(&expired[0].memory_id).await.unwrap().is_none(),
+        "disabling the policy must not auto-restore"
+    );
+}
+
+#[tokio::test]
+async fn confidence_lifecycle_routes_group_data_and_skips_deleted_scopes() {
+    use memoria_core::ConfidenceDecayPolicy;
+    use std::sync::Arc;
+    let (mut shared, uid) = setup().await;
+    let url = std::env::var("DATABASE_URL").expect("explicit isolated test database");
+    let router = Arc::new(
+        memoria_storage::DbRouter::connect(&url, test_dim(), Uuid::new_v4().to_string())
+            .await
+            .unwrap(),
+    );
+    shared.set_db_router(router.clone());
+    let group = format!("grp_{uid}");
+    let group_db = format!("confidence_group_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE `{group_db}`"))
+        .execute(shared.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO mem_groups (group_id, group_name, db_name, owner_user_id, status, created_at, updated_at) VALUES (?, 'test', ?, 'owner', 'active', NOW(), NOW())")
+        .bind(&group).bind(&group_db).execute(shared.pool()).await.unwrap();
+    let routed = router.group_store(&group).await.unwrap();
+    let mut m = make_memory(&format!("group-{uid}"), "group evidence", &group);
+    m.embedding = None;
+    m.subject_id = Some("consumer".into());
+    m.observed_at = Some(Utc::now() - chrono::Duration::days(60));
+    routed.insert(&m).await.unwrap();
+    let policy = ConfidenceDecayPolicy {
+        enabled: true,
+        ..Default::default()
+    };
+    shared.set_confidence_policy(&group, &policy).await.unwrap();
+    // A stale policy must not cause provisioning or halt live scopes.
+    shared
+        .set_confidence_policy("grp_missing", &policy)
+        .await
+        .unwrap();
+    assert_eq!(shared.apply_confidence_policies().await.unwrap(), 1);
+    assert!(routed.get(&m.memory_id).await.unwrap().is_none());
+    assert_eq!(
+        routed
+            .list_confidence_inactive(&group, "consumer", "", 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    sqlx::query("UPDATE mem_groups SET status = 'deleted' WHERE group_id = ?")
+        .bind(&group)
+        .execute(shared.pool())
+        .await
+        .unwrap();
+    assert_eq!(shared.apply_confidence_policies().await.unwrap(), 0);
+    sqlx::query(&format!("DROP DATABASE `{group_db}`"))
+        .execute(shared.pool())
+        .await
+        .unwrap();
+}

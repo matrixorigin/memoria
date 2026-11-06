@@ -368,6 +368,12 @@ impl GovernanceScheduler {
 
     /// Spawn background tasks. Returns immediately; tasks run in background.
     pub fn start(self: Arc<Self>) {
+        // Per-scope confidence policies are explicitly opted in, independently
+        // of the destructive native governance flag. Use this same scheduler.
+        if self.sql_store.is_some() {
+            let s = self.clone();
+            tokio::spawn(async move { s.run_loop(GovernanceTask::Hourly, 3600).await });
+        }
         if !self.enabled {
             info!("Governance scheduler disabled (set MEMORIA_GOVERNANCE_ENABLED=true to enable)");
             return;
@@ -379,8 +385,10 @@ impl GovernanceScheduler {
             "Governance scheduler starting"
         );
 
-        let s = self.clone();
-        tokio::spawn(async move { s.run_loop(GovernanceTask::Hourly, 3600).await });
+        if self.sql_store.is_none() {
+            let s = self.clone();
+            tokio::spawn(async move { s.run_loop(GovernanceTask::Hourly, 3600).await });
+        }
 
         let s = self.clone();
         tokio::spawn(async move { s.run_loop(GovernanceTask::Daily, 86400).await });
@@ -449,6 +457,14 @@ impl GovernanceScheduler {
         &self,
         task: GovernanceTask,
     ) -> Result<GovernanceExecution, crate::MemoriaError> {
+        if matches!(task, GovernanceTask::Hourly) {
+            if let Some(sql) = &self.sql_store {
+                sql.apply_confidence_policies().await?;
+            }
+        }
+        if !self.enabled {
+            return Ok(GovernanceExecution::default());
+        }
         let Some(store) = &self.store else {
             return Ok(GovernanceExecution::default());
         };
@@ -1065,7 +1081,10 @@ mod tests {
             Ok(None)
         }
 
-        async fn get_including_inactive(&self, _: &str) -> Result<Option<Memory>, crate::MemoriaError> {
+        async fn get_including_inactive(
+            &self,
+            _: &str,
+        ) -> Result<Option<Memory>, crate::MemoriaError> {
             Ok(None)
         }
 

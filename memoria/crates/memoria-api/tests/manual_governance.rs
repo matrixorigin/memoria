@@ -1,6 +1,7 @@
 //! Real MatrixOne coverage for operator-controlled memory lifecycle.
 mod support;
 
+use memoria_core::interfaces::MemoryStore;
 use reqwest::{Method, RequestBuilder};
 use serde_json::{json, Value};
 use support::multi_db::ApiTestServer;
@@ -41,6 +42,131 @@ async fn store(server: &ApiTestServer, owner: &str, key: &str) -> String {
         .as_str()
         .unwrap()
         .into()
+}
+
+#[tokio::test]
+async fn confidence_lifecycle_api_preserves_scope_and_guards_cleanup() {
+    let server = server().await;
+    let owner = format!("confidence_{}", uuid::Uuid::new_v4().simple());
+    let other = format!("other_{}", uuid::Uuid::new_v4().simple());
+    let path = "/v1/governance/confidence-policy";
+    let defaults: Value = request(&server, &owner, Method::GET, path)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        defaults,
+        json!({"enabled": false, "half_life_days": 30.0, "inactive_threshold": 0.3})
+    );
+    let invalid = request(&server, &owner, Method::PUT, path)
+        .json(&json!({"enabled":true,"half_life_days":0,"inactive_threshold":0.3}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), 422);
+    let id = store(&server, &owner, "confidence-expired").await;
+    let active = store(&server, &owner, "confidence-active").await;
+    let cleanup = format!("/v1/memories/{id}/cleanup-confidence");
+    assert_eq!(
+        request(&server, &owner, Method::POST, &cleanup)
+            .json(&json!({"subject_id":"subject-a","branch":"main"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        409
+    );
+    let sql = server.user_store(&owner).await;
+    sqlx::query(&format!(
+        "UPDATE {} SET observed_at = DATE_SUB(NOW(), INTERVAL 90 DAY) WHERE memory_id = ?",
+        sql.t("mem_memories")
+    ))
+    .bind(&id)
+    .execute(sql.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        request(&server, &owner, Method::PUT, path)
+            .json(&json!({"enabled":true,"half_life_days":30,"inactive_threshold":0.3}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        server
+            .shared_store()
+            .apply_confidence_policies()
+            .await
+            .unwrap(),
+        1
+    );
+    let other_policy: Value = request(&server, &other, Method::GET, path)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(other_policy["enabled"], false);
+    // Existing GET contract is 200/null for a record outside the active view.
+    let hidden = request(
+        &server,
+        &owner,
+        Method::GET,
+        &format!("/v1/memories/{id}?branch=main"),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(hidden.status(), 200);
+    assert_eq!(hidden.json::<Value>().await.unwrap(), Value::Null);
+    let visible: Value = request(
+        &server,
+        &owner,
+        Method::GET,
+        &format!("/v1/memories/{active}?branch=main"),
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(visible["memory_id"], active);
+    let page: Value = request(
+        &server,
+        &owner,
+        Method::GET,
+        "/v1/memories/confidence-inactive?subject_id=subject-a&limit=1",
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    assert_eq!(page["items"][0]["memory_id"], id);
+    assert!(page["items"][0]["extra_metadata"]
+        .get("_memoria_confidence_inactive")
+        .is_none());
+    for (subject, status) in [("other", 404), ("subject-a", 204), ("subject-a", 404)] {
+        assert_eq!(
+            request(&server, &owner, Method::POST, &cleanup)
+                .json(&json!({"subject_id":subject,"branch":"main"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            status
+        );
+    }
+    assert!(sql.get(&active).await.unwrap().is_some());
 }
 
 #[tokio::test]
