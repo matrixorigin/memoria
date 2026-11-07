@@ -590,6 +590,7 @@ mod tests {
         for number in [
             "٤١١١ ١١١١ ١١١١ ١١١١", // Arabic-Indic
             "४१११ ११११ ११११ ११११", // Devanagari
+            "4111 ١١١١ 1111 1111", // Mixed ASCII and Arabic-Indic (review reproduction)
             "٤111 1١11 ١1١1 111١", // Mixed ASCII and Arabic-Indic
         ] {
             let result = check_sensitivity(&format!("card {number} on file"));
