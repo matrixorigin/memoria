@@ -3,8 +3,24 @@
 Official Python SDK for the [Memoria](https://github.com/matrixorigin/Memoria) memory engine.
 
 ## Installation
+**From source (primary path today):**
 
-**v1 — GitHub Release wheel:**
+```bash
+pip install ./sdk/python
+```
+
+**From source (development, editable with dev tools):**
+
+```bash
+pip install -e "./sdk/python[dev]"
+```
+
+The package version is declared in `sdk/python/pyproject.toml` (currently `0.0.1`).
+Wheels published under the `python-sdk-v*` release tags are versioned by the release
+workflow rather than by `pyproject.toml`, so a released wheel can report a different
+version (`1.0.0`) than a source build from the same revision (#415).
+
+**GitHub Release wheel** — requires the `python-sdk-v1.0.0` release asset to exist:
 
 ```bash
 pip install https://github.com/matrixorigin/Memoria/releases/download/python-sdk-v1.0.0/memoria_client-1.0.0-py3-none-any.whl
@@ -13,13 +29,8 @@ pip install https://github.com/matrixorigin/Memoria/releases/download/python-sdk
 **Offline / air-gapped:**
 
 ```bash
+# Build the wheel on a connected host, copy it over, then:
 pip install ./memoria_client-1.0.0-py3-none-any.whl
-```
-
-**From source (development):**
-
-```bash
-pip install -e ".[dev]"
 ```
 
 ## Quick Start
