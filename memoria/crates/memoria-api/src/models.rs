@@ -360,6 +360,10 @@ pub struct IdempotentCorrectRequest {
     pub subject_id: String,
     pub branch: String,
     pub idempotency_key: String,
+    /// Removes structured_content from the new version inside this correction.
+    /// Absent means false so an existing text correction keeps its payload hash.
+    #[serde(default)]
+    pub omit_structured_content: bool,
 }
 
 #[derive(Deserialize)]
@@ -866,5 +870,37 @@ mod tests {
         };
 
         assert!(matches!(request.selector().unwrap(), PurgeSelector::None));
+    }
+
+    #[test]
+    fn idempotent_correction_omission_is_optional_and_not_a_metadata_editor() {
+        let plain: super::IdempotentCorrectRequest = serde_json::from_value(serde_json::json!({
+            "new_content": "text",
+            "subject_id": "consumer",
+            "branch": "main",
+            "idempotency_key": "key",
+        }))
+        .unwrap();
+        assert!(!plain.omit_structured_content);
+        let confirmed: super::IdempotentCorrectRequest =
+            serde_json::from_value(serde_json::json!({
+                "new_content": "text",
+                "subject_id": "consumer",
+                "branch": "main",
+                "idempotency_key": "key",
+                "omit_structured_content": true,
+            }))
+            .unwrap();
+        assert!(confirmed.omit_structured_content);
+        assert!(
+            serde_json::from_value::<super::IdempotentCorrectRequest>(serde_json::json!({
+                "new_content": "text",
+                "subject_id": "consumer",
+                "branch": "main",
+                "idempotency_key": "key",
+                "extra_metadata": {"structured_content": null},
+            }))
+            .is_err()
+        );
     }
 }

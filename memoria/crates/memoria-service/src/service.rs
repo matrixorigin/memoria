@@ -2277,7 +2277,7 @@ impl MemoryService {
         memory_id: &str,
         new_content: &str,
     ) -> Result<Memory, MemoriaError> {
-        self.correct_inner(user_id, branch, memory_id, new_content, None, None)
+        self.correct_inner(user_id, branch, memory_id, new_content, None, None, false)
             .await
     }
 
@@ -2292,6 +2292,7 @@ impl MemoryService {
         subject_id: &str,
         new_content: &str,
         key: &str,
+        omit_structured_content: bool,
     ) -> Result<Memory, MemoriaError> {
         if branch.trim().is_empty()
             || branch.trim() != branch
@@ -2312,6 +2313,7 @@ impl MemoryService {
             new_content,
             Some(subject_id),
             Some(key),
+            omit_structured_content,
         )
         .await
     }
@@ -2324,6 +2326,7 @@ impl MemoryService {
         new_content: &str,
         subject_id: Option<&str>,
         key: Option<&str>,
+        omit_structured_content: bool,
     ) -> Result<Memory, MemoriaError> {
         let requested_content = new_content;
         if new_content.trim().is_empty() {
@@ -2360,6 +2363,7 @@ impl MemoryService {
                         subject_id.expect("receipt requires subject"),
                         requested_content,
                         key,
+                        omit_structured_content,
                     )
                 })
                 .transpose()?;
@@ -2400,6 +2404,7 @@ impl MemoryService {
                     .get_or_insert_with(HashMap::new)
                     .insert(STORE_REQUEST_HASH_FIELD.into(), serde_json::json!(hash));
             }
+            let metadata = without_structured_content(metadata, omit_structured_content);
             let new_mem = Memory {
                 memory_id: new_id,
                 user_id: old.user_id.clone(),
@@ -2485,7 +2490,10 @@ impl MemoryService {
                 embedding: self.embed(new_content).await?,
                 session_id: old.session_id.clone(),
                 source_event_ids: vec![format!("correct:{}", memory_id)],
-                extra_metadata: correction_metadata(&old),
+                extra_metadata: without_structured_content(
+                    correction_metadata(&old),
+                    omit_structured_content,
+                ),
                 observed_at: Some(Utc::now()),
                 created_at: Some(Utc::now()),
                 updated_at: None,
@@ -4166,6 +4174,21 @@ fn correction_metadata(memory: &Memory) -> Option<HashMap<String, serde_json::Va
     })
 }
 
+/// Drops only the business JSON copy. Identity, source and type stay on the
+/// same metadata map that the atomic replacement writes.
+fn without_structured_content(
+    metadata: Option<HashMap<String, serde_json::Value>>,
+    omit: bool,
+) -> Option<HashMap<String, serde_json::Value>> {
+    if !omit {
+        return metadata;
+    }
+    metadata.map(|mut metadata| {
+        metadata.remove("structured_content");
+        metadata
+    })
+}
+
 fn reject_reserved_metadata(
     metadata: Option<&HashMap<String, serde_json::Value>>,
 ) -> Result<(), MemoriaError> {
@@ -4229,6 +4252,7 @@ fn correction_receipt(
     subject: &str,
     content: &str,
     key: &str,
+    omit_structured_content: bool,
 ) -> Result<(String, String), MemoriaError> {
     // Validate the same public key alphabet without sharing the store's identity
     // namespace. IDs remain canonical 32-character hex, including for cursors.
@@ -4238,7 +4262,13 @@ fn correction_receipt(
     let digest = Sha256::digest(serde_json::to_vec(&identity)?);
     let mut receipt = [0_u8; 16];
     receipt.copy_from_slice(&digest[..16]);
-    let payload = serde_json::json!([original, subject, content]);
+    // A false flag is absent from the hash so receipts written before this
+    // field still replay. A true flag is part of the payload.
+    let payload = if omit_structured_content {
+        serde_json::json!([original, subject, content, "omit_structured_content"])
+    } else {
+        serde_json::json!([original, subject, content])
+    };
     Ok((
         format!("{:032x}", u128::from_be_bytes(receipt)),
         format!("{:x}", Sha256::digest(serde_json::to_vec(&payload)?)),
@@ -4266,5 +4296,59 @@ mod idempotency_tests {
             assert!(idempotent_memory_id("owner-a", None, key).is_err());
         }
         assert!(idempotent_memory_id("owner-a", None, &"x".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn text_correction_hash_stays_stable_until_structured_content_is_omitted() {
+        let plain = super::correction_receipt(
+            "owner", "main", "original", "subject", "content", "key", false,
+        )
+        .unwrap();
+        let replay = super::correction_receipt(
+            "owner", "main", "original", "subject", "content", "key", false,
+        )
+        .unwrap();
+        assert_eq!(plain, replay);
+        let omitted = super::correction_receipt(
+            "owner", "main", "original", "subject", "content", "key", true,
+        )
+        .unwrap();
+        assert_eq!(plain.0, omitted.0);
+        assert_ne!(plain.1, omitted.1);
+        let changed =
+            super::correction_receipt("owner", "main", "original", "subject", "other", "key", true)
+                .unwrap();
+        assert_eq!(omitted.0, changed.0);
+        assert_ne!(omitted.1, changed.1);
+    }
+
+    #[test]
+    fn omission_removes_only_the_structured_copy() {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "structured_content".into(),
+            serde_json::json!({"subject": "A"}),
+        );
+        metadata.insert(
+            "business_memory_type".into(),
+            serde_json::json!("factual_memory"),
+        );
+        metadata.insert("source_session_id".into(), serde_json::json!("session-1"));
+        let kept = super::without_structured_content(Some(metadata.clone()), false).unwrap();
+        assert!(kept.contains_key("structured_content"));
+        let revised = super::without_structured_content(Some(metadata), true).unwrap();
+        assert!(!revised.contains_key("structured_content"));
+        assert_eq!(
+            revised
+                .get("business_memory_type")
+                .and_then(|value| value.as_str()),
+            Some("factual_memory")
+        );
+        assert_eq!(
+            revised
+                .get("source_session_id")
+                .and_then(|value| value.as_str()),
+            Some("session-1")
+        );
     }
 }

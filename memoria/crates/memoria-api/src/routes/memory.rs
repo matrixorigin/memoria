@@ -614,6 +614,7 @@ pub async fn correct_memory_idempotent(
             &request.subject_id,
             &request.new_content,
             &request.idempotency_key,
+            request.omit_structured_content,
         )
         .await
         .map_err(memory_record_error)?;
