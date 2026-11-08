@@ -1,0 +1,35 @@
+name: Fork Pre-PR Check
+
+# 在 fork 仓库推送 feat/* 分支时自动运行，
+# 提 PR 到上游前提前发现 clippy / 编译问题。
+on:
+  push:
+    branches:
+      - "feat/**"
+      - "fix/**"
+      - "chore/**"
+
+env:
+  CARGO_TERM_COLOR: always
+  SQLX_OFFLINE: "true"
+  # 无需真实 DB / Embedding key，仅做静态检查
+  DATABASE_URL: mysql://root:111@localhost:6001/memoria_test
+
+jobs:
+  check-and-clippy:
+    name: Check & Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: memoria
+          shared-key: fork-pre-pr
+
+      - name: Check & Clippy
+        run: cd memoria && cargo check && cargo clippy -- -D warnings
