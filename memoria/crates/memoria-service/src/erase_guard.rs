@@ -134,22 +134,21 @@ impl<L: EraseLock> Clone for GateState<L> {
 }
 
 impl<L: EraseLock> EraseStatementHold for GateState<L> {
-    fn run_step(
+    fn run_step<F>(
         &self,
-        action: std::pin::Pin<
-            Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'static>,
-        >,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'static>>
+        action: F,
+    ) -> impl Future<Output = Result<u64, MemoriaError>> + Send
+    where
+        F: Future<Output = Result<u64, MemoriaError>> + Send + 'static,
     {
-        // Box the async fn, not an async block. Rust 1.88 cannot coerce a
-        // pinned async block to this trait object (rust-lang/rust#100013).
-        Box::pin(locked_step(self.clone(), action))
+        let gate = self.clone();
+        async move { locked_step(gate, action).await }
     }
 }
 
 async fn locked_step<L: EraseLock>(
     gate: GateState<L>,
-    action: std::pin::Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'static>>,
+    action: impl Future<Output = Result<u64, MemoriaError>> + Send + 'static,
 ) -> Result<u64, MemoriaError> {
     if gate.stop_steps.load(Ordering::Relaxed) || gate.lost.load(Ordering::Relaxed) {
         gate.lost.store(true, Ordering::Relaxed);
@@ -727,7 +726,7 @@ mod tests {
         let release_statement = Arc::new(tokio::sync::Notify::new());
         let started_flag = Arc::clone(&started);
         let release = Arc::clone(&release_statement);
-        let steps = EraseStepGate::new(Arc::new(gate.clone()) as Arc<dyn EraseStatementHold>);
+        let steps = EraseStepGate::new(gate.clone());
         let statement = memoria_storage::run_gated_erase_step(&steps, async move {
             started_flag.store(true, Ordering::SeqCst);
             release.notified().await;
