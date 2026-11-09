@@ -18,7 +18,9 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use memoria_core::MemoriaError;
-use memoria_storage::{EraseStatementHold, MemoryEraseReport, SqlMemoryStore};
+use memoria_storage::{
+    EraseStatementHold, EraseStepGate, MemoryEraseReport, SqlMemoryStore,
+};
 use tokio::task::JoinHandle;
 
 const LOCK_TTL: Duration = Duration::from_secs(30);
@@ -138,7 +140,25 @@ impl<L: EraseLock> EraseStatementHold for GateState<L> {
             Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'a>,
         >,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'a>> {
-        Box::pin(self.run_statement(action))
+        // An async block, not `Box::pin(self.run_statement(...))`. Rust 1.88
+        // cannot coerce that async-fn future to a trait object with lifetime `'a`.
+        Box::pin(async move {
+            if self.stop_steps.load(Ordering::Relaxed) || self.lost.load(Ordering::Relaxed) {
+                self.lost.store(true, Ordering::Relaxed);
+                return Err(lock_lost_error());
+            }
+            match self
+                .backend
+                .run_exclusive(&self.key, &self.holder, self.ttl, action)
+                .await
+            {
+                Err(error) if error.to_string().contains("lost its lock") => {
+                    self.lost.store(true, Ordering::Relaxed);
+                    Err(error)
+                }
+                other => other,
+            }
+        })
     }
 }
 
@@ -168,28 +188,6 @@ impl<L: EraseLock> GateState<L> {
                 self.lost.store(true, Ordering::Relaxed);
                 Err(lock_lost_error())
             }
-        }
-    }
-
-    /// Run one destructive statement without letting the lease expire under it.
-    pub async fn run_statement(
-        &self,
-        action: impl Future<Output = Result<u64, MemoriaError>> + Send,
-    ) -> Result<u64, MemoriaError> {
-        if self.stop_steps.load(Ordering::Relaxed) || self.lost.load(Ordering::Relaxed) {
-            self.lost.store(true, Ordering::Relaxed);
-            return Err(lock_lost_error());
-        }
-        match self
-            .backend
-            .run_exclusive(&self.key, &self.holder, self.ttl, action)
-            .await
-        {
-            Err(error) if error.to_string().contains("lost its lock") => {
-                self.lost.store(true, Ordering::Relaxed);
-                Err(error)
-            }
-            other => other,
         }
     }
 
@@ -723,7 +721,8 @@ mod tests {
         let release_statement = Arc::new(tokio::sync::Notify::new());
         let started_flag = Arc::clone(&started);
         let release = Arc::clone(&release_statement);
-        let statement = gate.run_statement(async move {
+        let steps = EraseStepGate::new(Arc::new(gate.clone()) as Arc<dyn EraseStatementHold>);
+        let statement = memoria_storage::run_gated_erase_step(&steps, async move {
             started_flag.store(true, Ordering::SeqCst);
             release.notified().await;
             Ok(1)
@@ -765,12 +764,11 @@ mod tests {
         assert_eq!(deleted, 1);
         let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = Arc::clone(&polled);
-        let next = gate
-            .run_statement(async move {
-                flag.store(true, Ordering::SeqCst);
-                Ok(2)
-            })
-            .await;
+        let next = memoria_storage::run_gated_erase_step(&steps, async move {
+            flag.store(true, Ordering::SeqCst);
+            Ok(2)
+        })
+        .await;
         assert!(next.expect_err("next step").to_string().contains("lock"));
         assert!(!polled.load(Ordering::SeqCst));
         gate.finish().await.expect("release");
