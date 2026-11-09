@@ -1,6 +1,7 @@
 pub mod config;
 pub mod content_filter;
 pub mod distributed;
+pub mod erase_guard;
 pub mod governance;
 pub mod graph_domains;
 pub mod pipeline;
