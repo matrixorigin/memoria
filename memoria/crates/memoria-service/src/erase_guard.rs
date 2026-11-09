@@ -138,24 +138,30 @@ impl<L: EraseLock> EraseStatementHold for GateState<L> {
         &self,
         action: std::pin::Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send>>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send>> {
-        let gate = self.clone();
-        Box::pin(async move {
-            if gate.stop_steps.load(Ordering::Relaxed) || gate.lost.load(Ordering::Relaxed) {
-                gate.lost.store(true, Ordering::Relaxed);
-                return Err(lock_lost_error());
-            }
-            match gate
-                .backend
-                .run_exclusive(&gate.key, &gate.holder, gate.ttl, action)
-                .await
-            {
-                Err(error) if error.to_string().contains("lost its lock") => {
-                    gate.lost.store(true, Ordering::Relaxed);
-                    Err(error)
-                }
-                other => other,
-            }
-        })
+        // Box the async fn, not an async block. Rust 1.88 cannot coerce a
+        // pinned async block to this trait object (rust-lang/rust#100013).
+        Box::pin(locked_step(self.clone(), action))
+    }
+}
+
+async fn locked_step<L: EraseLock>(
+    gate: GateState<L>,
+    action: std::pin::Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send>>,
+) -> Result<u64, MemoriaError> {
+    if gate.stop_steps.load(Ordering::Relaxed) || gate.lost.load(Ordering::Relaxed) {
+        gate.lost.store(true, Ordering::Relaxed);
+        return Err(lock_lost_error());
+    }
+    match gate
+        .backend
+        .run_exclusive(&gate.key, &gate.holder, gate.ttl, action)
+        .await
+    {
+        Err(error) if error.to_string().contains("lost its lock") => {
+            gate.lost.store(true, Ordering::Relaxed);
+            Err(error)
+        }
+        other => other,
     }
 }
 
