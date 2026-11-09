@@ -141,8 +141,7 @@ impl<L: EraseLock> EraseStatementHold for GateState<L> {
     where
         F: Future<Output = Result<u64, MemoriaError>> + Send + 'static,
     {
-        let gate = self.clone();
-        async move { locked_step(gate, action).await }
+        locked_step(self.clone(), action)
     }
 }
 
