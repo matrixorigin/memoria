@@ -1022,8 +1022,8 @@ pub struct MemoryEraseSelector {
     pub connector_id: Option<String>,
 }
 
-/// Counts of physically removed rows. `snapshots_retained` is true when a
-/// narrower erase cannot remove database snapshots that may still hold the rows.
+/// Counts of physically removed rows. `snapshots_retained` is true when this
+/// erase cannot prove those rows are gone from database or account snapshots.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MemoryEraseReport {
     pub memories: u64,
@@ -1084,6 +1084,103 @@ fn memory_erase_predicate(
         }
     }
     Ok((predicate, binds))
+}
+
+fn group_snapshots_retained(database_named: bool, account_snapshots_remain: bool) -> bool {
+    !database_named && account_snapshots_remain
+}
+
+fn unreferenced_entity_delete_sql(entities: &str, links: &str) -> String {
+    format!(
+        "DELETE FROM {entities} WHERE user_id = ? AND entity_id NOT IN (\
+         SELECT entity_id FROM {links} WHERE user_id = ?)"
+    )
+}
+
+fn subject_graph_edge_delete_sql(edges: &str, nodes: &str, source: &str, predicate: &str) -> String {
+    format!(
+        "DELETE FROM {edges} WHERE user_id = ? AND (source_id IN (\
+         SELECT node_id FROM {nodes} WHERE memory_id IN (\
+         SELECT memory_id FROM {source} WHERE {predicate})) OR target_id IN (\
+         SELECT node_id FROM {nodes} WHERE memory_id IN (\
+         SELECT memory_id FROM {source} WHERE {predicate})))"
+    )
+}
+
+fn subject_graph_edge_binds(binds: &[String]) -> Vec<String> {
+    let mut edge_binds = Vec::with_capacity(1 + binds.len() * 2);
+    if let Some(user_id) = binds.first() {
+        edge_binds.push(user_id.clone());
+    }
+    edge_binds.extend(binds.iter().cloned());
+    edge_binds.extend(binds.iter().cloned());
+    edge_binds
+}
+
+#[cfg(test)]
+mod erase_scope_tests {
+    use super::{
+        group_snapshots_retained, memory_erase_predicate, subject_graph_edge_binds,
+        subject_graph_edge_delete_sql, unreferenced_entity_delete_sql, MemoryEraseSelector,
+    };
+
+    #[test]
+    fn subject_edge_delete_removes_incoming_and_outgoing() {
+        let predicate = "user_id = ? AND subject_id = ?";
+        let sql = subject_graph_edge_delete_sql("edges", "nodes", "memories", predicate);
+        assert!(sql.contains("source_id IN"));
+        assert!(sql.contains("OR target_id IN"));
+        let binds = subject_graph_edge_binds(&["user".into(), "subject-a".into()]);
+        assert_eq!(sql.matches('?').count(), binds.len());
+        assert_eq!(
+            binds,
+            vec![
+                "user".to_string(),
+                "user".to_string(),
+                "subject-a".to_string(),
+                "user".to_string(),
+                "subject-a".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn connector_edge_delete_filters_both_endpoints() {
+        let selector = MemoryEraseSelector {
+            subject_id: Some("subject-a".into()),
+            connector_id: Some("connector-a".into()),
+        };
+        let (predicate, binds) = memory_erase_predicate("grp", &selector).expect("predicate");
+        let sql = subject_graph_edge_delete_sql("edges", "nodes", "memories", &predicate);
+        let edge_binds = subject_graph_edge_binds(&binds);
+        assert!(sql.contains("subject_id = ?"));
+        assert!(sql.contains("connector_id"));
+        assert_eq!(sql.matches('?').count(), edge_binds.len());
+        assert_eq!(
+            edge_binds.iter().filter(|bind| bind.as_str() == "subject-a").count(),
+            2
+        );
+        assert_eq!(
+            edge_binds.iter().filter(|bind| bind.as_str() == "connector-a").count(),
+            2
+        );
+    }
+
+    #[test]
+    fn unreferenced_entities_are_deleted_after_links() {
+        let sql = unreferenced_entity_delete_sql("mem_entities", "mem_memory_entity_links");
+        assert!(sql.contains("DELETE FROM mem_entities"));
+        assert!(sql.contains("NOT IN"));
+        assert!(sql.contains("mem_memory_entity_links"));
+        assert_eq!(sql.matches('?').count(), 2);
+    }
+
+    #[test]
+    fn unnamed_database_reports_account_snapshots_retained() {
+        assert!(group_snapshots_retained(false, true));
+        assert!(!group_snapshots_retained(false, false));
+        assert!(!group_snapshots_retained(true, true));
+    }
 }
 
 impl SqlMemoryStore {
@@ -4540,6 +4637,17 @@ impl SqlMemoryStore {
 
     /// Try to acquire a distributed lock (returns true if acquired).
     pub async fn try_acquire_lock(&self, key: &str, ttl_secs: i64) -> Result<bool, MemoriaError> {
+        self.try_acquire_lock_holder(key, &self.instance_id, ttl_secs)
+            .await
+    }
+
+    /// Acquire `key` for one operation. Only that holder can renew or release it.
+    pub async fn try_acquire_lock_holder(
+        &self,
+        key: &str,
+        holder_id: &str,
+        ttl_secs: i64,
+    ) -> Result<bool, MemoriaError> {
         let mut conn = self.conn().await?;
         let lock_table = self.t("mem_distributed_locks");
         let expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::seconds(ttl_secs);
@@ -4550,7 +4658,7 @@ impl SqlMemoryStore {
              SET holder_id = ?, acquired_at = NOW(), expires_at = ? \
              WHERE lock_key = ? AND expires_at < NOW()"
         ))
-        .bind(&self.instance_id)
+        .bind(holder_id)
         .bind(expires_at)
         .bind(key)
         .execute(&mut *conn)
@@ -4567,7 +4675,7 @@ impl SqlMemoryStore {
              VALUES (?, ?, NOW(), ?)"
         ))
         .bind(key)
-        .bind(&self.instance_id)
+        .bind(holder_id)
         .bind(expires_at)
         .execute(&mut *conn)
         .await;
@@ -4598,7 +4706,7 @@ impl SqlMemoryStore {
                          VALUES (?, ?, NOW(), ?)"
                     ))
                     .bind(key)
-                    .bind(&self.instance_id)
+                    .bind(holder_id)
                     .bind(expires_at)
                     .execute(&mut *conn)
                     .await;
@@ -4621,8 +4729,9 @@ impl SqlMemoryStore {
     }
 
     /// Physically delete memory rows for one scope. `selector` with neither subject
-    /// nor connector erases the whole scope and its database snapshots. A subject
-    /// selector leaves database snapshots in place and reports that fact.
+    /// nor connector erases the whole scope and its database snapshots. Account-level
+    /// snapshots are left in place and reported. A subject selector leaves snapshots
+    /// in place and reports them when any may still hold the rows.
     pub async fn erase_memories(
         &self,
         user_id: &str,
@@ -4631,7 +4740,9 @@ impl SqlMemoryStore {
         let (predicate, binds) = memory_erase_predicate(user_id, selector)?;
         let mut report = MemoryEraseReport::default();
         if selector.subject_id.is_none() {
-            report.snapshots_dropped = self.drop_scope_snapshots(user_id).await?;
+            let (dropped, retained) = self.drop_scope_snapshots(user_id).await?;
+            report.snapshots_dropped = dropped;
+            report.snapshots_retained = retained;
             let snapshots = self.t("mem_snapshots");
             self.exec_delete(
                 format!("DELETE FROM {snapshots} WHERE user_id = ?"),
@@ -4676,14 +4787,21 @@ impl SqlMemoryStore {
                 selector,
             )
             .await?;
-        if selector.subject_id.is_none() {
-            report.entities = self
-                .exec_delete(
-                    format!("DELETE FROM {} WHERE user_id = ?", self.t("mem_entities")),
-                    &[user_id.to_string()],
-                )
-                .await?;
-        }
+        let entities = self.t("mem_entities");
+        report.entities = if selector.subject_id.is_none() {
+            self.exec_delete(
+                format!("DELETE FROM {entities} WHERE user_id = ?"),
+                &[user_id.to_string()],
+            )
+            .await?
+        } else {
+            let links = self.t("mem_memory_entity_links");
+            self.exec_delete(
+                unreferenced_entity_delete_sql(&entities, &links),
+                &[user_id.to_string(), user_id.to_string()],
+            )
+            .await?
+        };
 
         for table in &memory_tables {
             let deleted = self
@@ -4761,16 +4879,10 @@ impl SqlMemoryStore {
         let nodes = self.t("memory_graph_nodes");
         let mut deleted = 0;
         for source in memory_tables {
-            let mut edge_binds = vec![binds[0].clone()];
-            edge_binds.extend(binds.iter().cloned());
             deleted += self
                 .exec_delete(
-                    format!(
-                        "DELETE FROM {edges} WHERE user_id = ? AND source_id IN (\
-                         SELECT node_id FROM {nodes} WHERE memory_id IN (\
-                         SELECT memory_id FROM {source} WHERE {predicate}))"
-                    ),
-                    &edge_binds,
+                    subject_graph_edge_delete_sql(&edges, &nodes, source, predicate),
+                    &subject_graph_edge_binds(binds),
                 )
                 .await?;
         }
@@ -4833,9 +4945,18 @@ impl SqlMemoryStore {
         if registered.0 > 0 {
             return Ok(true);
         }
-        let Some(prefix) = self.database_name().map(|name| safety_snapshot_prefix(Some(name))) else {
-            return Ok(false);
-        };
+        self.safety_snapshots_with_prefix_exist(self.snapshot_search_prefix())
+            .await
+    }
+
+    fn snapshot_search_prefix(&self) -> String {
+        match self.database_name() {
+            Some(name) => safety_snapshot_prefix(Some(name)),
+            None => safety_snapshot_prefix(None),
+        }
+    }
+
+    async fn safety_snapshots_with_prefix_exist(&self, prefix: String) -> Result<bool, MemoriaError> {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT sname FROM mo_catalog.mo_snapshots WHERE prefix_eq(sname, ?) LIMIT 1",
         )
@@ -4846,7 +4967,7 @@ impl SqlMemoryStore {
         Ok(!rows.is_empty())
     }
 
-    async fn drop_scope_snapshots(&self, user_id: &str) -> Result<u64, MemoriaError> {
+    async fn drop_scope_snapshots(&self, user_id: &str) -> Result<(u64, bool), MemoriaError> {
         let mut prefixes = Vec::new();
         if let Some(name) = self.database_name() {
             prefixes.push(safety_snapshot_prefix(Some(name)));
@@ -4880,7 +5001,17 @@ impl SqlMemoryStore {
         for (name,) in registered {
             dropped += self.drop_snapshot(&name).await?;
         }
-        Ok(dropped)
+        let database_named = self.database_name().is_some();
+        let account_snapshots_remain = if database_named {
+            false
+        } else {
+            self.safety_snapshots_with_prefix_exist(safety_snapshot_prefix(None))
+                .await?
+        };
+        Ok((
+            dropped,
+            group_snapshots_retained(database_named, account_snapshots_remain),
+        ))
     }
 
     async fn drop_snapshot(&self, name: &str) -> Result<u64, MemoriaError> {
@@ -4903,19 +5034,47 @@ impl SqlMemoryStore {
         }
     }
 
-    /// Release a distributed lock.
+    /// Extend a lock still held by `holder_id`. Returns false when this holder no longer owns it.
+    pub async fn renew_lock_holder(
+        &self,
+        key: &str,
+        holder_id: &str,
+        ttl_secs: i64,
+    ) -> Result<bool, MemoriaError> {
+        let expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::seconds(ttl_secs);
+        let lock_table = self.t("mem_distributed_locks");
+        let result = sqlx::query(&format!(
+            "UPDATE {lock_table} SET expires_at = ? \
+             WHERE lock_key = ? AND holder_id = ? AND expires_at >= NOW()"
+        ))
+        .bind(expires_at)
+        .bind(key)
+        .bind(holder_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Release a lock held by this instance.
     pub async fn release_lock(&self, key: &str) -> Result<(), MemoriaError> {
+        self.release_lock_holder(key, &self.instance_id).await?;
+        Ok(())
+    }
+
+    /// Release a lock only when `holder_id` still owns it.
+    pub async fn release_lock_holder(&self, key: &str, holder_id: &str) -> Result<bool, MemoriaError> {
         let mut conn = self.conn().await?;
         let lock_table = self.t("mem_distributed_locks");
-        sqlx::query(&format!(
+        let result = sqlx::query(&format!(
             "DELETE FROM {lock_table} WHERE lock_key = ? AND holder_id = ?"
         ))
         .bind(key)
-        .bind(&self.instance_id)
+        .bind(holder_id)
         .execute(&mut *conn)
         .await
         .map_err(db_err)?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     // ── Retrieval feedback ────────────────────────────────────────────────────

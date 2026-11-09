@@ -311,6 +311,40 @@ pub(crate) async fn group_main_write_allowed_for_solo_owner(
     owner_user_id == user_id && active_member_count == 1
 }
 
+/// Group erase is allowed only for the active group's owner. A member key with
+/// `memory:write` is not enough, and a lookup failure stays closed.
+pub(crate) async fn group_erase_allowed(state: &AppState, group_id: &str, user_id: &str) -> bool {
+    let Some(pool) = state
+        .auth_pool
+        .as_ref()
+        .or_else(|| state.service.sql_store.as_ref().map(|s| s.pool()))
+    else {
+        return false;
+    };
+
+    let row = match sqlx::query(
+        "SELECT owner_user_id FROM mem_groups WHERE group_id = ? AND status = 'active' LIMIT 1",
+    )
+    .bind(group_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            warn!("group_erase_allowed: DB query failed: {e}");
+            return false;
+        }
+    };
+
+    let Some(row) = row else {
+        return false;
+    };
+    let Ok(owner_user_id) = row.try_get::<String, _>("owner_user_id") else {
+        return false;
+    };
+    !owner_user_id.is_empty() && owner_user_id == user_id
+}
+
 // ── Group main-write guard (middleware) ──────────────────────────────────────
 
 /// Axum middleware that rejects write requests to `main` in group mode.

@@ -11,7 +11,7 @@ use memoria_storage::{
 };
 use moka::sync::Cache;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -2385,28 +2385,87 @@ impl MemoryService {
         }
     }
 
-    /// Physically erase memory data in the authenticated scope. The shared lock
-    /// stops a second erase of the same scope; it does not replace the caller's
-    /// decision to pause new writes.
+    /// Physically erase memory data in the authenticated scope. The lock is held
+    /// by this operation and renewed until the erase returns. It does not replace
+    /// the caller's decision to pause new writes.
     pub async fn erase_memories(
         &self,
         scope_id: &str,
         selector: &MemoryEraseSelector,
     ) -> Result<MemoryEraseReport, MemoriaError> {
+        const LOCK_TTL_SECS: i64 = 30;
         let shared = self.shared_sql_store()?;
         let lock_key = format!("memory-erase:{scope_id}");
-        if !shared.try_acquire_lock(&lock_key, 120).await? {
+        let holder = Uuid::new_v4().simple().to_string();
+        if !shared
+            .try_acquire_lock_holder(&lock_key, &holder, LOCK_TTL_SECS)
+            .await?
+        {
             return Err(MemoriaError::Blocked(
                 "memory erase is already running for this scope".into(),
             ));
         }
+        let stop = Arc::new(AtomicBool::new(false));
+        let lost = Arc::new(AtomicBool::new(false));
+        let renew_stop = Arc::clone(&stop);
+        let renew_lost = Arc::clone(&lost);
+        let renew_store = Arc::clone(&shared);
+        let renew_key = lock_key.clone();
+        let renew_holder = holder.clone();
+        let renew = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(10));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if renew_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                match renew_store
+                    .renew_lock_holder(&renew_key, &renew_holder, LOCK_TTL_SECS)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        renew_lost.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "memory erase lock renewal failed");
+                        renew_lost.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+        });
         let store = self.user_sql_store(scope_id).await;
-        let result = match store {
+        let mut result = match store {
             Ok(store) => store.erase_memories(scope_id, selector).await,
             Err(error) => Err(error),
         };
-        if let Err(error) = shared.release_lock(&lock_key).await {
-            tracing::error!(%error, scope_id, "failed to release memory erase lock");
+        stop.store(true, Ordering::Relaxed);
+        renew.abort();
+        match shared.release_lock_holder(&lock_key, &holder).await {
+            Ok(false) if result.is_ok() => {
+                result = Err(MemoriaError::Internal(
+                    "memory erase lost its lock before completion".into(),
+                ));
+            }
+            Ok(_) => {
+                if lost.load(Ordering::Relaxed) && result.is_ok() {
+                    result = Err(MemoriaError::Internal(
+                        "memory erase lost its lock before completion".into(),
+                    ));
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, scope_id, "failed to release memory erase lock");
+                if result.is_ok() {
+                    result = Err(MemoriaError::Internal(
+                        "memory erase lost its lock before completion".into(),
+                    ));
+                }
+            }
         }
         result
     }

@@ -726,6 +726,14 @@ pub async fn erase_memories(
             r#"{"code":"memory_erase_forbidden"}"#.to_string(),
         ));
     }
+    if let Some(group_id) = auth.group_id.as_deref() {
+        if !crate::auth::group_erase_allowed(&state, group_id, &auth.user_id).await {
+            return Err((
+                StatusCode::FORBIDDEN,
+                r#"{"code":"memory_erase_forbidden"}"#.to_string(),
+            ));
+        }
+    }
     let selector = req.selector().map_err(|_| {
         (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -766,7 +774,11 @@ fn erase_failure(error: memoria_core::MemoriaError) -> (StatusCode, String) {
             StatusCode::CONFLICT,
             r#"{"code":"memory_erase_busy"}"#.to_string(),
         ),
-        Internal(message) if message.contains("left memory rows") || message.contains("snapshot") => {
+        Internal(message)
+            if message.contains("left memory rows")
+                || message.contains("snapshot")
+                || message.contains("lock") =>
+        {
             tracing::error!(error = %message, "physical erase incomplete");
             (
                 StatusCode::BAD_GATEWAY,
