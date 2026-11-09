@@ -112,17 +112,19 @@ static COMPILED: Lazy<Vec<(&'static Pattern, Regex)>> = Lazy::new(|| {
         .collect()
 });
 
-/// Unicode 17.0 code points for the zero digit in each decimal-digit block.
-/// Each decimal digit set contains ten consecutive code points starting here.
-const DECIMAL_DIGIT_ZEROES: [u32; 77] = [
+/// Zero-digit code points for each decimal-digit block matched by the regex
+/// crate's `\d` class. Each set contains ten consecutive code points starting
+/// here. `decimal_digit_table_matches_regex_digit_class` checks this table
+/// against `\d` for every code point, so a regex Unicode upgrade or a table
+/// edit that disagrees fails the test.
+const DECIMAL_DIGIT_ZEROES: [u32; 76] = [
     0x0030, 0x0660, 0x06F0, 0x07C0, 0x0966, 0x09E6, 0x0A66, 0x0AE6, 0x0B66, 0x0BE6, 0x0C66, 0x0CE6,
     0x0D66, 0x0DE6, 0x0E50, 0x0ED0, 0x0F20, 0x1040, 0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80,
     0x1A90, 0x1B50, 0x1BB0, 0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0, 0xA9F0, 0xAA50, 0xABF0,
     0xFF10, 0x104A0, 0x10D30, 0x10D40, 0x11066, 0x110F0, 0x11136, 0x111D0, 0x112F0, 0x11450,
     0x114D0, 0x11650, 0x116C0, 0x116D0, 0x116DA, 0x11730, 0x118E0, 0x11950, 0x11BF0, 0x11C50,
-    0x11D50, 0x11DA0, 0x11DE0, 0x11F50, 0x16130, 0x16A60, 0x16AC0, 0x16B50, 0x16D70, 0x1CCF0,
-    0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6, 0x1E140, 0x1E2F0, 0x1E4F0, 0x1E5F1, 0x1E950,
-    0x1FBF0,
+    0x11D50, 0x11DA0, 0x11F50, 0x16130, 0x16A60, 0x16AC0, 0x16B50, 0x16D70, 0x1CCF0, 0x1D7CE,
+    0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6, 0x1E140, 0x1E2F0, 0x1E4F0, 0x1E5F1, 0x1E950, 0x1FBF0,
 ];
 
 /// Decimal value for Unicode decimal digits accepted in card numbers.
@@ -541,6 +543,19 @@ mod tests {
             let r = check_sensitivity(text);
             assert_eq!(r.redacted_content, None, "non-card digits redacted: {text}");
         }
+        // Luhn-invalid numbers stay unredacted in ASCII, fullwidth and
+        // non-fullwidth Unicode decimal digits.
+        for text in [
+            "card 4111 1111 1111 1112 on file",
+            "card ４１１１ １１１１ １１１１ １１１２ on file",
+            "card ٤١١١ ١١١١ ١١١١ ١١١٢ on file",
+        ] {
+            let r = check_sensitivity(text);
+            assert_eq!(
+                r.redacted_content, None,
+                "Luhn-invalid card redacted: {text}"
+            );
+        }
         let r = check_sensitivity("card 4111 1111 1111 1111 on file");
         assert_eq!(r.redacted_content.as_deref(), Some("card [card] on file"));
     }
@@ -635,6 +650,28 @@ mod tests {
         assert_eq!(
             result.redacted_content.as_deref(),
             Some("card [card] on file")
+        );
+    }
+
+    #[test]
+    fn decimal_digit_table_matches_regex_digit_class() {
+        // The card pattern uses `\d`, so every code point it accepts must be
+        // scanned as a digit, and no other code point may be.
+        let digit_class = Regex::new(r"\A\d\z").expect("valid digit regex");
+        let mut buf = [0u8; 4];
+        let mut mismatches = Vec::new();
+        for codepoint in 0..=char::MAX as u32 {
+            let Some(c) = char::from_u32(codepoint) else {
+                continue;
+            };
+            let expected = digit_class.is_match(c.encode_utf8(&mut buf));
+            if decimal_digit(c).is_some() != expected {
+                mismatches.push(format!("U+{codepoint:04X} regex_digit={expected}"));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "decimal_digit disagrees with \\d: {mismatches:?}"
         );
     }
 }
