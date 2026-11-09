@@ -2,8 +2,8 @@ use crate::router::DbRouter;
 use async_trait::async_trait;
 use chrono::{NaiveDateTime, Utc};
 use memoria_core::{
-    interfaces::MemoryStore, nullable_str, nullable_str_from_row, MemoriaError, Memory, MemoryType,
-    TrustTier,
+    interfaces::MemoryStore, is_safe_sql_identifier, nullable_str, nullable_str_from_row,
+    MemoriaError, Memory, MemoryType, TrustTier,
 };
 use sqlx::{mysql::MySqlPool, MySql, QueryBuilder, Row};
 use std::borrow::Cow;
@@ -1013,6 +1013,77 @@ impl Default for UserRetrievalParams {
             confidence_weight: 0.1,
         }
     }
+}
+
+/// Scope of a physical erase. Neither field erases the whole scope.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MemoryEraseSelector {
+    pub subject_id: Option<String>,
+    pub connector_id: Option<String>,
+}
+
+/// Counts of physically removed rows. `snapshots_retained` is true when a
+/// narrower erase cannot remove database snapshots that may still hold the rows.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MemoryEraseReport {
+    pub memories: u64,
+    pub branch_memories: u64,
+    pub graph_nodes: u64,
+    pub graph_edges: u64,
+    pub entity_links: u64,
+    pub memory_entity_links: u64,
+    pub entities: u64,
+    pub stats: u64,
+    pub edit_log: u64,
+    pub feedback: u64,
+    pub snapshots_dropped: u64,
+    pub snapshots_retained: bool,
+}
+
+fn valid_erase_token(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value.trim() == value
+        && value.chars().all(|c| !c.is_control())
+}
+
+fn memory_erase_predicate(
+    user_id: &str,
+    selector: &MemoryEraseSelector,
+) -> Result<(String, Vec<String>), MemoriaError> {
+    if user_id.is_empty() || user_id.len() > 64 {
+        return Err(MemoriaError::Validation("invalid erase scope".into()));
+    }
+    let mut binds = vec![user_id.to_string()];
+    let mut predicate = "user_id = ?".to_string();
+    match (&selector.subject_id, &selector.connector_id) {
+        (None, None) => {}
+        (Some(subject), None) => {
+            if !valid_erase_token(subject, 128) {
+                return Err(MemoriaError::Validation("invalid subject_id".into()));
+            }
+            predicate.push_str(" AND subject_id = ?");
+            binds.push(subject.clone());
+        }
+        (Some(subject), Some(connector)) => {
+            if !valid_erase_token(subject, 128) || !valid_erase_token(connector, 1024) {
+                return Err(MemoriaError::Validation(
+                    "invalid subject_id or connector_id".into(),
+                ));
+            }
+            predicate.push_str(
+                " AND subject_id = ? AND JSON_UNQUOTE(JSON_EXTRACT(extra_metadata, '$.connector_id')) = ?",
+            );
+            binds.push(subject.clone());
+            binds.push(connector.clone());
+        }
+        (None, Some(_)) => {
+            return Err(MemoriaError::Validation(
+                "connector_id requires subject_id".into(),
+            ));
+        }
+    }
+    Ok((predicate, binds))
 }
 
 impl SqlMemoryStore {
@@ -4544,6 +4615,289 @@ impl SqlMemoryStore {
                     }
                 } else {
                     Err(db_err(e))
+                }
+            }
+        }
+    }
+
+    /// Physically delete memory rows for one scope. `selector` with neither subject
+    /// nor connector erases the whole scope and its database snapshots. A subject
+    /// selector leaves database snapshots in place and reports that fact.
+    pub async fn erase_memories(
+        &self,
+        user_id: &str,
+        selector: &MemoryEraseSelector,
+    ) -> Result<MemoryEraseReport, MemoriaError> {
+        let (predicate, binds) = memory_erase_predicate(user_id, selector)?;
+        let mut report = MemoryEraseReport::default();
+        if selector.subject_id.is_none() {
+            report.snapshots_dropped = self.drop_scope_snapshots(user_id).await?;
+            let snapshots = self.t("mem_snapshots");
+            self.exec_delete(
+                format!("DELETE FROM {snapshots} WHERE user_id = ?"),
+                &[user_id.to_string()],
+            )
+            .await?;
+        } else {
+            report.snapshots_retained = self.scope_snapshots_exist(user_id).await?;
+        }
+
+        let memory_tables = self.erase_memory_tables(user_id).await?;
+        report.stats = self
+            .delete_memory_id_rows("mem_memories_stats", &memory_tables, &predicate, &binds)
+            .await?;
+        report.feedback = self
+            .delete_scoped_or_linked("mem_retrieval_feedback", &memory_tables, &predicate, &binds, selector)
+            .await?;
+        report.edit_log = self
+            .delete_scoped_or_linked("mem_edit_log", &memory_tables, &predicate, &binds, selector)
+            .await?;
+        report.entity_links = self
+            .delete_scoped_or_linked("mem_entity_links", &memory_tables, &predicate, &binds, selector)
+            .await?;
+        report.memory_entity_links = self
+            .delete_scoped_or_linked(
+                "mem_memory_entity_links",
+                &memory_tables,
+                &predicate,
+                &binds,
+                selector,
+            )
+            .await?;
+        report.graph_edges = self
+            .delete_graph_edges(&memory_tables, &predicate, &binds, selector)
+            .await?;
+        report.graph_nodes = self
+            .delete_scoped_or_linked(
+                "memory_graph_nodes",
+                &memory_tables,
+                &predicate,
+                &binds,
+                selector,
+            )
+            .await?;
+        if selector.subject_id.is_none() {
+            report.entities = self
+                .exec_delete(
+                    format!("DELETE FROM {} WHERE user_id = ?", self.t("mem_entities")),
+                    &[user_id.to_string()],
+                )
+                .await?;
+        }
+
+        for table in &memory_tables {
+            let deleted = self
+                .exec_delete(format!("DELETE FROM {table} WHERE {predicate}"), &binds)
+                .await?;
+            if table.ends_with("mem_memories") || table == "mem_memories" {
+                report.memories += deleted;
+            } else {
+                report.branch_memories += deleted;
+            }
+            let remaining = self.count_where(table, &predicate, &binds).await?;
+            if remaining != 0 {
+                return Err(MemoriaError::Internal(
+                    "physical erase left memory rows".into(),
+                ));
+            }
+        }
+        Ok(report)
+    }
+
+    async fn erase_memory_tables(&self, user_id: &str) -> Result<Vec<String>, MemoriaError> {
+        let mut tables = vec![self.t("mem_memories")];
+        for (_, table_name, _) in self.list_branches(user_id).await? {
+            if table_name.is_empty() || table_name == "mem_memories" {
+                continue;
+            }
+            if !is_safe_sql_identifier(&table_name) {
+                return Err(MemoriaError::Internal(
+                    "unsafe branch table name".into(),
+                ));
+            }
+            let qualified = self.t(&table_name);
+            if !tables.contains(&qualified) {
+                tables.push(qualified);
+            }
+        }
+        Ok(tables)
+    }
+
+    async fn delete_memory_id_rows(
+        &self,
+        table: &str,
+        memory_tables: &[String],
+        predicate: &str,
+        binds: &[String],
+    ) -> Result<u64, MemoriaError> {
+        let mut deleted = 0;
+        let target = self.t(table);
+        for source in memory_tables {
+            deleted += self
+                .exec_delete(
+                    format!(
+                        "DELETE FROM {target} WHERE memory_id IN (SELECT memory_id FROM {source} WHERE {predicate})"
+                    ),
+                    binds,
+                )
+                .await?;
+        }
+        Ok(deleted)
+    }
+
+    async fn delete_graph_edges(
+        &self,
+        memory_tables: &[String],
+        predicate: &str,
+        binds: &[String],
+        selector: &MemoryEraseSelector,
+    ) -> Result<u64, MemoriaError> {
+        let edges = self.t("memory_graph_edges");
+        if selector.subject_id.is_none() {
+            return self
+                .exec_delete(format!("DELETE FROM {edges} WHERE user_id = ?"), &binds[..1])
+                .await;
+        }
+        let nodes = self.t("memory_graph_nodes");
+        let mut deleted = 0;
+        for source in memory_tables {
+            let mut edge_binds = vec![binds[0].clone()];
+            edge_binds.extend(binds.iter().cloned());
+            deleted += self
+                .exec_delete(
+                    format!(
+                        "DELETE FROM {edges} WHERE user_id = ? AND source_id IN (\
+                         SELECT node_id FROM {nodes} WHERE memory_id IN (\
+                         SELECT memory_id FROM {source} WHERE {predicate}))"
+                    ),
+                    &edge_binds,
+                )
+                .await?;
+        }
+        Ok(deleted)
+    }
+
+    async fn delete_scoped_or_linked(
+        &self,
+        table: &str,
+        memory_tables: &[String],
+        predicate: &str,
+        binds: &[String],
+        selector: &MemoryEraseSelector,
+    ) -> Result<u64, MemoriaError> {
+        if selector.subject_id.is_none() {
+            return self
+                .exec_delete(
+                    format!("DELETE FROM {} WHERE user_id = ?", self.t(table)),
+                    &binds[..1],
+                )
+                .await;
+        }
+        self.delete_memory_id_rows(table, memory_tables, predicate, binds)
+            .await
+    }
+
+    async fn exec_delete(&self, sql: String, binds: &[String]) -> Result<u64, MemoriaError> {
+        let mut query = sqlx::query(&sql);
+        for bind in binds {
+            query = query.bind(bind);
+        }
+        let result = query.execute(&self.pool).await.map_err(db_err)?;
+        Ok(result.rows_affected())
+    }
+
+    async fn count_where(
+        &self,
+        table: &str,
+        predicate: &str,
+        binds: &[String],
+    ) -> Result<i64, MemoriaError> {
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE {predicate}");
+        let mut query = sqlx::query_as::<_, (i64,)>(&sql);
+        for bind in binds {
+            query = query.bind(bind);
+        }
+        let (count,) = query.fetch_one(&self.pool).await.map_err(db_err)?;
+        Ok(count)
+    }
+
+    async fn scope_snapshots_exist(&self, user_id: &str) -> Result<bool, MemoriaError> {
+        let snapshots = self.t("mem_snapshots");
+        let registered: (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM {snapshots} WHERE user_id = ? AND status = 'active'"
+        ))
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if registered.0 > 0 {
+            return Ok(true);
+        }
+        let Some(prefix) = self.database_name().map(|name| safety_snapshot_prefix(Some(name))) else {
+            return Ok(false);
+        };
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT sname FROM mo_catalog.mo_snapshots WHERE prefix_eq(sname, ?) LIMIT 1",
+        )
+        .bind(prefix)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(!rows.is_empty())
+    }
+
+    async fn drop_scope_snapshots(&self, user_id: &str) -> Result<u64, MemoriaError> {
+        let mut prefixes = Vec::new();
+        if let Some(name) = self.database_name() {
+            prefixes.push(safety_snapshot_prefix(Some(name)));
+            if let Some(legacy) = legacy_safety_snapshot_prefix(Some(name)) {
+                if !prefixes.contains(&legacy) {
+                    prefixes.push(legacy);
+                }
+            }
+        }
+        let snapshots = self.t("mem_snapshots");
+        let registered: Vec<(String,)> = sqlx::query_as(&format!(
+            "SELECT snapshot_name FROM {snapshots} WHERE user_id = ? AND status = 'active'"
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut dropped = 0u64;
+        for prefix in prefixes {
+            let rows: Vec<(String,)> = sqlx::query_as(
+                "SELECT sname FROM mo_catalog.mo_snapshots WHERE prefix_eq(sname, ?)",
+            )
+            .bind(&prefix)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+            for (name,) in rows {
+                dropped += self.drop_snapshot(&name).await?;
+            }
+        }
+        for (name,) in registered {
+            dropped += self.drop_snapshot(&name).await?;
+        }
+        Ok(dropped)
+    }
+
+    async fn drop_snapshot(&self, name: &str) -> Result<u64, MemoriaError> {
+        if !is_safe_sql_identifier(name) {
+            return Err(MemoriaError::Internal("unsafe snapshot name".into()));
+        }
+        match sqlx::raw_sql(&format!("DROP SNAPSHOT {name}"))
+            .execute(&self.pool)
+            .await
+        {
+            Ok(_) => Ok(1),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("not exist") || message.contains("does not exist") {
+                    Ok(0)
+                } else {
+                    Err(db_err(error))
                 }
             }
         }

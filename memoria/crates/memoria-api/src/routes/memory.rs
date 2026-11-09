@@ -715,6 +715,74 @@ pub async fn purge_memories(
     }))
 }
 
+pub async fn erase_memories(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<EraseRequest>,
+) -> Result<Json<EraseResponse>, (StatusCode, String)> {
+    if auth.is_master {
+        return Err((
+            StatusCode::FORBIDDEN,
+            r#"{"code":"memory_erase_forbidden"}"#.to_string(),
+        ));
+    }
+    let selector = req.selector().map_err(|_| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            r#"{"code":"memory_erase_invalid"}"#.to_string(),
+        )
+    })?;
+    match state
+        .service
+        .erase_memories(auth.scope_id(), &selector)
+        .await
+    {
+        Ok(report) => Ok(Json(EraseResponse {
+            memories: report.memories,
+            branch_memories: report.branch_memories,
+            graph_nodes: report.graph_nodes,
+            graph_edges: report.graph_edges,
+            entity_links: report.entity_links,
+            memory_entity_links: report.memory_entity_links,
+            entities: report.entities,
+            stats: report.stats,
+            edit_log: report.edit_log,
+            feedback: report.feedback,
+            snapshots_dropped: report.snapshots_dropped,
+            snapshots_retained: report.snapshots_retained,
+        })),
+        Err(error) => Err(erase_failure(error)),
+    }
+}
+
+fn erase_failure(error: memoria_core::MemoriaError) -> (StatusCode, String) {
+    use memoria_core::MemoriaError::*;
+    match error {
+        Validation(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            r#"{"code":"memory_erase_invalid"}"#.to_string(),
+        ),
+        Blocked(_) => (
+            StatusCode::CONFLICT,
+            r#"{"code":"memory_erase_busy"}"#.to_string(),
+        ),
+        Internal(message) if message.contains("left memory rows") || message.contains("snapshot") => {
+            tracing::error!(error = %message, "physical erase incomplete");
+            (
+                StatusCode::BAD_GATEWAY,
+                r#"{"code":"memory_erase_incomplete"}"#.to_string(),
+            )
+        }
+        other => {
+            let (status, _) = api_err_typed(other);
+            (
+                status,
+                r#"{"code":"memory_erase_incomplete"}"#.to_string(),
+            )
+        }
+    }
+}
+
 pub async fn get_profile(
     State(state): State<AppState>,
     auth: AuthUser,

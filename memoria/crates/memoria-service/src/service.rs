@@ -6,7 +6,9 @@ use memoria_core::{
 };
 use memoria_embedding::llm::ChatMessage;
 use memoria_embedding::LlmClient;
-use memoria_storage::{DbRouter, OwnedEditLogEntry, SqlMemoryStore};
+use memoria_storage::{
+    DbRouter, MemoryEraseReport, MemoryEraseSelector, OwnedEditLogEntry, SqlMemoryStore,
+};
 use moka::sync::Cache;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2381,6 +2383,32 @@ impl MemoryService {
             self.store.update(&old_updated).await?;
             Ok(new_mem)
         }
+    }
+
+    /// Physically erase memory data in the authenticated scope. The shared lock
+    /// stops a second erase of the same scope; it does not replace the caller's
+    /// decision to pause new writes.
+    pub async fn erase_memories(
+        &self,
+        scope_id: &str,
+        selector: &MemoryEraseSelector,
+    ) -> Result<MemoryEraseReport, MemoriaError> {
+        let shared = self.shared_sql_store()?;
+        let lock_key = format!("memory-erase:{scope_id}");
+        if !shared.try_acquire_lock(&lock_key, 120).await? {
+            return Err(MemoriaError::Blocked(
+                "memory erase is already running for this scope".into(),
+            ));
+        }
+        let store = self.user_sql_store(scope_id).await;
+        let result = match store {
+            Ok(store) => store.erase_memories(scope_id, selector).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = shared.release_lock(&lock_key).await {
+            tracing::error!(%error, scope_id, "failed to release memory erase lock");
+        }
+        result
     }
 
     pub async fn purge(&self, user_id: &str, memory_id: &str) -> Result<PurgeResult, MemoriaError> {

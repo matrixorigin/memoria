@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 from ..exceptions import MemoriaValidationError
-from ..models import Memory, MemoryPage, PurgeResult, RetrieveResult
+from ..models import EraseResult, Memory, MemoryPage, PurgeResult, RetrieveResult
 
 if TYPE_CHECKING:
     from .._http import _HttpTransport
@@ -23,6 +23,32 @@ _FULLTEXT_QUERY_MAX_BYTES = 4096
 _FULLTEXT_SEARCH_DEFAULT_LIMIT = 20
 _FULLTEXT_SEARCH_MAX_LIMIT = 100
 _MEMORY_CURSOR_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_ERASE_MODES = frozenset({"group", "subject", "subject_connector"})
+
+
+def _erase_body(
+    mode: str,
+    subject_id: str | None,
+    connector_id: str | None,
+) -> dict[str, str]:
+    if mode not in _ERASE_MODES:
+        raise MemoriaValidationError(
+            "erase: mode must be group, subject, or subject_connector"
+        )
+    if mode == "group" and (subject_id is not None or connector_id is not None):
+        raise MemoriaValidationError("erase: group mode does not accept identifiers")
+    if mode == "subject" and (not subject_id or connector_id is not None):
+        raise MemoriaValidationError("erase: subject mode requires subject_id only")
+    if mode == "subject_connector" and (not subject_id or not connector_id):
+        raise MemoriaValidationError(
+            "erase: subject_connector mode requires subject_id and connector_id"
+        )
+    body = {"mode": mode}
+    if subject_id is not None:
+        body["subject_id"] = subject_id
+    if connector_id is not None:
+        body["connector_id"] = connector_id
+    return body
 
 _MEMORY_TYPE_NAMES = {
     "semantic",
@@ -602,6 +628,17 @@ class MemoriesResource:
         data = self._client._request("POST", "/v1/memories/purge", json=body)
         return PurgeResult.from_dict(data)
 
+    def erase(
+        self,
+        *,
+        mode: str,
+        subject_id: str | None = None,
+        connector_id: str | None = None,
+    ) -> EraseResult:
+        body = _erase_body(mode, subject_id, connector_id)
+        data = self._client._request("POST", "/v1/memories/erase", json=body)
+        return EraseResult.from_dict(data)
+
     def feedback(
         self,
         id: str,
@@ -900,6 +937,17 @@ class AsyncMemoriesResource:
         )
         data = await self._client._arequest("POST", "/v1/memories/purge", json=body)
         return PurgeResult.from_dict(data)
+
+    async def erase(
+        self,
+        *,
+        mode: str,
+        subject_id: str | None = None,
+        connector_id: str | None = None,
+    ) -> EraseResult:
+        body = _erase_body(mode, subject_id, connector_id)
+        data = await self._client._arequest("POST", "/v1/memories/erase", json=body)
+        return EraseResult.from_dict(data)
 
     async def feedback(
         self,
