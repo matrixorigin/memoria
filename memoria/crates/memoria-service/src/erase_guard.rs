@@ -1,9 +1,9 @@
 //! Operation-scoped lock for a physical memory erase.
 //!
-//! A failed renewal stops later destructive steps. The statement that already
-//! passed its lock check runs to completion; dropping that future is not treated
-//! as proof that the database stopped. Renewal and release both require this
-//! operation's holder, so an older request cannot change a newer holder's lock.
+//! A failed renewal stops later destructive steps. The statement already sent
+//! keeps the lock row until it returns, so a second erase cannot acquire that
+//! lock while the statement is still running. Renewal and release both require
+//! this operation's holder.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +18,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use memoria_core::MemoriaError;
-use memoria_storage::{MemoryEraseReport, SqlMemoryStore};
+use memoria_storage::{EraseStatementHold, MemoryEraseReport, SqlMemoryStore};
 use tokio::task::JoinHandle;
 
 const LOCK_TTL: Duration = Duration::from_secs(30);
@@ -51,6 +51,17 @@ pub trait EraseLock: Send + Sync + 'static {
         key: &str,
         holder: &str,
     ) -> impl Future<Output = Result<bool, MemoriaError>> + Send;
+    /// Poll `action` only while `holder` still owns `key`, and keep that
+    /// ownership until `action` returns.
+    fn run_exclusive<'a, F>(
+        &'a self,
+        key: &'a str,
+        holder: &'a str,
+        ttl: Duration,
+        action: F,
+    ) -> impl Future<Output = Result<u64, MemoriaError>> + Send + 'a
+    where
+        F: Future<Output = Result<u64, MemoriaError>> + Send + 'a;
 }
 
 impl EraseLock for SqlMemoryStore {
@@ -74,6 +85,20 @@ impl EraseLock for SqlMemoryStore {
     async fn held_by(&self, key: &str, holder: &str) -> Result<bool, MemoriaError> {
         self.lock_held_by(key, holder).await
     }
+
+    async fn run_exclusive<'a, F>(
+        &'a self,
+        key: &'a str,
+        holder: &'a str,
+        ttl: Duration,
+        action: F,
+    ) -> Result<u64, MemoriaError>
+    where
+        F: Future<Output = Result<u64, MemoriaError>> + Send + 'a,
+    {
+        self.run_with_holder_lock(key, holder, ttl_secs(ttl), action)
+            .await
+    }
 }
 
 fn ttl_secs(ttl: Duration) -> i64 {
@@ -88,6 +113,7 @@ pub struct GateState<L: EraseLock> {
     renew_stop: Arc<AtomicBool>,
     lost: Arc<AtomicBool>,
     released: Arc<AtomicBool>,
+    ttl: Duration,
 }
 
 impl<L: EraseLock> Clone for GateState<L> {
@@ -100,7 +126,19 @@ impl<L: EraseLock> Clone for GateState<L> {
             renew_stop: Arc::clone(&self.renew_stop),
             lost: Arc::clone(&self.lost),
             released: Arc::clone(&self.released),
+            ttl: self.ttl,
         }
+    }
+}
+
+impl<L: EraseLock> EraseStatementHold for GateState<L> {
+    fn run_step<'a>(
+        &'a self,
+        action: std::pin::Pin<
+            Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'a>,
+        >,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'a>> {
+        Box::pin(self.run_statement(action))
     }
 }
 
@@ -130,6 +168,28 @@ impl<L: EraseLock> GateState<L> {
                 self.lost.store(true, Ordering::Relaxed);
                 Err(lock_lost_error())
             }
+        }
+    }
+
+    /// Run one destructive statement without letting the lease expire under it.
+    pub async fn run_statement(
+        &self,
+        action: impl Future<Output = Result<u64, MemoriaError>> + Send,
+    ) -> Result<u64, MemoriaError> {
+        if self.stop_steps.load(Ordering::Relaxed) || self.lost.load(Ordering::Relaxed) {
+            self.lost.store(true, Ordering::Relaxed);
+            return Err(lock_lost_error());
+        }
+        match self
+            .backend
+            .run_exclusive(&self.key, &self.holder, self.ttl, action)
+            .await
+        {
+            Err(error) if error.to_string().contains("lost its lock") => {
+                self.lost.store(true, Ordering::Relaxed);
+                Err(error)
+            }
+            other => other,
         }
     }
 
@@ -248,6 +308,7 @@ impl<L: EraseLock> EraseSession<L> {
             renew_stop: Arc::clone(&renew_stop),
             lost,
             released: Arc::clone(&released),
+            ttl,
         };
         Ok(Self {
             gate,
@@ -350,6 +411,7 @@ enum RenewBehavior {
 struct LockRow {
     holder: String,
     expires: Instant,
+    statement_open: bool,
 }
 
 #[cfg(test)]
@@ -378,6 +440,10 @@ impl MemoryLock {
             row.expires = Instant::now() - Duration::from_secs(1);
         }
     }
+
+    fn set_renew(&self, behavior: RenewBehavior) {
+        *self.renew.lock().expect("lock") = behavior;
+    }
 }
 
 #[cfg(test)]
@@ -389,19 +455,51 @@ impl EraseLock for MemoryLock {
         ttl: Duration,
     ) -> Result<bool, MemoriaError> {
         let mut rows = self.rows.lock().expect("lock");
-        if let Some(row) = rows.get(key) {
-            if row.expires > Instant::now() {
-                return Ok(false);
-            }
+        if rows
+            .get(key)
+            .is_some_and(|row| row.statement_open || row.expires > Instant::now())
+        {
+            return Ok(false);
         }
         rows.insert(
             key.to_string(),
             LockRow {
                 holder: holder.to_string(),
                 expires: Instant::now() + ttl,
+                statement_open: false,
             },
         );
         Ok(true)
+    }
+
+    async fn run_exclusive<'a, F>(
+        &'a self,
+        key: &'a str,
+        holder: &'a str,
+        ttl: Duration,
+        action: F,
+    ) -> Result<u64, MemoriaError>
+    where
+        F: Future<Output = Result<u64, MemoriaError>> + Send + 'a,
+    {
+        {
+            let mut rows = self.rows.lock().expect("lock");
+            match rows.get_mut(key) {
+                Some(row) if row.holder == holder && !row.statement_open => {
+                    row.statement_open = true;
+                }
+                _ => return Err(lock_lost_error()),
+            }
+        }
+        let result = action.await;
+        let mut rows = self.rows.lock().expect("lock");
+        if let Some(row) = rows.get_mut(key) {
+            if row.holder == holder {
+                row.statement_open = false;
+                row.expires = Instant::now() + ttl;
+            }
+        }
+        result
     }
 
     async fn renew(&self, key: &str, holder: &str, ttl: Duration) -> Result<bool, MemoriaError> {
@@ -413,10 +511,14 @@ impl EraseLock for MemoryLock {
             }
             RenewBehavior::Reject => {
                 let mut rows = self.rows.lock().expect("lock");
-                if rows.get(key).is_some_and(|row| row.holder == holder) {
-                    rows.remove(key);
+                match rows.get(key) {
+                    Some(row) if row.holder == holder && row.statement_open => Ok(false),
+                    Some(row) if row.holder == holder => {
+                        rows.remove(key);
+                        Ok(false)
+                    }
+                    _ => Ok(false),
                 }
-                Ok(false)
             }
             RenewBehavior::Extend => {
                 let mut rows = self.rows.lock().expect("lock");
@@ -434,6 +536,7 @@ impl EraseLock for MemoryLock {
     async fn release(&self, key: &str, holder: &str) -> Result<bool, MemoriaError> {
         let mut rows = self.rows.lock().expect("lock");
         match rows.get(key) {
+            Some(row) if row.holder == holder && row.statement_open => Ok(false),
             Some(row) if row.holder == holder => {
                 rows.remove(key);
                 Ok(true)
@@ -444,9 +547,9 @@ impl EraseLock for MemoryLock {
 
     async fn held_by(&self, key: &str, holder: &str) -> Result<bool, MemoriaError> {
         let rows = self.rows.lock().expect("lock");
-        Ok(rows
-            .get(key)
-            .is_some_and(|row| row.holder == holder && row.expires > Instant::now()))
+        Ok(rows.get(key).is_some_and(|row| {
+            row.holder == holder && (row.statement_open || row.expires > Instant::now())
+        }))
     }
 }
 
@@ -602,6 +705,81 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert_eq!(lock.renew_calls(), calls);
         let _ = gate.finish().await;
+    }
+
+    #[tokio::test]
+    async fn in_flight_statement_keeps_the_lock_after_renewal_fails() {
+        let lock = Arc::new(MemoryLock::new(RenewBehavior::Extend));
+        let session = EraseSession::start_with(
+            Arc::clone(&lock),
+            "memory-erase:scope".into(),
+            Duration::from_secs(30),
+            Duration::from_millis(20),
+        )
+        .await
+        .expect("acquired");
+        let (cancel, lease, gate) = session.handoff();
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_statement = Arc::new(tokio::sync::Notify::new());
+        let started_flag = Arc::clone(&started);
+        let release = Arc::clone(&release_statement);
+        let statement = gate.run_statement(async move {
+            started_flag.store(true, Ordering::SeqCst);
+            release.notified().await;
+            Ok(1)
+        });
+        tokio::pin!(statement);
+        for _ in 0..50 {
+            tokio::select! {
+                _ = &mut statement => panic!("statement finished before the lock check"),
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                    if started.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(started.load(Ordering::SeqCst));
+        lock.expire("memory-erase:scope");
+        lock.set_renew(RenewBehavior::Fail);
+        for _ in 0..50 {
+            if gate.lost() {
+                break;
+            }
+            tokio::select! {
+                _ = &mut statement => panic!("statement finished before renewal failed"),
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+        }
+        assert!(gate.lost());
+        assert!(!lock
+            .try_acquire(
+                "memory-erase:scope",
+                "second",
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("acquire while statement is running"));
+        release_statement.notify_one();
+        let deleted = statement.await.expect("statement");
+        assert_eq!(deleted, 1);
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&polled);
+        let next = gate
+            .run_statement(async move {
+                flag.store(true, Ordering::SeqCst);
+                Ok(2)
+            })
+            .await;
+        assert!(next.expect_err("next step").to_string().contains("lock"));
+        assert!(!polled.load(Ordering::SeqCst));
+        gate.finish().await.expect("release");
+        assert!(lock
+            .try_acquire("memory-erase:scope", "second", Duration::from_secs(30))
+            .await
+            .expect("acquire after the statement"));
+        drop(cancel);
+        drop(lease);
     }
 
     #[tokio::test]
