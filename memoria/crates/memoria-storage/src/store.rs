@@ -1206,8 +1206,8 @@ fn memory_erase_predicate(
 pub trait EraseStatementHold: Send + Sync {
     fn run_step(
         &self,
-        action: Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send>>,
-    ) -> Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send>>;
+        action: Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'static>>,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'static>>;
 }
 
 /// Runs each destructive erase statement through `EraseStatementHold`.
@@ -1350,8 +1350,8 @@ mod erase_gate_tests {
     impl EraseStatementHold for Refuse {
         fn run_step(
             &self,
-            action: Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send>>,
-        ) -> Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send>> {
+            action: Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'static>>,
+        ) -> Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'static>> {
             drop(action);
             Box::pin(async { Err(lost()) })
         }
@@ -1364,8 +1364,8 @@ mod erase_gate_tests {
     impl EraseStatementHold for Once {
         fn run_step(
             &self,
-            action: Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send>>,
-        ) -> Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send>> {
+            action: Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'static>>,
+        ) -> Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'static>> {
             let calls = Arc::clone(&self.calls);
             Box::pin(async move {
                 if calls.fetch_add(1, Ordering::SeqCst) > 0 {
