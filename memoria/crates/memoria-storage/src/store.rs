@@ -1094,10 +1094,10 @@ fn memory_erase_predicate(
 /// must keep that ownership until `action` returns. Dropping `action` without
 /// polling it means the statement was not sent.
 pub trait EraseStatementHold: Send + Sync {
-    fn run_step<'a>(
-        &'a self,
-        action: Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'a>>,
-    ) -> Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'a>>;
+    fn run_step(
+        &self,
+        action: Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send>>,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send>>;
 }
 
 /// Runs each destructive erase statement through `EraseStatementHold`.
@@ -1115,7 +1115,7 @@ impl EraseStepGate {
 /// only after the holder still owns the lock, and it is awaited to completion.
 pub async fn run_gated_erase_step(
     gate: &EraseStepGate,
-    action: impl Future<Output = Result<u64, MemoriaError>> + Send,
+    action: impl Future<Output = Result<u64, MemoriaError>> + Send + 'static,
 ) -> Result<u64, MemoriaError> {
     gate.hold.run_step(Box::pin(action)).await
 }
@@ -1238,26 +1238,27 @@ mod erase_gate_tests {
     struct Refuse;
 
     impl EraseStatementHold for Refuse {
-        fn run_step<'a>(
-            &'a self,
-            action: Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'a>>,
-        ) -> Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'a>> {
+        fn run_step(
+            &self,
+            action: Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send>>,
+        ) -> Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send>> {
             drop(action);
             Box::pin(async { Err(lost()) })
         }
     }
 
     struct Once {
-        calls: AtomicUsize,
+        calls: Arc<AtomicUsize>,
     }
 
     impl EraseStatementHold for Once {
-        fn run_step<'a>(
-            &'a self,
-            action: Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'a>>,
-        ) -> Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'a>> {
+        fn run_step(
+            &self,
+            action: Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send>>,
+        ) -> Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send>> {
+            let calls = Arc::clone(&self.calls);
             Box::pin(async move {
-                if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                if calls.fetch_add(1, Ordering::SeqCst) > 0 {
                     drop(action);
                     return Err(lost());
                 }
@@ -1283,7 +1284,7 @@ mod erase_gate_tests {
     #[tokio::test]
     async fn started_statement_finishes_before_the_next_step_is_refused() {
         let gate = EraseStepGate::new(Arc::new(Once {
-            calls: AtomicUsize::new(0),
+            calls: Arc::new(AtomicUsize::new(0)),
         }));
         let finished = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&finished);
@@ -4878,12 +4879,14 @@ impl SqlMemoryStore {
             report.snapshots_dropped = dropped;
             report.snapshots_retained = retained;
             let snapshots = self.t("mem_snapshots");
-            let user_binds = [user_id.to_string()];
-            let delete_registry = self.exec_delete(
-                format!("DELETE FROM {snapshots} WHERE user_id = ?"),
-                &user_binds,
-            );
-            run_gated_erase_step(gate, delete_registry).await?;
+            run_gated_erase_step(
+                gate,
+                self.owned_delete(
+                    format!("DELETE FROM {snapshots} WHERE user_id = ?"),
+                    vec![user_id.to_string()],
+                ),
+            )
+            .await?;
         } else {
             report.snapshots_retained = self.scope_snapshots_exist(user_id).await?;
         }
@@ -4933,26 +4936,33 @@ impl SqlMemoryStore {
             .await?;
         let entities = self.t("mem_entities");
         report.entities = if selector.subject_id.is_none() {
-            let user_binds = [user_id.to_string()];
-            let delete_entities = self.exec_delete(
-                format!("DELETE FROM {entities} WHERE user_id = ?"),
-                &user_binds,
-            );
-            run_gated_erase_step(gate, delete_entities).await?
+            run_gated_erase_step(
+                gate,
+                self.owned_delete(
+                    format!("DELETE FROM {entities} WHERE user_id = ?"),
+                    vec![user_id.to_string()],
+                ),
+            )
+            .await?
         } else {
             let links = self.t("mem_memory_entity_links");
             let user = user_id.to_string();
-            let user_binds = [user.clone(), user];
-            let delete_orphans = self.exec_delete(
-                unreferenced_entity_delete_sql(&entities, &links),
-                &user_binds,
-            );
-            run_gated_erase_step(gate, delete_orphans).await?
+            run_gated_erase_step(
+                gate,
+                self.owned_delete(
+                    unreferenced_entity_delete_sql(&entities, &links),
+                    vec![user.clone(), user],
+                ),
+            )
+            .await?
         };
 
         for table in &memory_tables {
-            let delete_rows = self.exec_delete(format!("DELETE FROM {table} WHERE {predicate}"), &binds);
-            let deleted = run_gated_erase_step(gate, delete_rows).await?;
+            let deleted = run_gated_erase_step(
+                gate,
+                self.owned_delete(format!("DELETE FROM {table} WHERE {predicate}"), binds.clone()),
+            )
+            .await?;
             if table.ends_with("mem_memories") || table == "mem_memories" {
                 report.memories += deleted;
             } else {
@@ -4998,13 +5008,16 @@ impl SqlMemoryStore {
         let mut deleted = 0;
         let target = self.t(table);
         for source in memory_tables {
-            let delete_rows = self.exec_delete(
-                format!(
-                    "DELETE FROM {target} WHERE memory_id IN (SELECT memory_id FROM {source} WHERE {predicate})"
+            deleted += run_gated_erase_step(
+                gate,
+                self.owned_delete(
+                    format!(
+                        "DELETE FROM {target} WHERE memory_id IN (SELECT memory_id FROM {source} WHERE {predicate})"
+                    ),
+                    binds.to_vec(),
                 ),
-                binds,
-            );
-            deleted += run_gated_erase_step(gate, delete_rows).await?;
+            )
+            .await?;
         }
         Ok(deleted)
     }
@@ -5019,19 +5032,26 @@ impl SqlMemoryStore {
     ) -> Result<u64, MemoriaError> {
         let edges = self.t("memory_graph_edges");
         if selector.subject_id.is_none() {
-            let delete_edges =
-                self.exec_delete(format!("DELETE FROM {edges} WHERE user_id = ?"), &binds[..1]);
-            return run_gated_erase_step(gate, delete_edges).await;
+            return run_gated_erase_step(
+                gate,
+                self.owned_delete(
+                    format!("DELETE FROM {edges} WHERE user_id = ?"),
+                    binds[..1].to_vec(),
+                ),
+            )
+            .await;
         }
         let nodes = self.t("memory_graph_nodes");
         let mut deleted = 0;
         for source in memory_tables {
-            let edge_binds = subject_graph_edge_binds(binds);
-            let delete_edges = self.exec_delete(
-                subject_graph_edge_delete_sql(&edges, &nodes, source, predicate),
-                &edge_binds,
-            );
-            deleted += run_gated_erase_step(gate, delete_edges).await?;
+            deleted += run_gated_erase_step(
+                gate,
+                self.owned_delete(
+                    subject_graph_edge_delete_sql(&edges, &nodes, source, predicate),
+                    subject_graph_edge_binds(binds),
+                ),
+            )
+            .await?;
         }
         Ok(deleted)
     }
@@ -5046,14 +5066,34 @@ impl SqlMemoryStore {
         selector: &MemoryEraseSelector,
     ) -> Result<u64, MemoriaError> {
         if selector.subject_id.is_none() {
-            let delete_rows = self.exec_delete(
-                format!("DELETE FROM {} WHERE user_id = ?", self.t(table)),
-                &binds[..1],
-            );
-            return run_gated_erase_step(gate, delete_rows).await;
+            return run_gated_erase_step(
+                gate,
+                self.owned_delete(
+                    format!("DELETE FROM {} WHERE user_id = ?", self.t(table)),
+                    binds[..1].to_vec(),
+                ),
+            )
+            .await;
         }
         self.delete_memory_id_rows(gate, table, memory_tables, predicate, binds)
             .await
+    }
+
+    fn owned_delete(
+        &self,
+        sql: String,
+        binds: Vec<String>,
+    ) -> impl Future<Output = Result<u64, MemoriaError>> + Send + 'static {
+        let store = self.clone();
+        async move { store.exec_delete(sql, &binds).await }
+    }
+
+    fn owned_drop_snapshot(
+        &self,
+        name: String,
+    ) -> impl Future<Output = Result<u64, MemoriaError>> + Send + 'static {
+        let store = self.clone();
+        async move { store.drop_snapshot(&name).await }
     }
 
     async fn exec_delete(&self, sql: String, binds: &[String]) -> Result<u64, MemoriaError> {
@@ -5146,13 +5186,11 @@ impl SqlMemoryStore {
             .await
             .map_err(db_err)?;
             for (name,) in rows {
-                let drop_named = self.drop_snapshot(&name);
-                dropped += run_gated_erase_step(gate, drop_named).await?;
+                dropped += run_gated_erase_step(gate, self.owned_drop_snapshot(name)).await?;
             }
         }
         for (name,) in registered {
-            let drop_registered = self.drop_snapshot(&name);
-            dropped += run_gated_erase_step(gate, drop_registered).await?;
+            dropped += run_gated_erase_step(gate, self.owned_drop_snapshot(name)).await?;
         }
         let database_named = self.database_name().is_some();
         let account_snapshots_remain = if database_named {

@@ -18,9 +18,9 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use memoria_core::MemoriaError;
-use memoria_storage::{
-    EraseStatementHold, EraseStepGate, MemoryEraseReport, SqlMemoryStore,
-};
+use memoria_storage::{EraseStatementHold, MemoryEraseReport, SqlMemoryStore};
+#[cfg(test)]
+use memoria_storage::EraseStepGate;
 use tokio::task::JoinHandle;
 
 const LOCK_TTL: Duration = Duration::from_secs(30);
@@ -134,26 +134,23 @@ impl<L: EraseLock> Clone for GateState<L> {
 }
 
 impl<L: EraseLock> EraseStatementHold for GateState<L> {
-    fn run_step<'a>(
-        &'a self,
-        action: std::pin::Pin<
-            Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'a>,
-        >,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'a>> {
-        // An async block, not `Box::pin(self.run_statement(...))`. Rust 1.88
-        // cannot coerce that async-fn future to a trait object with lifetime `'a`.
+    fn run_step(
+        &self,
+        action: std::pin::Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send>>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send>> {
+        let gate = self.clone();
         Box::pin(async move {
-            if self.stop_steps.load(Ordering::Relaxed) || self.lost.load(Ordering::Relaxed) {
-                self.lost.store(true, Ordering::Relaxed);
+            if gate.stop_steps.load(Ordering::Relaxed) || gate.lost.load(Ordering::Relaxed) {
+                gate.lost.store(true, Ordering::Relaxed);
                 return Err(lock_lost_error());
             }
-            match self
+            match gate
                 .backend
-                .run_exclusive(&self.key, &self.holder, self.ttl, action)
+                .run_exclusive(&gate.key, &gate.holder, gate.ttl, action)
                 .await
             {
                 Err(error) if error.to_string().contains("lost its lock") => {
-                    self.lost.store(true, Ordering::Relaxed);
+                    gate.lost.store(true, Ordering::Relaxed);
                     Err(error)
                 }
                 other => other,
