@@ -7,7 +7,7 @@ use memoria_core::{
 use memoria_embedding::llm::ChatMessage;
 use memoria_embedding::LlmClient;
 use memoria_storage::{
-    DbRouter, EraseStatementHold, EraseStepGate, MemoryEraseReport, MemoryEraseSelector,
+    DbRouter, EraseStepGate, MemoryEraseReport, MemoryEraseSelector,
     OwnedEditLogEntry, SqlMemoryStore,
 };
 use moka::sync::Cache;
@@ -2414,7 +2414,7 @@ impl MemoryService {
         let selector = selector.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            let mut steps = EraseStepGate::new(Arc::new(gate.clone()) as Arc<dyn EraseStatementHold>);
+            let mut steps = EraseStepGate::new(gate.clone());
             let result = store.erase_memories(&scope, &selector, &mut steps).await;
             let result = crate::erase_guard::conclude_erase(result, &gate).await;
             lease.shutdown_renew();

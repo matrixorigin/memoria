@@ -8,7 +8,6 @@ use memoria_core::{
 use sqlx::{mysql::MySqlPool, Connection, MySql, QueryBuilder, Row};
 use std::borrow::Cow;
 use std::future::Future;
-use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -1094,30 +1093,32 @@ fn memory_erase_predicate(
 /// must keep that ownership until `action` returns. Dropping `action` without
 /// polling it means the statement was not sent.
 pub trait EraseStatementHold: Send + Sync {
-    fn run_step(
+    fn run_step<F>(
         &self,
-        action: Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'static>>,
-    ) -> Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'static>>;
+        action: F,
+    ) -> impl Future<Output = Result<u64, MemoriaError>> + Send
+    where
+        F: Future<Output = Result<u64, MemoriaError>> + Send + 'static;
 }
 
 /// Runs each destructive erase statement through `EraseStatementHold`.
-pub struct EraseStepGate {
-    hold: Arc<dyn EraseStatementHold>,
+pub struct EraseStepGate<H: EraseStatementHold> {
+    hold: H,
 }
 
-impl EraseStepGate {
-    pub fn new(hold: Arc<dyn EraseStatementHold>) -> Self {
+impl<H: EraseStatementHold> EraseStepGate<H> {
+    pub fn new(hold: H) -> Self {
         Self { hold }
     }
 }
 
 /// Run one statement while its lock ownership is held. The future is polled
 /// only after the holder still owns the lock, and it is awaited to completion.
-pub async fn run_gated_erase_step(
-    gate: &EraseStepGate,
+pub async fn run_gated_erase_step<H: EraseStatementHold>(
+    gate: &EraseStepGate<H>,
     action: impl Future<Output = Result<u64, MemoriaError>> + Send + 'static,
 ) -> Result<u64, MemoriaError> {
-    gate.hold.run_step(Box::pin(action)).await
+    gate.hold.run_step(action).await
 }
 
 fn lock_acquire_blocked(error: &sqlx::Error) -> bool {
@@ -1227,7 +1228,6 @@ mod erase_gate_tests {
     use super::{run_gated_erase_step, EraseStatementHold, EraseStepGate};
     use memoria_core::MemoriaError;
     use std::future::Future;
-    use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -1238,12 +1238,15 @@ mod erase_gate_tests {
     struct Refuse;
 
     impl EraseStatementHold for Refuse {
-        fn run_step(
+        fn run_step<F>(
             &self,
-            action: Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'static>>,
-        ) -> Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'static>> {
+            action: F,
+        ) -> impl Future<Output = Result<u64, MemoriaError>> + Send
+        where
+            F: Future<Output = Result<u64, MemoriaError>> + Send + 'static,
+        {
             drop(action);
-            Box::pin(async { Err(lost()) })
+            async { Err(lost()) }
         }
     }
 
@@ -1252,18 +1255,21 @@ mod erase_gate_tests {
     }
 
     impl EraseStatementHold for Once {
-        fn run_step(
+        fn run_step<F>(
             &self,
-            action: Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'static>>,
-        ) -> Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'static>> {
+            action: F,
+        ) -> impl Future<Output = Result<u64, MemoriaError>> + Send
+        where
+            F: Future<Output = Result<u64, MemoriaError>> + Send + 'static,
+        {
             let calls = Arc::clone(&self.calls);
-            Box::pin(async move {
+            async move {
                 if calls.fetch_add(1, Ordering::SeqCst) > 0 {
                     drop(action);
                     return Err(lost());
                 }
                 action.await
-            })
+            }
         }
     }
 
@@ -1271,7 +1277,7 @@ mod erase_gate_tests {
     async fn failed_lock_check_does_not_poll_the_statement() {
         let polled = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&polled);
-        let gate = EraseStepGate::new(Arc::new(Refuse));
+        let gate = EraseStepGate::new(Refuse);
         let action = async move {
             flag.store(true, Ordering::SeqCst);
             Ok(1)
@@ -1283,9 +1289,9 @@ mod erase_gate_tests {
 
     #[tokio::test]
     async fn started_statement_finishes_before_the_next_step_is_refused() {
-        let gate = EraseStepGate::new(Arc::new(Once {
+        let gate = EraseStepGate::new(Once {
             calls: Arc::new(AtomicUsize::new(0)),
-        }));
+        });
         let finished = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&finished);
         let deleted = run_gated_erase_step(&gate, async move {
@@ -4866,11 +4872,11 @@ impl SqlMemoryStore {
     /// nor connector erases the whole scope and its database snapshots. Account-level
     /// snapshots are left in place and reported. A subject selector leaves snapshots
     /// in place and reports them when any may still hold the rows.
-    pub async fn erase_memories(
+    pub async fn erase_memories<H: EraseStatementHold>(
         &self,
         user_id: &str,
         selector: &MemoryEraseSelector,
-        gate: &mut EraseStepGate,
+        gate: &mut EraseStepGate<H>,
     ) -> Result<MemoryEraseReport, MemoriaError> {
         let (predicate, binds) = memory_erase_predicate(user_id, selector)?;
         let mut report = MemoryEraseReport::default();
@@ -4997,9 +5003,9 @@ impl SqlMemoryStore {
         Ok(tables)
     }
 
-    async fn delete_memory_id_rows(
+    async fn delete_memory_id_rows<H: EraseStatementHold>(
         &self,
-        gate: &mut EraseStepGate,
+        gate: &mut EraseStepGate<H>,
         table: &str,
         memory_tables: &[String],
         predicate: &str,
@@ -5022,9 +5028,9 @@ impl SqlMemoryStore {
         Ok(deleted)
     }
 
-    async fn delete_graph_edges(
+    async fn delete_graph_edges<H: EraseStatementHold>(
         &self,
-        gate: &mut EraseStepGate,
+        gate: &mut EraseStepGate<H>,
         memory_tables: &[String],
         predicate: &str,
         binds: &[String],
@@ -5056,9 +5062,9 @@ impl SqlMemoryStore {
         Ok(deleted)
     }
 
-    async fn delete_scoped_or_linked(
+    async fn delete_scoped_or_linked<H: EraseStatementHold>(
         &self,
-        gate: &mut EraseStepGate,
+        gate: &mut EraseStepGate<H>,
         table: &str,
         memory_tables: &[String],
         predicate: &str,
@@ -5154,10 +5160,10 @@ impl SqlMemoryStore {
         Ok(!rows.is_empty())
     }
 
-    async fn drop_scope_snapshots(
+    async fn drop_scope_snapshots<H: EraseStatementHold>(
         &self,
         user_id: &str,
-        gate: &mut EraseStepGate,
+        gate: &mut EraseStepGate<H>,
     ) -> Result<(u64, bool), MemoriaError> {
         let mut prefixes = Vec::new();
         if let Some(name) = self.database_name() {
