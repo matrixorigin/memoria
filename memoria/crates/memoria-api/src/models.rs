@@ -494,6 +494,70 @@ pub struct PurgeResponse {
     pub warning: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EraseRequest {
+    pub mode: String,
+    #[serde(default)]
+    pub subject_id: Option<String>,
+    #[serde(default)]
+    pub connector_id: Option<String>,
+}
+
+impl EraseRequest {
+    pub fn selector(&self) -> Result<memoria_storage::MemoryEraseSelector, &'static str> {
+        let subject_id = self
+            .subject_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let connector_id = self
+            .connector_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        match self.mode.as_str() {
+            "group" if subject_id.is_none() && connector_id.is_none() => {
+                Ok(memoria_storage::MemoryEraseSelector::default())
+            }
+            "subject" if subject_id.is_some() && connector_id.is_none() => {
+                Ok(memoria_storage::MemoryEraseSelector {
+                    subject_id,
+                    connector_id: None,
+                })
+            }
+            "subject_connector" if subject_id.is_some() && connector_id.is_some() => {
+                Ok(memoria_storage::MemoryEraseSelector {
+                    subject_id,
+                    connector_id,
+                })
+            }
+            "group" | "subject" | "subject_connector" => {
+                Err("erase mode does not match the supplied identifiers")
+            }
+            _ => Err("mode must be group, subject, or subject_connector"),
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct EraseResponse {
+    pub memories: u64,
+    pub branch_memories: u64,
+    pub graph_nodes: u64,
+    pub graph_edges: u64,
+    pub entity_links: u64,
+    pub memory_entity_links: u64,
+    pub entities: u64,
+    pub stats: u64,
+    pub edit_log: u64,
+    pub feedback: u64,
+    pub snapshots_dropped: u64,
+    pub snapshots_retained: bool,
+}
+
 // ── Governance ────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, Default)]
@@ -664,8 +728,8 @@ pub fn parse_trust_tier(s: &str) -> Result<TrustTier, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_fulltext_memory_types_opt, parse_memory_types_opt, PurgeRequest, PurgeSelector,
-        StructuredQueryRequest,
+        parse_fulltext_memory_types_opt, parse_memory_types_opt, EraseRequest, PurgeRequest,
+        PurgeSelector, StructuredQueryRequest,
     };
     use memoria_core::MemoryType;
 
@@ -766,5 +830,29 @@ mod tests {
         };
 
         assert!(matches!(request.selector().unwrap(), PurgeSelector::None));
+    }
+
+    #[test]
+    fn erase_request_requires_mode_to_match_identifiers() {
+        let group = EraseRequest {
+            mode: "group".into(),
+            subject_id: None,
+            connector_id: None,
+        };
+        assert!(group.selector().unwrap().subject_id.is_none());
+
+        let subject = EraseRequest {
+            mode: "subject".into(),
+            subject_id: Some("consumer".into()),
+            connector_id: None,
+        };
+        assert_eq!(subject.selector().unwrap().subject_id.as_deref(), Some("consumer"));
+
+        let mismatched = EraseRequest {
+            mode: "group".into(),
+            subject_id: Some("consumer".into()),
+            connector_id: None,
+        };
+        assert!(mismatched.selector().is_err());
     }
 }
