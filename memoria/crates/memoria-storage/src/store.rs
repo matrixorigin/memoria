@@ -5,7 +5,7 @@ use memoria_core::{
     interfaces::MemoryStore, is_safe_sql_identifier, nullable_str, nullable_str_from_row,
     MemoriaError, Memory, MemoryType, TrustTier,
 };
-use sqlx::{mysql::MySqlPool, MySql, QueryBuilder, Row};
+use sqlx::{mysql::MySqlPool, Connection, MySql, QueryBuilder, Row};
 use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
@@ -1088,38 +1088,41 @@ fn memory_erase_predicate(
     Ok((predicate, binds))
 }
 
-/// Called before each destructive erase statement. The statement future must be
-/// polled only after `enter` succeeds, and must then be awaited to completion.
+/// Holds this operation's lock row across one destructive statement.
+///
+/// `run_step` may poll `action` only after this holder owns the lock, and it
+/// must keep that ownership until `action` returns. Dropping `action` without
+/// polling it means the statement was not sent.
+pub trait EraseStatementHold: Send + Sync {
+    fn run_step<'a>(
+        &'a self,
+        action: Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'a>>,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'a>>;
+}
+
+/// Runs each destructive erase statement through `EraseStatementHold`.
 pub struct EraseStepGate {
-    check: Box<
-        dyn FnMut() -> Pin<Box<dyn Future<Output = Result<(), MemoriaError>> + Send>> + Send,
-    >,
+    hold: Arc<dyn EraseStatementHold>,
 }
 
 impl EraseStepGate {
-    pub fn new<F, Fut>(mut check: F) -> Self
-    where
-        F: FnMut() -> Fut + Send + 'static,
-        Fut: Future<Output = Result<(), MemoriaError>> + Send + 'static,
-    {
-        Self {
-            check: Box::new(move || Box::pin(check())),
-        }
-    }
-
-    pub async fn enter(&mut self) -> Result<(), MemoriaError> {
-        (self.check)().await
+    pub fn new(hold: Arc<dyn EraseStatementHold>) -> Self {
+        Self { hold }
     }
 }
 
-/// Confirm the lock, then run one already-built statement. The statement is not
-/// polled when the lock check fails, and it is not dropped after polling starts.
-pub async fn run_gated_erase_step<T>(
-    gate: &mut EraseStepGate,
-    action: impl Future<Output = Result<T, MemoriaError>> + Send,
-) -> Result<T, MemoriaError> {
-    gate.enter().await?;
-    action.await
+/// Run one statement while its lock ownership is held. The future is polled
+/// only after the holder still owns the lock, and it is awaited to completion.
+pub async fn run_gated_erase_step(
+    gate: &EraseStepGate,
+    action: impl Future<Output = Result<u64, MemoriaError>> + Send,
+) -> Result<u64, MemoriaError> {
+    gate.hold.run_step(Box::pin(action)).await
+}
+
+fn lock_acquire_blocked(error: &sqlx::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("lock wait") || message.contains("write conflict") || message.contains("write-write")
 }
 
 fn group_snapshots_retained(database_named: bool, account_snapshots_remain: bool) -> bool {
@@ -1221,8 +1224,10 @@ mod erase_scope_tests {
 
 #[cfg(test)]
 mod erase_gate_tests {
-    use super::{run_gated_erase_step, EraseStepGate};
+    use super::{run_gated_erase_step, EraseStatementHold, EraseStepGate};
     use memoria_core::MemoriaError;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -1230,41 +1235,61 @@ mod erase_gate_tests {
         MemoriaError::Internal("memory erase lost its lock before completion".into())
     }
 
+    struct Refuse;
+
+    impl EraseStatementHold for Refuse {
+        fn run_step<'a>(
+            &'a self,
+            action: Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'a>>,
+        ) -> Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'a>> {
+            drop(action);
+            Box::pin(async { Err(lost()) })
+        }
+    }
+
+    struct Once {
+        calls: AtomicUsize,
+    }
+
+    impl EraseStatementHold for Once {
+        fn run_step<'a>(
+            &'a self,
+            action: Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'a>>,
+        ) -> Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send + 'a>> {
+            Box::pin(async move {
+                if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                    drop(action);
+                    return Err(lost());
+                }
+                action.await
+            })
+        }
+    }
+
     #[tokio::test]
     async fn failed_lock_check_does_not_poll_the_statement() {
         let polled = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&polled);
-        let mut gate = EraseStepGate::new(|| async { Err(lost()) });
+        let gate = EraseStepGate::new(Arc::new(Refuse));
         let action = async move {
             flag.store(true, Ordering::SeqCst);
-            Ok::<(), MemoriaError>(())
+            Ok(1)
         };
-        let error = run_gated_erase_step(&mut gate, action).await.unwrap_err();
+        let error = run_gated_erase_step(&gate, action).await.unwrap_err();
         assert!(!polled.load(Ordering::SeqCst));
         assert!(error.to_string().contains("lock"));
     }
 
     #[tokio::test]
     async fn started_statement_finishes_before_the_next_step_is_refused() {
-        let checks = Arc::new(AtomicUsize::new(0));
-        let mut gate = EraseStepGate::new({
-            let checks = Arc::clone(&checks);
-            move || {
-                let checks = Arc::clone(&checks);
-                async move {
-                    if checks.fetch_add(1, Ordering::SeqCst) == 0 {
-                        Ok(())
-                    } else {
-                        Err(lost())
-                    }
-                }
-            }
-        });
+        let gate = EraseStepGate::new(Arc::new(Once {
+            calls: AtomicUsize::new(0),
+        }));
         let finished = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&finished);
-        let deleted = run_gated_erase_step(&mut gate, async move {
+        let deleted = run_gated_erase_step(&gate, async move {
             flag.store(true, Ordering::SeqCst);
-            Ok::<u64, MemoriaError>(1)
+            Ok(1)
         })
         .await
         .expect("first statement");
@@ -1272,9 +1297,9 @@ mod erase_gate_tests {
         assert!(finished.load(Ordering::SeqCst));
         let polled = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&polled);
-        let error = run_gated_erase_step(&mut gate, async move {
+        let error = run_gated_erase_step(&gate, async move {
             flag.store(true, Ordering::SeqCst);
-            Ok::<u64, MemoriaError>(2)
+            Ok(2)
         })
         .await
         .unwrap_err();
@@ -4762,8 +4787,16 @@ impl SqlMemoryStore {
         .bind(expires_at)
         .bind(key)
         .execute(&mut *conn)
-        .await
-        .map_err(db_err)?;
+        .await;
+        let update_result = match update_result {
+            Ok(result) => result,
+            Err(error) => {
+                if lock_acquire_blocked(&error) {
+                    return Ok(false);
+                }
+                return Err(db_err(error));
+            }
+        };
 
         if update_result.rows_affected() > 0 {
             return Ok(true); // 成功更新过期锁
@@ -5189,6 +5222,92 @@ impl SqlMemoryStore {
         .await
         .map_err(db_err)?;
         Ok(count > 0)
+    }
+
+    /// Run `action` while this holder keeps the lock row locked.
+    ///
+    /// The statement is polled only after `FOR UPDATE` confirms ownership. The
+    /// row lock stays until `action` returns, so another acquire cannot commit
+    /// over an in-flight statement. The future is not polled when this holder
+    /// no longer owns the row.
+    pub async fn run_with_holder_lock<F>(
+        &self,
+        key: &str,
+        holder: &str,
+        ttl_secs: i64,
+        action: F,
+    ) -> Result<u64, MemoriaError>
+    where
+        F: Future<Output = Result<u64, MemoriaError>> + Send,
+    {
+        if let Some(url) = &self.database_url {
+            let mut conn = sqlx::mysql::MySqlConnection::connect(url)
+                .await
+                .map_err(db_err)?;
+            return self
+                .run_with_holder_lock_on(&mut conn, key, holder, ttl_secs, action)
+                .await;
+        }
+        let mut conn = self.conn().await?;
+        self.run_with_holder_lock_on(&mut *conn, key, holder, ttl_secs, action)
+            .await
+    }
+
+    async fn run_with_holder_lock_on<C, F>(
+        &self,
+        conn: &mut C,
+        key: &str,
+        holder: &str,
+        ttl_secs: i64,
+        action: F,
+    ) -> Result<u64, MemoriaError>
+    where
+        C: sqlx::Connection<Database = sqlx::MySql>,
+        F: Future<Output = Result<u64, MemoriaError>> + Send,
+    {
+        let mut tx = conn.begin().await.map_err(db_err)?;
+        let lock_table = self.t("mem_distributed_locks");
+        let owned = sqlx::query(&format!(
+            "SELECT holder_id FROM {lock_table} WHERE lock_key = ? AND holder_id = ? FOR UPDATE"
+        ))
+        .bind(key)
+        .bind(holder)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if owned.is_none() {
+            let _ = tx.rollback().await;
+            return Err(MemoriaError::Internal(
+                "memory erase lost its lock before completion".into(),
+            ));
+        }
+        let result = action.await;
+        let expires_at =
+            chrono::Utc::now().naive_utc() + chrono::Duration::seconds(ttl_secs.max(1));
+        let extended = sqlx::query(&format!(
+            "UPDATE {lock_table} SET expires_at = ? WHERE lock_key = ? AND holder_id = ?"
+        ))
+        .bind(expires_at)
+        .bind(key)
+        .bind(holder)
+        .execute(&mut *tx)
+        .await;
+        if let Err(error) = extended {
+            let _ = tx.rollback().await;
+            return match result {
+                Err(action_error) => Err(action_error),
+                Ok(_) => Err(db_err(error)),
+            };
+        }
+        match tx.commit().await {
+            Ok(_) => result,
+            Err(_) => match result {
+                Err(action_error) => Err(action_error),
+                Ok(_) => Err(MemoriaError::Internal(
+                    "memory erase lost its lock before completion".into(),
+                )),
+            },
+        }
     }
 
     /// Release a lock held by this instance.
