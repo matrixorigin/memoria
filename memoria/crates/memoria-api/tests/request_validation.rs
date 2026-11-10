@@ -151,13 +151,21 @@ fn structured_query_cursor_shape() {
             .as_deref(),
         Some(good)
     );
+    // Omitted and null cursors select page one.
     assert_eq!(
-        structured(json!({"session_id": "s", "cursor": "  "}))
+        structured(json!({"session_id": "s"})).unwrap().cursor,
+        None
+    );
+    assert_eq!(
+        structured(json!({"session_id": "s", "cursor": null}))
             .unwrap()
             .cursor,
         None
     );
+    // An explicitly blank cursor is rejected rather than restarting at page one (#370).
     for bad in [
+        "",
+        "  ",
         "abc",
         "0123456789abcdef0123456789abcdeg",
         "0123456789abcdef0123456789abcdef0",
