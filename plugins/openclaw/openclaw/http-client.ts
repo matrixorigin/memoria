@@ -168,8 +168,15 @@ export class MemoriaHttpTransport {
         : `limit=${pageSize}`;
       const data = await this.get(`/v1/memories?${query}${typeFilter}`);
       const rec = this.asRecord(data);
-      const pageItems = Array.isArray(rec?.items) ? rec!.items : Array.isArray(data) ? data : [];
-      const next = typeof rec?.next_cursor === "string" && rec.next_cursor ? rec.next_cursor : null;
+      const pageItems = Array.isArray(rec?.items) ? rec!.items : Array.isArray(data) ? data : null;
+      if (pageItems === null) {
+        throw new Error("Invalid Memoria API list page: expected an items array");
+      }
+      const rawCursor = rec?.next_cursor;
+      if (rawCursor !== null && rawCursor !== undefined && typeof rawCursor !== "string") {
+        throw new Error("Invalid Memoria API list page: next_cursor must be a string or null");
+      }
+      const next = typeof rawCursor === "string" && rawCursor ? rawCursor : null;
       // A cursor that does not advance means the server repeated a page: drop it
       // so rows are not counted twice, and stop so a misbehaving server cannot
       // loop us. The leftover cursor still marks the result as incomplete.
@@ -520,6 +527,9 @@ export class MemoriaHttpTransport {
       if (Array.isArray(rec.branches)) branches = rec.branches;
       else if (Array.isArray(rec.items)) branches = rec.items;
       else if (typeof rec.result === "string") return rec.result as string;
+      else throw new Error("Invalid Memoria API branch list response: expected branches/items array");
+    } else {
+      throw new Error("Invalid Memoria API branch list response: expected branches/items array");
     }
     if (branches.length === 0) {
       return "Branches:\n  main ← active";

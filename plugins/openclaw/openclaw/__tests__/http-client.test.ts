@@ -118,8 +118,10 @@ describe("Group 3: Cloud API Communication", () => {
       it(`${id} ${tool} → ${method} ${pathPattern.source}`, async () => {
         fetchMock.respondWith(200, tool === "memory_store"
           ? { memory_id: "new-id", content: args.content ?? "" }
-          : tool.includes("retrieve") || tool.includes("search") || tool === "memory_list"
-            ? { results: [] }
+          : tool === "memory_list"
+            ? { items: [] }
+            : tool.includes("retrieve") || tool.includes("search")
+              ? { results: [] }
             : tool === "memory_profile"
               ? { profile: "test" }
               : tool === "memory_purge"
@@ -319,6 +321,31 @@ describe("Group 3: Cloud API Communication", () => {
       fetchMock.respondWith(200, { branches: [] });
       const result = await transport.callTool("memory_branches", {}) as any;
       expect(result.content[0].text).toContain("main ← active");
+    });
+
+    it.each([
+      ["null body", null],
+      ["empty object", {}],
+      ["upstream error", { error: "service failed" }],
+      ["null branches", { branches: null }],
+      ["unexpected text", "not a branch list"],
+      ["number", 42],
+    ])("3.45a memory_branches rejects malformed %s", async (_name, response) => {
+      fetchMock.respondWith(200, response);
+      await expect(transport.callTool("memory_branches", {}))
+        .rejects.toThrow(/invalid memoria api branch list response/i);
+    });
+
+    it("3.45b memory_branches preserves items envelope", async () => {
+      fetchMock.respondWith(200, { items: [{ name: "testing", active: true }] });
+      const result = await transport.callTool("memory_branches", {}) as any;
+      expect(result.content[0].text).toContain("testing ← active");
+    });
+
+    it("3.45c memory_branches preserves legacy text envelope", async () => {
+      fetchMock.respondWith(200, { result: "Branches:\n  legacy ← active" });
+      const result = await transport.callTool("memory_branches", {}) as any;
+      expect(result.content[0].text).toBe("Branches:\n  legacy ← active");
     });
   });
 
