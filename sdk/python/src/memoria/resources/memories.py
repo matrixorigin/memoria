@@ -9,7 +9,14 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 from ..exceptions import MemoriaResponseError, MemoriaValidationError
-from ..models import DisabledMemoryPage, EraseResult, Memory, MemoryPage, PurgeResult, RetrieveResult
+from ..models import (
+    DisabledMemoryPage,
+    EraseResult,
+    Memory,
+    MemoryPage,
+    PurgeResult,
+    RetrieveResult,
+)
 
 if TYPE_CHECKING:
     from .._http import _HttpTransport

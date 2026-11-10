@@ -1248,7 +1248,9 @@ fn refresh_holder_lock_sql(lock_table: &str) -> String {
 
 fn lock_acquire_blocked(error: &sqlx::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
-    message.contains("lock wait") || message.contains("write conflict") || message.contains("write-write")
+    message.contains("lock wait")
+        || message.contains("write conflict")
+        || message.contains("write-write")
 }
 
 fn group_snapshots_retained(account_snapshots_remain: bool) -> bool {
@@ -1262,7 +1264,12 @@ fn unreferenced_entity_delete_sql(entities: &str, links: &str) -> String {
     )
 }
 
-fn subject_graph_edge_delete_sql(edges: &str, nodes: &str, source: &str, predicate: &str) -> String {
+fn subject_graph_edge_delete_sql(
+    edges: &str,
+    nodes: &str,
+    source: &str,
+    predicate: &str,
+) -> String {
     format!(
         "DELETE FROM {edges} WHERE user_id = ? AND (source_id IN (\
          SELECT node_id FROM {nodes} WHERE memory_id IN (\
@@ -1322,11 +1329,17 @@ mod erase_scope_tests {
         assert!(sql.contains("connector_id"));
         assert_eq!(sql.matches('?').count(), edge_binds.len());
         assert_eq!(
-            edge_binds.iter().filter(|bind| bind.as_str() == "subject-a").count(),
+            edge_binds
+                .iter()
+                .filter(|bind| bind.as_str() == "subject-a")
+                .count(),
             2
         );
         assert_eq!(
-            edge_binds.iter().filter(|bind| bind.as_str() == "connector-a").count(),
+            edge_binds
+                .iter()
+                .filter(|bind| bind.as_str() == "connector-a")
+                .count(),
             2
         );
     }
@@ -1483,15 +1496,7 @@ impl EraseLockConnection {
     {
         let mut conn = self.conn.lock().await;
         self.store
-            .run_with_holder_lock_on(
-                &mut *conn,
-                key,
-                holder,
-                ttl_secs,
-                stop_steps,
-                lost,
-                action,
-            )
+            .run_with_holder_lock_on(&mut *conn, key, holder, ttl_secs, stop_steps, lost, action)
             .await
     }
 }
@@ -5254,7 +5259,13 @@ impl SqlMemoryStore {
 
         let memory_tables = self.erase_memory_tables(user_id).await?;
         report.stats = self
-            .delete_memory_id_rows(gate, "mem_memories_stats", &memory_tables, &predicate, &binds)
+            .delete_memory_id_rows(
+                gate,
+                "mem_memories_stats",
+                &memory_tables,
+                &predicate,
+                &binds,
+            )
             .await?;
         report.feedback = self
             .delete_scoped_or_linked(
@@ -5267,10 +5278,24 @@ impl SqlMemoryStore {
             )
             .await?;
         report.edit_log = self
-            .delete_scoped_or_linked(gate, "mem_edit_log", &memory_tables, &predicate, &binds, selector)
+            .delete_scoped_or_linked(
+                gate,
+                "mem_edit_log",
+                &memory_tables,
+                &predicate,
+                &binds,
+                selector,
+            )
             .await?;
         report.entity_links = self
-            .delete_scoped_or_linked(gate, "mem_entity_links", &memory_tables, &predicate, &binds, selector)
+            .delete_scoped_or_linked(
+                gate,
+                "mem_entity_links",
+                &memory_tables,
+                &predicate,
+                &binds,
+                selector,
+            )
             .await?;
         report.memory_entity_links = self
             .delete_scoped_or_linked(
@@ -5321,7 +5346,10 @@ impl SqlMemoryStore {
         for table in &memory_tables {
             let deleted = run_gated_erase_step(
                 gate,
-                self.owned_delete(format!("DELETE FROM {table} WHERE {predicate}"), binds.clone()),
+                self.owned_delete(
+                    format!("DELETE FROM {table} WHERE {predicate}"),
+                    binds.clone(),
+                ),
             )
             .await?;
             if table.ends_with("mem_memories") || table == "mem_memories" {
@@ -5388,9 +5416,7 @@ impl SqlMemoryStore {
                 continue;
             }
             if !is_safe_sql_identifier(&table_name) {
-                return Err(MemoriaError::Internal(
-                    "unsafe branch table name".into(),
-                ));
+                return Err(MemoriaError::Internal("unsafe branch table name".into()));
             }
             let qualified = self.t(&table_name);
             if !tables.contains(&qualified) {
@@ -5546,7 +5572,10 @@ impl SqlMemoryStore {
         }
     }
 
-    async fn safety_snapshots_with_prefix_exist(&self, prefix: String) -> Result<bool, MemoriaError> {
+    async fn safety_snapshots_with_prefix_exist(
+        &self,
+        prefix: String,
+    ) -> Result<bool, MemoriaError> {
         let rows: Vec<(String,)> = sqlx::query_as(&format!(
             "SELECT sname FROM mo_catalog.mo_snapshots WHERE {SNAPSHOT_NAME_PREFIX_MATCH} LIMIT 1",
         ))
@@ -5782,7 +5811,11 @@ impl SqlMemoryStore {
     }
 
     /// Release a lock only when `holder_id` still owns it.
-    pub async fn release_lock_holder(&self, key: &str, holder_id: &str) -> Result<bool, MemoriaError> {
+    pub async fn release_lock_holder(
+        &self,
+        key: &str,
+        holder_id: &str,
+    ) -> Result<bool, MemoriaError> {
         let mut conn = self.conn().await?;
         let lock_table = self.t("mem_distributed_locks");
         let result = sqlx::query(&format!(
@@ -8942,7 +8975,10 @@ mod tests {
         let result = store
             .replace_memory_atomically("mem_memories", &original, &replacement)
             .await;
-        assert!(matches!(result, Err(memoria_core::MemoriaError::Blocked(_))));
+        assert!(matches!(
+            result,
+            Err(memoria_core::MemoriaError::Blocked(_))
+        ));
         store.erase_barrier().unseal("owner");
     }
 

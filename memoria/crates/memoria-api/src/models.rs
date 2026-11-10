@@ -991,7 +991,10 @@ mod tests {
             subject_id: Some("consumer".into()),
             connector_id: None,
         };
-        assert_eq!(subject.selector().unwrap().subject_id.as_deref(), Some("consumer"));
+        assert_eq!(
+            subject.selector().unwrap().subject_id.as_deref(),
+            Some("consumer")
+        );
 
         let mismatched = EraseRequest {
             mode: "group".into(),
