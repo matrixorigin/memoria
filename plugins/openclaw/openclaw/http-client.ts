@@ -313,6 +313,11 @@ export class MemoriaHttpTransport {
         if (page === 0) return this.formatSnapshotList(data);
         throw new Error("Memoria snapshot listing returned a malformed page");
       }
+      // Missing metadata is supported for legacy unpaginated responses, but
+      // invalid metadata must not turn a truncated scan into a complete list.
+      if (rec.has_more !== undefined && typeof rec.has_more !== "boolean") {
+        throw new Error("Memoria snapshot listing returned invalid has_more");
+      }
       const items = rec.snapshots;
       snapshots.push(...items);
       if (rec.has_more !== true) return this.formatSnapshotList({ snapshots });

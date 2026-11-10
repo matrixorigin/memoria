@@ -26,3 +26,19 @@ describe.each([{}, { limit: 20, offset: 0 }])("snapshot response validation %j",
     },
   );
 });
+
+describe("snapshot discovery pagination metadata", () => {
+  it.each(["true", "false", 1, 0, null, {}, []])("rejects invalid has_more %j on every page", async (has_more) => {
+    for (const later of [false, true]) {
+      const mock = mockFetch();
+      mock.respondWithHandler((url) => ({ status: 200, body: {
+        snapshots: [{ name: "release", timestamp: "2026-11-10T00:00:00Z" }],
+        has_more: later && new URL(url).searchParams.get("offset") === "0" ? true : has_more,
+      } }));
+      const transport = new MemoriaHttpTransport(buildApiConfig(), "user");
+      await expect(transport.callTool("memory_snapshots", {}))
+        .rejects.toThrow("Memoria snapshot listing returned invalid has_more");
+      expect(mock.calls).toHaveLength(later ? 2 : 1);
+    }
+  });
+});
