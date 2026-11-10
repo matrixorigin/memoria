@@ -722,3 +722,178 @@ async fn test_flush_edit_log_drains_in_memory_buffer() {
     assert_eq!(drained[0].reason, "store_memory");
     println!("✅ flush_edit_log_drains_in_memory_buffer");
 }
+
+// Content filtering remains default-on; only trusted inline owner work opts out.
+#[tokio::test]
+async fn content_filter_override_preserves_store_correct_batch_and_observe_content() {
+    use memoria_service::content_filter::with_content_filter_scope;
+    let svc = make_service();
+    let text = "The standard bearer carried the flag. Contact person@example.com.";
+    let blocked = svc
+        .store_memory(
+            "owner-a",
+            text,
+            MemoryType::Semantic,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert!(matches!(blocked, Err(MemoriaError::Blocked(_))));
+
+    with_content_filter_scope(Some("owner-a".into()), async {
+        let stored = svc
+            .store_memory(
+                "owner-a",
+                text,
+                MemoryType::Semantic,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.content, text);
+        assert_eq!(
+            svc.get(&stored.memory_id).await.unwrap().unwrap().content,
+            text
+        );
+        let corrected_text = "The standard bearer returned. Contact updated@example.com.";
+        let corrected = svc
+            .correct("owner-a", &stored.memory_id, corrected_text)
+            .await
+            .unwrap();
+        assert_eq!(corrected.content, corrected_text);
+        let batch = svc
+            .store_batch(
+                "owner-a",
+                vec![(text.into(), MemoryType::Semantic, None, None, None)],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch[0].content, text);
+        let (observed, _) = svc
+            .observe_turn(
+                "owner-a",
+                &[serde_json::json!({"role":"user", "content":text})],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!observed.is_empty());
+        assert_eq!(observed[0].content, text);
+        let other = svc
+            .store_memory(
+                "owner-b",
+                text,
+                MemoryType::Semantic,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(matches!(other, Err(MemoriaError::Blocked(_))));
+        let too_large = svc
+            .store_memory(
+                "owner-a",
+                &"x".repeat(32769),
+                MemoryType::Semantic,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(matches!(too_large, Err(MemoriaError::Validation(_))));
+    })
+    .await;
+
+    let still_blocked = svc
+        .store_memory(
+            "owner-a",
+            text,
+            MemoryType::Semantic,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert!(matches!(still_blocked, Err(MemoriaError::Blocked(_))));
+    let normal = svc
+        .store_memory(
+            "owner-b",
+            "Contact person@example.com.",
+            MemoryType::Semantic,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(normal.content, "Contact [email].");
+}
+
+#[tokio::test]
+async fn content_filter_override_applies_to_llm_candidates_and_pipeline() {
+    use memoria_service::{content_filter::with_content_filter_scope, MemoryPipeline};
+    let text = "The standard bearer carried the flag. Contact person@example.com.";
+    let (llm, _shutdown) = memoria_test_utils::spawn_fake_llm(vec![(
+        "Remember the project contact.",
+        serde_json::json!([{"type":"semantic", "content":text, "confidence":0.8}]),
+    )])
+    .await;
+    let mut svc = make_service();
+    svc.llm = Some(llm);
+    let svc = Arc::new(svc);
+    with_content_filter_scope(Some("owner-a".into()), async {
+        let (observed, has_llm) = svc
+            .observe_turn(
+                "owner-a",
+                &[serde_json::json!({"role":"user", "content":"Remember the project contact."})],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(has_llm);
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].content, text);
+        let pipeline = MemoryPipeline::new(svc.clone(), None);
+        let result = pipeline
+            .run(
+                "owner-a",
+                vec![(text.into(), MemoryType::Semantic, None)],
+                None,
+            )
+            .await;
+        assert_eq!(result.memories_rejected, 0);
+        assert_eq!(result.memories_redacted, 0);
+        assert!(result.errors.is_empty());
+        let result = pipeline
+            .run(
+                "owner-b",
+                vec![(text.into(), MemoryType::Semantic, None)],
+                None,
+            )
+            .await;
+        assert_eq!(result.memories_rejected, 1);
+    })
+    .await;
+}

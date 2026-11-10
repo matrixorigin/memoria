@@ -71,6 +71,59 @@ function serveMemories(f: ReturnType<typeof mockFetch>, total: number) {
 
 describe("listMemories cursor pagination", () => {
   it.each([
+    ["null", null],
+    ["empty object", {}],
+    ["error envelope", { error: "upstream failed" }],
+    ["null items", { items: null }],
+    ["unexpected text", "invalid"],
+    ["unexpected number", 42],
+    ["non-string cursor", { items: [], next_cursor: 42 }],
+    ["empty response", ""],
+  ])("rejects malformed successful list pages: %s", async (_case, response) => {
+    const f = mockFetch();
+    f.respondWith(200, response);
+    const client = new MemoriaClient(buildApiConfig());
+    try {
+      await expect(client.listMemories({ userId: "u", limit: 10 }))
+        .rejects.toThrow(/invalid memoria api list page/i);
+    } finally {
+      client.close();
+    }
+  });
+
+  it("rejects malformed later pages instead of returning an incomplete list as complete", async () => {
+    const f = mockFetch();
+    const id = memoryId(0);
+    f.respondWithHandler((url) => ({
+      status: 200,
+      body: new URL(url).searchParams.has("cursor")
+        ? { error: "unexpected page" }
+        : { items: [{ memory_id: id, content: "first", memory_type: "semantic" }], next_cursor: id },
+    }));
+    const client = new MemoriaClient(buildApiConfig());
+    try {
+      await expect(client.listMemories({ userId: "u", limit: 10 }))
+        .rejects.toThrow(/invalid memoria api list page/i);
+      expect(f.calls).toHaveLength(2);
+    } finally {
+      client.close();
+    }
+  });
+
+  it("preserves legacy array-only list responses", async () => {
+    const f = mockFetch();
+    f.respondWith(200, [{ memory_id: memoryId(0), content: "first", memory_type: "semantic" }]);
+    const client = new MemoriaClient(buildApiConfig());
+    try {
+      const result = await client.listMemories({ userId: "u", limit: 10 });
+      expect(result.items.map((item) => item.memory_id)).toEqual([memoryId(0)]);
+      expect(result.partial).toBe(false);
+    } finally {
+      client.close();
+    }
+  });
+
+  it.each([
     { limit: 1, pages: 1, ids: [2], partial: true },
     { limit: 3, pages: 2, ids: [2, 3, 4], partial: false },
   ])("filters by type before applying the API page budget: $limit rows", async ({ limit, pages, ids, partial }) => {

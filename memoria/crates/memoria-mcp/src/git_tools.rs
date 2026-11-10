@@ -941,6 +941,14 @@ pub async fn call(
         }
 
         GitToolCallName::MemorySnapshotDelete => {
+            if args["prefix"]
+                .as_str()
+                .is_some_and(|prefix| prefix.trim().is_empty())
+            {
+                return Ok(crate::tool_result::error(
+                    "Snapshot prefix must not be blank",
+                ));
+            }
             let sql = snapshot_store(svc, user_id).await?;
             let git = git_for_store(&sql)?;
             let snaps = visible_snapshots_for_user(svc, user_id).await?;
@@ -2565,6 +2573,43 @@ fn parse_apply_updates(args: &Value) -> Result<Vec<memoria_git::ApplyUpdatePair>
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn snapshot_delete_rejects_blank_prefix_before_storage() {
+        use std::sync::Arc;
+
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://test:test@127.0.0.1/test")
+            .unwrap();
+        let store = Arc::new(memoria_storage::SqlMemoryStore::new(
+            pool.clone(),
+            3,
+            "test".into(),
+        ));
+        let service = Arc::new(memoria_service::MemoryService::new(store, None, None));
+        let git = Arc::new(memoria_git::GitForDataService::new(pool, "test"));
+        for args in [
+            serde_json::json!({"prefix": ""}),
+            serde_json::json!({"prefix": " "}),
+            serde_json::json!({"prefix": "\t\n"}),
+            serde_json::json!({"prefix": "\u{2003}"}),
+            serde_json::json!({"prefix": "", "names": "test"}),
+        ] {
+            let result = super::call(
+                "memory_snapshot_delete",
+                args.clone(),
+                &git,
+                &service,
+                "test",
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["isError"], true, "args: {args:?}");
+            assert!(result
+                .to_string()
+                .contains("Snapshot prefix must not be blank"));
+        }
+    }
+
     #[test]
     fn branch_suffix_is_ascii_without_changing_unicode_snapshot_names() {
         for name in ["实验", "café", "分支 / 测试", "🚀"] {

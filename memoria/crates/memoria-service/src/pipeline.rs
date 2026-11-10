@@ -9,11 +9,11 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use memoria_core::{check_sensitivity, Memory, MemoryType, TrustTier};
+use memoria_core::{Memory, MemoryType, TrustTier};
 use memoria_git::GitForDataService;
 use uuid::Uuid;
 
-use crate::MemoryService;
+use crate::{content_filter::check_content_sensitivity, MemoryService};
 
 #[derive(Debug, Default, serde::Serialize)]
 pub struct PipelineResult {
@@ -53,7 +53,7 @@ impl MemoryPipeline {
 
         // Phase 1: Sensitivity filter
         for (content, mtype, tier) in candidates {
-            let sensitivity = check_sensitivity(&content);
+            let sensitivity = check_content_sensitivity(user_id, &content);
             if sensitivity.blocked {
                 result.memories_rejected += 1;
                 result

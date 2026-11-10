@@ -25,6 +25,13 @@ def _snapshot_path(name: str, suffix: str = "") -> str:
     return f"/v1/snapshots/{encoded}{suffix}"
 
 
+def _validate_delete_prefix(prefix: str | None) -> None:
+    # The API implements prefix deletion with starts_with(). An empty prefix
+    # therefore matches every visible snapshot instead of acting as a no-op.
+    if prefix is not None and not prefix.strip():
+        raise MemoriaValidationError("delete: prefix must not be empty")
+
+
 class SnapshotsResource:
     def __init__(self, client: _HttpTransport) -> None:
         self._client = client
@@ -67,6 +74,7 @@ class SnapshotsResource:
         Ambiguous failures are not retried by default: a snapshot can be
         recreated with the same name before the client retries.
         """
+        _validate_delete_prefix(prefix)
         selectors = sum(
             [
                 1 if name is not None else 0,
@@ -125,6 +133,7 @@ class AsyncSnapshotsResource:
         older_than: str | None = None,
     ) -> None:
         """Delete snapshots; ambiguous failures are not retried by default."""
+        _validate_delete_prefix(prefix)
         selectors = sum(
             [
                 1 if name is not None else 0,
