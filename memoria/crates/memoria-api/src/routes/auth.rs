@@ -11,8 +11,8 @@ use sqlx::Row;
 
 use crate::{
     auth::{
-        is_reserved_group_id, parse_scopes, AuthUser, DEFAULT_API_KEY_SCOPES,
-        SCOPE_IDENTITY_READ, SCOPE_KEYS_MANAGE, SCOPE_MEMORY_READ, SCOPE_MEMORY_WRITE,
+        is_reserved_group_id, parse_scopes, AuthUser, DEFAULT_API_KEY_SCOPES, SCOPE_IDENTITY_READ,
+        SCOPE_KEYS_MANAGE, SCOPE_MEMORY_READ, SCOPE_MEMORY_SQL, SCOPE_MEMORY_WRITE,
     },
     routes::memory::api_err,
     state::AppState,
@@ -47,6 +47,7 @@ fn normalize_scopes(requested: Option<Vec<String>>) -> Result<Vec<String>, (Stat
         SCOPE_IDENTITY_READ,
         SCOPE_MEMORY_READ,
         SCOPE_MEMORY_WRITE,
+        SCOPE_MEMORY_SQL,
         SCOPE_KEYS_MANAGE,
     ];
     if let Some(scope) = requested
@@ -187,6 +188,12 @@ pub async fn create_key(
     auth.require_scope(SCOPE_KEYS_MANAGE)?;
     let pool = auth_pool(&state)?;
     let scopes = normalize_scopes(req.scopes.clone())?;
+    if scopes.iter().any(|scope| scope == SCOPE_MEMORY_SQL) && !auth.has_scope(SCOPE_MEMORY_SQL) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "The caller cannot grant the memory SQL scope".into(),
+        ));
+    }
     let scopes_csv = scopes.join(",");
 
     match req.group_id.as_deref() {

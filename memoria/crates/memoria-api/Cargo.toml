@@ -44,6 +44,7 @@ tempfile = "3.14"
 moka = { version = "0.12", features = ["future", "sync"] }
 
 [dev-dependencies]
+hmac = "0.12"
 tokio = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }

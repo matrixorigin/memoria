@@ -8,9 +8,87 @@ use tracing::warn;
 use crate::{
     auth::{group_main_write_allowed_for_solo_owner, AuthUser},
     models::*,
-    routes::memory::api_err,
+    routes::memory::{api_err, api_err_typed},
     state::AppState,
 };
+
+pub async fn get_confidence_policy(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> Result<Json<memoria_core::ConfidenceDecayPolicy>, (StatusCode, String)> {
+    let store = state.service.shared_sql_store().map_err(api_err_typed)?;
+    Ok(Json(
+        store
+            .confidence_policy(auth.scope_id())
+            .await
+            .map_err(api_err_typed)?,
+    ))
+}
+
+pub async fn set_confidence_policy(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(policy): Json<memoria_core::ConfidenceDecayPolicy>,
+) -> Result<Json<memoria_core::ConfidenceDecayPolicy>, (StatusCode, String)> {
+    if let Some(group) = auth.group_id.as_deref() {
+        if !group_main_write_allowed_for_solo_owner(&state, group, &auth.user_id).await {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "confidence lifecycle requires the group owner".into(),
+            ));
+        }
+    }
+    policy.validate().map_err(api_err_typed)?;
+    let store = state.service.shared_sql_store().map_err(api_err_typed)?;
+    store
+        .set_confidence_policy(auth.scope_id(), &policy)
+        .await
+        .map_err(api_err_typed)?;
+    Ok(Json(policy))
+}
+
+#[derive(serde::Deserialize)]
+pub struct ConfidenceInactiveQuery {
+    subject_id: String,
+    cursor: Option<String>,
+    limit: Option<i64>,
+}
+
+pub async fn list_confidence_inactive(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    axum::extract::Query(query): axum::extract::Query<ConfidenceInactiveQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let limit = query.limit.unwrap_or(100);
+    let cursor = query.cursor.as_deref().unwrap_or("");
+    if query.subject_id.trim().is_empty()
+        || query.subject_id.len() > 128
+        || cursor.len() > 128
+        || !(1..=500).contains(&limit)
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid inactive memory query".into(),
+        ));
+    }
+    let store = state
+        .service
+        .user_sql_store(auth.scope_id())
+        .await
+        .map_err(api_err_typed)?;
+    let mut items = store
+        .list_confidence_inactive(auth.scope_id(), &query.subject_id, cursor, limit + 1)
+        .await
+        .map_err(api_err_typed)?;
+    let next = if items.len() > limit as usize {
+        items.truncate(limit as usize);
+        items.last().map(|m| m.memory_id.clone())
+    } else {
+        None
+    };
+    let items: Vec<MemoryResponse> = items.into_iter().map(Into::into).collect();
+    Ok(Json(json!({"items": items, "next_cursor": next})))
+}
 
 pub async fn governance(
     State(state): State<AppState>,

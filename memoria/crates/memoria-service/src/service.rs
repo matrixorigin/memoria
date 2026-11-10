@@ -2,7 +2,7 @@ use crate::content_filter::check_content_sensitivity;
 use chrono::{DateTime, Utc};
 use memoria_core::{
     interfaces::{EmbeddingProvider, MemoryStore},
-    MemoriaError, Memory, MemoryType, TrustTier,
+    MemoriaError, Memory, MemoryFilter, MemoryType, TrustTier,
 };
 use memoria_embedding::llm::ChatMessage;
 use memoria_embedding::LlmClient;
@@ -115,7 +115,7 @@ fn validate_observed_at(observed_at: Option<DateTime<Utc>>) -> Result<(), Memori
 }
 
 /// Extra retrieval controls that must be threaded through the full retrieval pipeline.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RetrieveOptions {
     session_id: Option<String>,
     session_scope: SessionScope,
@@ -123,6 +123,7 @@ pub struct RetrieveOptions {
     subject_id: Option<String>,
     /// Restrict results to these memory types. Empty/None means no type filter.
     memory_types: Option<Vec<MemoryType>>,
+    filter: MemoryFilter,
 }
 
 impl RetrieveOptions {
@@ -135,6 +136,7 @@ impl RetrieveOptions {
             session_scope: session_scope.unwrap_or(SessionScope::Prefer),
             subject_id: None,
             memory_types: None,
+            filter: MemoryFilter::default(),
         }
     }
 
@@ -146,6 +148,15 @@ impl RetrieveOptions {
     pub fn with_memory_types(mut self, memory_types: Option<Vec<MemoryType>>) -> Self {
         self.memory_types = memory_types.filter(|v| !v.is_empty());
         self
+    }
+
+    pub fn with_filter(mut self, filter: MemoryFilter) -> Self {
+        self.filter = filter;
+        self
+    }
+
+    pub fn filter(&self) -> &MemoryFilter {
+        &self.filter
     }
 
     pub fn session_id(&self) -> Option<&str> {
@@ -189,6 +200,7 @@ pub struct ListActiveOptions<'a> {
 /// keyword, graph, or relevance-scoring work.
 #[derive(Debug, Clone)]
 pub struct StructuredQueryOptions {
+    pub filter: MemoryFilter,
     pub limit: i64,
     pub memory_types: Option<Vec<MemoryType>>,
     pub session_id: Option<String>,
@@ -203,6 +215,7 @@ pub struct StructuredQueryOptions {
 /// unscoped memories.
 #[derive(Debug, Clone)]
 pub struct FulltextSearchOptions {
+    pub filter: MemoryFilter,
     pub limit: i64,
     pub memory_types: Option<Vec<MemoryType>>,
     pub session_id: Option<String>,
@@ -1459,7 +1472,7 @@ impl MemoryService {
             let table = sql
                 .table_for_branch(user_id, Some(&resolved_branch))
                 .await?;
-            if let Some(existing) = sql.get_from(&table, &id).await? {
+            if let Some(existing) = sql.get_retry_receipt_from(&table, &id, user_id).await? {
                 return validate_idempotent_receipt(existing, user_id, &hash);
             }
             extra_metadata
@@ -1535,7 +1548,8 @@ impl MemoryService {
                     return Ok(memory);
                 }
                 Err(error) => {
-                    if let Some(existing) = sql.get_from(&table, &id).await? {
+                    if let Some(existing) = sql.get_retry_receipt_from(&table, &id, user_id).await?
+                    {
                         return validate_idempotent_receipt(existing, user_id, &hash);
                     }
                     return Err(error);
@@ -1927,7 +1941,7 @@ impl MemoryService {
         }
     }
 
-    #[tracing::instrument(skip(self), fields(user_id, top_k))]
+    #[tracing::instrument(skip(self, query, options), fields(user_id, top_k))]
     async fn retrieve_inner(
         &self,
         user_id: &str,
@@ -1937,6 +1951,12 @@ impl MemoryService {
         level: ExplainLevel,
         options: &RetrieveOptions,
     ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
+        options.filter.validate()?;
+        if self.sql_store.is_none() && !options.filter.is_empty() {
+            return Err(MemoriaError::Validation(
+                "structured retrieval filters require SQL storage".into(),
+            ));
+        }
         let total_start = std::time::Instant::now();
         let mut explain = RetrievalExplain {
             level,
@@ -1967,6 +1987,7 @@ impl MemoryService {
             if strict_session_id.is_none()
                 && subject_id.is_none()
                 && memory_types.is_none()
+                && options.filter.is_empty()
                 && table == main_table
             {
                 if let Some(ref embedding) = emb {
@@ -2065,6 +2086,7 @@ impl MemoryService {
                                     None,
                                     subject_id,
                                     memory_types,
+                                    &options.filter,
                                 )
                                 .await?;
                             explain.vector_ms = vs_start.elapsed().as_secs_f64() * 1000.0;
@@ -2142,6 +2164,7 @@ impl MemoryService {
                         strict_session_id,
                         subject_id,
                         memory_types,
+                        &options.filter,
                     )
                     .await?;
                 explain.vector_ms = vs_start.elapsed().as_secs_f64() * 1000.0;
@@ -2181,6 +2204,7 @@ impl MemoryService {
                     strict_session_id,
                     subject_id,
                     memory_types,
+                    &options.filter,
                 )
                 .await?;
             explain.fulltext_ms = ft_start.elapsed().as_secs_f64() * 1000.0;
@@ -2300,8 +2324,6 @@ impl MemoryService {
         .await
     }
 
-    // TODO(concurrency): concurrent correct on same memory_id can create duplicate
-    // new memories. Consider SELECT FOR UPDATE or optimistic locking.
     pub async fn correct(
         &self,
         user_id: &str,
@@ -2319,6 +2341,61 @@ impl MemoryService {
         memory_id: &str,
         new_content: &str,
     ) -> Result<Memory, MemoriaError> {
+        self.correct_inner(user_id, branch, memory_id, new_content, None, None, false)
+            .await
+    }
+
+    /// A correction receipt is bound to authenticated owner, explicit branch,
+    /// original memory, subject and request payload. Replays cannot insert twice.
+    #[tracing::instrument(skip_all)]
+    pub async fn correct_with_key_on_branch(
+        &self,
+        user_id: &str,
+        branch: &str,
+        memory_id: &str,
+        subject_id: &str,
+        new_content: &str,
+        key: &str,
+        omit_structured_content: bool,
+    ) -> Result<Memory, MemoriaError> {
+        if branch.trim().is_empty()
+            || branch.trim() != branch
+            || subject_id.trim().is_empty()
+            || subject_id.trim() != subject_id
+            || self.sql_store.is_none()
+        {
+            return Err(MemoriaError::Validation(
+                "an explicit branch, subject and SQL storage are required".into(),
+            ));
+        }
+        // Reject malformed retry identities before resolving/provisioning storage.
+        idempotent_memory_id(user_id, Some(branch), key)?;
+        self.correct_inner(
+            user_id,
+            Some(branch),
+            memory_id,
+            new_content,
+            Some(subject_id),
+            Some(key),
+            omit_structured_content,
+        )
+        .await
+    }
+
+    async fn correct_inner(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        memory_id: &str,
+        new_content: &str,
+        subject_id: Option<&str>,
+        key: Option<&str>,
+        omit_structured_content: bool,
+    ) -> Result<Memory, MemoriaError> {
+        let requested_content = new_content;
+        if new_content.trim().is_empty() {
+            return Err(MemoriaError::Validation("content must not be empty".into()));
+        }
         if new_content.len() > MAX_MEMORY_CONTENT_BYTES {
             return Err(MemoriaError::Validation(
                 "content exceeds 32 KiB limit".into(),
@@ -2341,13 +2418,57 @@ impl MemoryService {
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
             let table = sql.table_for_branch(user_id, branch).await?;
-            let old = sql
-                .get_from(&table, memory_id)
-                .await?
-                .filter(|memory| memory.user_id == user_id)
-                .ok_or_else(|| MemoriaError::NotFound(memory_id.to_string()))?;
+            let receipt = key
+                .map(|key| {
+                    correction_receipt(
+                        user_id,
+                        branch.expect("receipt requires explicit branch"),
+                        memory_id,
+                        subject_id.expect("receipt requires subject"),
+                        requested_content,
+                        key,
+                        omit_structured_content,
+                    )
+                })
+                .transpose()?;
+            if let Some((id, hash)) = &receipt {
+                if let Some(existing) = sql.get_retry_receipt_from(&table, id, user_id).await? {
+                    if existing.subject_id.as_deref() != subject_id {
+                        return Err(MemoriaError::NotFound("memory".into()));
+                    }
+                    return validate_idempotent_receipt(existing, user_id, hash);
+                }
+            }
+            let old = sql.get_from(&table, memory_id).await?.filter(|memory| {
+                memory.user_id == user_id
+                    && subject_id
+                        .is_none_or(|subject| memory.subject_id.as_deref() == Some(subject))
+            });
+            let Some(old) = old else {
+                // A concurrent request can commit between the receipt and old
+                // lookups. Confirm the same durable result, never invent a retry.
+                if let Some((id, hash)) = &receipt {
+                    if let Some(existing) = sql.get_retry_receipt_from(&table, id, user_id).await? {
+                        if existing.subject_id.as_deref() != subject_id {
+                            return Err(MemoriaError::NotFound("memory".into()));
+                        }
+                        return validate_idempotent_receipt(existing, user_id, hash);
+                    }
+                }
+                return Err(MemoriaError::NotFound("memory".into()));
+            };
 
-            let new_id = Uuid::now_v7().simple().to_string();
+            let new_id = receipt
+                .as_ref()
+                .map(|(id, _)| id.clone())
+                .unwrap_or_else(|| Uuid::now_v7().simple().to_string());
+            let mut metadata = correction_metadata(&old);
+            if let Some((_, hash)) = &receipt {
+                metadata
+                    .get_or_insert_with(HashMap::new)
+                    .insert(STORE_REQUEST_HASH_FIELD.into(), serde_json::json!(hash));
+            }
+            let metadata = without_structured_content(metadata, omit_structured_content);
             let new_mem = Memory {
                 memory_id: new_id,
                 user_id: old.user_id.clone(),
@@ -2358,7 +2479,7 @@ impl MemoryService {
                 embedding: self.embed(new_content).await?,
                 session_id: old.session_id.clone(),
                 source_event_ids: vec![format!("correct:{}", memory_id)],
-                extra_metadata: correction_metadata(&old),
+                extra_metadata: metadata,
                 observed_at: Some(Utc::now()),
                 created_at: Some(Utc::now()),
                 updated_at: None,
@@ -2370,13 +2491,19 @@ impl MemoryService {
                 subject_id: old.subject_id.clone(),
             };
 
-            sql.insert_into(&table, &new_mem).await?;
-            // Supersede + cleanup are independent — run in parallel
-            let (sup_res, _) = tokio::join!(
-                sql.supersede_memory(&table, memory_id, &new_mem.memory_id),
-                Self::cleanup_entity_data_for_memory(sql.as_ref(), memory_id, "correct"),
-            );
-            sup_res?;
+            if let Err(error) = sql.replace_memory_atomically(&table, &old, &new_mem).await {
+                // This also confirms an uncertain COMMIT acknowledgement when
+                // the exact durable receipt is already visible.
+                if let Some((id, hash)) = &receipt {
+                    if let Some(existing) = sql.get_retry_receipt_from(&table, id, user_id).await? {
+                        if existing.subject_id.as_deref() != subject_id {
+                            return Err(MemoriaError::NotFound("memory".into()));
+                        }
+                        return validate_idempotent_receipt(existing, user_id, hash);
+                    }
+                }
+                return Err(error);
+            }
 
             self.report(StatsEvent::MemoryStored {
                 user_id: user_id.to_string(),
@@ -2401,8 +2528,10 @@ impl MemoryService {
                 None,
             );
 
-            self.enqueue_entity_extraction(user_id, &new_mem.memory_id, new_content)
-                .await;
+            if table == sql.t("mem_memories") {
+                self.enqueue_entity_extraction(user_id, &new_mem.memory_id, new_content)
+                    .await;
+            }
 
             Ok(new_mem)
         } else {
@@ -2425,7 +2554,10 @@ impl MemoryService {
                 embedding: self.embed(new_content).await?,
                 session_id: old.session_id.clone(),
                 source_event_ids: vec![format!("correct:{}", memory_id)],
-                extra_metadata: correction_metadata(&old),
+                extra_metadata: without_structured_content(
+                    correction_metadata(&old),
+                    omit_structured_content,
+                ),
                 observed_at: Some(Utc::now()),
                 created_at: Some(Utc::now()),
                 updated_at: None,
@@ -2546,6 +2678,292 @@ impl MemoryService {
                 warning: None,
             })
         }
+    }
+
+    /// An owned memory in any state, fenced to `subject_id` when the caller names one.
+    async fn owned_governance_target(
+        sql: &SqlMemoryStore,
+        table: &str,
+        user_id: &str,
+        subject_id: Option<&str>,
+        memory_id: &str,
+    ) -> Result<Memory, MemoriaError> {
+        sql.get_owned_from(table, memory_id, user_id)
+            .await?
+            .filter(|memory| {
+                !memory
+                    .extra_metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.contains_key(memoria_core::ERASED_FIELD))
+            })
+            .filter(|memory| subject_id.is_none() || memory.subject_id.as_deref() == subject_id)
+            .ok_or_else(|| MemoriaError::NotFound(memory_id.to_string()))
+    }
+
+    /// Operator disable: the memory leaves retrieval but stays restorable, unlike a purge.
+    /// Its marker lets an extraction pipeline recognise the content as rejected.
+    pub async fn disable_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        subject_id: Option<&str>,
+        memory_id: &str,
+        reason: &str,
+    ) -> Result<Memory, MemoriaError> {
+        if self.sql_store.is_none() {
+            return Err(MemoriaError::Internal(
+                "memory governance requires a SQL-backed memory store".to_string(),
+            ));
+        }
+        let sql = self.user_sql_store(user_id).await?;
+        let table = sql.table_for_branch(user_id, branch).await?;
+        let mut memory =
+            Self::owned_governance_target(&sql, &table, user_id, subject_id, memory_id).await?;
+        if !memory.is_active {
+            return Err(MemoriaError::Conflict(format!(
+                "memory {memory_id} is not active"
+            )));
+        }
+        let mut metadata = memory.extra_metadata.take().unwrap_or_default();
+        metadata.insert(
+            DISABLED_FIELD.into(),
+            serde_json::json!({"at": Utc::now().to_rfc3339(), "reason": reason}),
+        );
+        if sql.disable_in(&table, &memory, &metadata).await? == 0 {
+            return Err(MemoriaError::Conflict(format!(
+                "memory {memory_id} is not active"
+            )));
+        }
+        self.send_edit_log(user_id, "disable", Some(memory_id), None, reason, None);
+        if table == sql.t("mem_memories") {
+            self.report(StatsEvent::MemoryDeactivated {
+                user_id: user_id.to_string(),
+            });
+            Self::cleanup_entity_data_for_memory(sql.as_ref(), memory_id, "disable").await;
+        }
+        Self::owned_governance_target(&sql, &table, user_id, subject_id, memory_id).await
+    }
+
+    /// Reactivate an operator-disabled memory.
+    pub async fn restore_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        subject_id: Option<&str>,
+        memory_id: &str,
+    ) -> Result<Memory, MemoriaError> {
+        if self.sql_store.is_none() {
+            return Err(MemoriaError::Internal(
+                "memory governance requires a SQL-backed memory store".to_string(),
+            ));
+        }
+        let sql = self.user_sql_store(user_id).await?;
+        let table = sql.table_for_branch(user_id, branch).await?;
+        let mut memory =
+            Self::owned_governance_target(&sql, &table, user_id, subject_id, memory_id).await?;
+        let mut metadata = memory.extra_metadata.take().unwrap_or_default();
+        if memory.is_active || metadata.remove(DISABLED_FIELD).is_none() {
+            return Err(MemoriaError::Conflict(format!(
+                "memory {memory_id} is not disabled"
+            )));
+        }
+        if sql.restore_in(&table, &memory, &metadata).await? == 0 {
+            return Err(MemoriaError::Conflict(format!(
+                "memory {memory_id} is not disabled"
+            )));
+        }
+        self.send_edit_log(user_id, "restore", Some(memory_id), None, "", None);
+        if table == sql.t("mem_memories") {
+            sql.graph_store().reactivate_by_memory_id(memory_id).await?;
+            self.report(StatsEvent::MemoryActivated {
+                user_id: user_id.to_string(),
+            });
+            self.enqueue_entity_extraction(user_id, memory_id, &memory.content)
+                .await;
+        }
+        Self::owned_governance_target(&sql, &table, user_id, subject_id, memory_id).await
+    }
+
+    /// Permanently remove one active or disabled memory. Superseded revisions belong to the
+    /// history of their successor and are not erased one by one.
+    pub async fn erase_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        subject_id: Option<&str>,
+        memory_id: &str,
+    ) -> Result<(), MemoriaError> {
+        self.erase_governance_target(user_id, branch, subject_id, memory_id, false)
+            .await
+    }
+
+    /// Retire only the exact active derived revision inspected by the caller.
+    pub async fn retire_extracted_memory(
+        &self,
+        user_id: &str,
+        subject_id: &str,
+        session_id: &str,
+        memory_id: &str,
+        expected_updated_at: DateTime<Utc>,
+    ) -> Result<bool, MemoriaError> {
+        if subject_id.trim().is_empty() || session_id.trim().is_empty() {
+            return Err(MemoriaError::Validation("cleanup scope is required".into()));
+        }
+        if self.sql_store.is_none() {
+            return Err(MemoriaError::Internal(
+                "cleanup requires SQL storage".into(),
+            ));
+        }
+        let sql = self.user_sql_store(user_id).await?;
+        let table = sql.table_for_branch(user_id, Some("main")).await?;
+        let Some(memory) = sql.get_owned_from(&table, memory_id, user_id).await? else {
+            return Ok(false);
+        };
+        if memory.subject_id.as_deref() != Some(subject_id)
+            || memory.session_id.as_deref() != Some(session_id)
+        {
+            return Err(MemoriaError::NotFound(memory_id.into()));
+        }
+        let derived = memory.extra_metadata.as_ref().is_some_and(|metadata| {
+            ["source_job_id", "connector_id"].iter().all(|key| {
+                metadata
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+            })
+        });
+        if !derived
+            || !memory.is_active
+            || memory.updated_at != Some(expected_updated_at)
+            || memory
+                .superseded_by
+                .as_deref()
+                .is_some_and(|id| !id.is_empty())
+        {
+            return Ok(false);
+        }
+        // erase_from compares the exact persisted revision again in its DML.
+        // Concurrent disable/restore/correction therefore cannot be overwritten.
+        if sql.erase_from(&table, &memory).await? == 0 {
+            return Ok(false);
+        }
+        self.send_edit_log(
+            user_id,
+            "erase",
+            Some(memory_id),
+            None,
+            "extraction cleanup",
+            None,
+        );
+        self.report(StatsEvent::MemoryDeactivated {
+            user_id: user_id.into(),
+        });
+        Self::cleanup_entity_data_for_memory(sql.as_ref(), memory_id, "erase").await;
+        Ok(true)
+    }
+
+    /// Explicit cleanup of a confidence-expired main memory, never an active record.
+    pub async fn erase_confidence_inactive(
+        &self,
+        user_id: &str,
+        subject_id: &str,
+        memory_id: &str,
+    ) -> Result<(), MemoriaError> {
+        self.erase_governance_target(user_id, Some("main"), Some(subject_id), memory_id, true)
+            .await
+    }
+
+    async fn erase_governance_target(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        subject_id: Option<&str>,
+        memory_id: &str,
+        confidence_inactive_only: bool,
+    ) -> Result<(), MemoriaError> {
+        if self.sql_store.is_none() {
+            return Err(MemoriaError::Internal(
+                "memory governance requires a SQL-backed memory store".to_string(),
+            ));
+        }
+        let sql = self.user_sql_store(user_id).await?;
+        let table = sql.table_for_branch(user_id, branch).await?;
+        let memory =
+            Self::owned_governance_target(&sql, &table, user_id, subject_id, memory_id).await?;
+        if confidence_inactive_only
+            && (memory.is_active
+                || !memory.extra_metadata.as_ref().is_some_and(|metadata| {
+                    metadata.contains_key(memoria_core::CONFIDENCE_INACTIVE_FIELD)
+                }))
+        {
+            return Err(MemoriaError::Conflict(
+                "memory is not confidence-inactive".into(),
+            ));
+        }
+        if memory
+            .superseded_by
+            .as_deref()
+            .is_some_and(|next| !next.is_empty())
+        {
+            return Err(MemoriaError::Conflict(format!(
+                "memory {memory_id} is a superseded revision"
+            )));
+        }
+        if sql.erase_from(&table, &memory).await? != 1 {
+            return Err(MemoriaError::Conflict("memory changed during erase".into()));
+        }
+        self.send_edit_log(user_id, "erase", Some(memory_id), None, "", None);
+        if memory.is_active && table == sql.t("mem_memories") {
+            self.report(StatsEvent::MemoryDeactivated {
+                user_id: user_id.to_string(),
+            });
+        }
+        if table == sql.t("mem_memories") {
+            Self::cleanup_entity_data_for_memory(sql.as_ref(), memory_id, "erase").await;
+        }
+        Ok(())
+    }
+
+    /// Operator-disabled memories, most recently disabled first.
+    pub async fn list_disabled_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        subject_id: Option<&str>,
+        limit: i64,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<Memory>, Option<String>), MemoriaError> {
+        if !(1..=500).contains(&limit) {
+            return Err(MemoriaError::Validation(
+                "disabled memory limit must be between 1 and 500".into(),
+            ));
+        }
+        if self.sql_store.is_none() {
+            return Err(MemoriaError::Internal(
+                "memory governance requires a SQL-backed memory store".to_string(),
+            ));
+        }
+        let sql = self.user_sql_store(user_id).await?;
+        let table = sql.table_for_branch(user_id, branch).await?;
+        let mut memories = sql
+            .list_disabled_from(&table, user_id, subject_id, limit + 1, cursor)
+            .await?;
+        let has_more = memories.len() > limit as usize;
+        memories.truncate(limit as usize);
+        let next_cursor = if has_more {
+            let last = memories
+                .last()
+                .ok_or_else(|| MemoriaError::Internal("missing disabled page boundary".into()))?;
+            Some(serde_json::to_string(&(
+                last.updated_at.ok_or_else(|| {
+                    MemoriaError::Internal("missing disabled memory timestamp".into())
+                })?,
+                &last.memory_id,
+            ))?)
+        } else {
+            None
+        };
+        Ok((memories, next_cursor))
     }
 
     /// Purge multiple memories by IDs with a single audit log entry.
@@ -2902,10 +3320,10 @@ impl MemoryService {
         // Normalize all string filters once at the boundary so that both the SQL
         // path and the fallback path treat "  alice  " and "" identically.
         let memory_type = options.memory_type.map(str::trim).filter(|s| !s.is_empty());
-        let session_id  = options.session_id.map(str::trim).filter(|s| !s.is_empty());
-        let trust_tier  = options.trust_tier.map(str::trim).filter(|s| !s.is_empty());
-        let subject_id  = options.subject_id.map(str::trim).filter(|s| !s.is_empty());
-        let cursor      = options.cursor.map(str::trim).filter(|s| !s.is_empty());
+        let session_id = options.session_id.map(str::trim).filter(|s| !s.is_empty());
+        let trust_tier = options.trust_tier.map(str::trim).filter(|s| !s.is_empty());
+        let subject_id = options.subject_id.map(str::trim).filter(|s| !s.is_empty());
+        let cursor = options.cursor.map(str::trim).filter(|s| !s.is_empty());
 
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
@@ -2969,6 +3387,7 @@ impl MemoryService {
                     options.cursor.as_deref(),
                     options.subject_id.as_deref(),
                     &options.extra_metadata_filter,
+                    &options.filter,
                 )
                 .await;
         }
@@ -3008,6 +3427,47 @@ impl MemoryService {
             trust_tier.as_deref(),
             options.subject_id.as_deref(),
             &options.extra_metadata_filter,
+            &options.filter,
+        )
+        .await
+    }
+
+    /// Search an externally produced query vector without embedding, fusion,
+    /// graph expansion, confidence weighting, or feedback mutations.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_query_vector_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        query_vector: &[f32],
+        top_k: i64,
+        subject_id: Option<&str>,
+        memory_types: Option<&[MemoryType]>,
+        filter: &MemoryFilter,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        if !(1..=100).contains(&top_k) {
+            return Err(MemoriaError::Validation(
+                "top_k must be between 1 and 100".into(),
+            ));
+        }
+        filter.validate()?;
+        if self.sql_store.is_none() {
+            return Err(MemoriaError::Validation(
+                "query vector search requires SQL storage".into(),
+            ));
+        }
+        let sql = self.user_sql_store(user_id).await?;
+        let table = sql.table_for_branch(user_id, branch).await?;
+        sql.search_vector_from_filtered_scoped(
+            &table,
+            user_id,
+            query_vector,
+            top_k,
+            None,
+            None,
+            subject_id,
+            memory_types,
+            filter,
         )
         .await
     }
@@ -3830,8 +4290,8 @@ mod tests {
 
     #[test]
     fn retrieve_options_with_subject_id_empty_becomes_none() {
-        let opts = RetrieveOptions::from_session_scope(None, None)
-            .with_subject_id(Some("  ".to_string()));
+        let opts =
+            RetrieveOptions::from_session_scope(None, None).with_subject_id(Some("  ".to_string()));
         assert_eq!(opts.subject_id(), None);
     }
 
@@ -3997,14 +4457,30 @@ impl MemoryService {
     }
 }
 
-use memoria_core::STORE_REQUEST_HASH_FIELD;
+use memoria_core::{is_reserved_metadata_key, DISABLED_FIELD, STORE_REQUEST_HASH_FIELD};
 
 // Business metadata belongs to the memory across content revisions. The store
-// request fingerprint certifies only the original write, not this replacement.
+// request fingerprint certifies only the original write, not this replacement,
+// and a revision is never born disabled.
 fn correction_metadata(memory: &Memory) -> Option<HashMap<String, serde_json::Value>> {
     memory.extra_metadata.as_ref().map(|metadata| {
         let mut metadata = metadata.clone();
-        metadata.remove(STORE_REQUEST_HASH_FIELD);
+        metadata.retain(|key, _| !is_reserved_metadata_key(key));
+        metadata
+    })
+}
+
+/// Drops only the business JSON copy. Identity, source and type stay on the
+/// same metadata map that the atomic replacement writes.
+fn without_structured_content(
+    metadata: Option<HashMap<String, serde_json::Value>>,
+    omit: bool,
+) -> Option<HashMap<String, serde_json::Value>> {
+    if !omit {
+        return metadata;
+    }
+    metadata.map(|mut metadata| {
+        metadata.remove("structured_content");
         metadata
     })
 }
@@ -4012,10 +4488,8 @@ fn correction_metadata(memory: &Memory) -> Option<HashMap<String, serde_json::Va
 fn reject_reserved_metadata(
     metadata: Option<&HashMap<String, serde_json::Value>>,
 ) -> Result<(), MemoriaError> {
-    if metadata.is_some_and(|metadata| metadata.contains_key(STORE_REQUEST_HASH_FIELD)) {
-        return Err(MemoriaError::Validation(
-            "reserved idempotency metadata field".into(),
-        ));
+    if metadata.is_some_and(|metadata| metadata.keys().any(|key| is_reserved_metadata_key(key))) {
+        return Err(MemoriaError::Validation("reserved metadata field".into()));
     }
     Ok(())
 }
@@ -4047,8 +4521,12 @@ fn validate_idempotent_receipt(
     owner: &str,
     request_hash: &str,
 ) -> Result<Memory, MemoriaError> {
+    if !memory.is_active {
+        return Err(MemoriaError::Conflict(
+            "idempotency_key belongs to an inactive or erased receipt".into(),
+        ));
+    }
     if memory.user_id != owner
-        || !memory.is_active
         || memory
             .extra_metadata
             .as_ref()
@@ -4056,11 +4534,41 @@ fn validate_idempotent_receipt(
             .and_then(serde_json::Value::as_str)
             != Some(request_hash)
     {
-        return Err(MemoriaError::Validation(
+        return Err(MemoriaError::Conflict(
             "idempotency_key was already used for another payload or an inactive receipt".into(),
         ));
     }
     Ok(memory)
+}
+
+fn correction_receipt(
+    owner: &str,
+    branch: &str,
+    original: &str,
+    subject: &str,
+    content: &str,
+    key: &str,
+    omit_structured_content: bool,
+) -> Result<(String, String), MemoriaError> {
+    // Validate the same public key alphabet without sharing the store's identity
+    // namespace. IDs remain canonical 32-character hex, including for cursors.
+    idempotent_memory_id(owner, Some(branch), key)?;
+    use sha2::{Digest, Sha256};
+    let identity = serde_json::json!(["memoria.correct.v1", owner, branch, original, key]);
+    let digest = Sha256::digest(serde_json::to_vec(&identity)?);
+    let mut receipt = [0_u8; 16];
+    receipt.copy_from_slice(&digest[..16]);
+    // A false flag is absent from the hash so receipts written before this
+    // field still replay. A true flag is part of the payload.
+    let payload = if omit_structured_content {
+        serde_json::json!([original, subject, content, "omit_structured_content"])
+    } else {
+        serde_json::json!([original, subject, content])
+    };
+    Ok((
+        format!("{:032x}", u128::from_be_bytes(receipt)),
+        format!("{:x}", Sha256::digest(serde_json::to_vec(&payload)?)),
+    ))
 }
 
 #[cfg(test)]
@@ -4084,6 +4592,60 @@ mod idempotency_tests {
             assert!(idempotent_memory_id("owner-a", None, key).is_err());
         }
         assert!(idempotent_memory_id("owner-a", None, &"x".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn text_correction_hash_stays_stable_until_structured_content_is_omitted() {
+        let plain = super::correction_receipt(
+            "owner", "main", "original", "subject", "content", "key", false,
+        )
+        .unwrap();
+        let replay = super::correction_receipt(
+            "owner", "main", "original", "subject", "content", "key", false,
+        )
+        .unwrap();
+        assert_eq!(plain, replay);
+        let omitted = super::correction_receipt(
+            "owner", "main", "original", "subject", "content", "key", true,
+        )
+        .unwrap();
+        assert_eq!(plain.0, omitted.0);
+        assert_ne!(plain.1, omitted.1);
+        let changed =
+            super::correction_receipt("owner", "main", "original", "subject", "other", "key", true)
+                .unwrap();
+        assert_eq!(omitted.0, changed.0);
+        assert_ne!(omitted.1, changed.1);
+    }
+
+    #[test]
+    fn omission_removes_only_the_structured_copy() {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "structured_content".into(),
+            serde_json::json!({"subject": "A"}),
+        );
+        metadata.insert(
+            "business_memory_type".into(),
+            serde_json::json!("factual_memory"),
+        );
+        metadata.insert("source_session_id".into(), serde_json::json!("session-1"));
+        let kept = super::without_structured_content(Some(metadata.clone()), false).unwrap();
+        assert!(kept.contains_key("structured_content"));
+        let revised = super::without_structured_content(Some(metadata), true).unwrap();
+        assert!(!revised.contains_key("structured_content"));
+        assert_eq!(
+            revised
+                .get("business_memory_type")
+                .and_then(|value| value.as_str()),
+            Some("factual_memory")
+        );
+        assert_eq!(
+            revised
+                .get("source_session_id")
+                .and_then(|value| value.as_str()),
+            Some("session-1")
+        );
     }
 }
 

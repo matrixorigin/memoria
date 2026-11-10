@@ -11,6 +11,33 @@ fn db_err(e: sqlx::Error) -> MemoriaError {
     MemoriaError::Database(e.to_string())
 }
 
+/// Operator lifecycle state is not a branch merge decision. Only explicit
+/// governance endpoints may restore it; selective apply must not copy it away.
+async fn protected_memory_ids<'e>(
+    executor: impl Executor<'e, Database = MySql>,
+    table: &str,
+    owner: &str,
+    ids: &[String],
+) -> Result<std::collections::HashSet<String>, MemoriaError> {
+    if ids.is_empty() {
+        return Ok(Default::default());
+    }
+    let ph = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let statement = format!("SELECT memory_id FROM {table} WHERE user_id = ? \
+        AND memory_id IN ({ph}) AND (JSON_EXTRACT(extra_metadata, '$._memoria_disabled') IS NOT NULL \
+        OR JSON_EXTRACT(extra_metadata, '$._memoria_erased') IS NOT NULL)");
+    let mut query = sqlx::query_scalar(&statement).bind(owner);
+    for id in ids {
+        query = query.bind(id);
+    }
+    Ok(query
+        .fetch_all(executor)
+        .await
+        .map_err(db_err)?
+        .into_iter()
+        .collect())
+}
+
 // A staging table is private to one restore, never registered as a user branch.
 // Drop also schedules cleanup when the request future is cancelled.
 struct RestoreStage {
@@ -1182,22 +1209,22 @@ impl GitForDataService {
         let branch_table_ref = qualified_identifier(&self.db_name, &branch_table);
         let main_table_ref = qualified_identifier(&self.db_name, &main_table);
 
-        let add_ids: Vec<String> = selection
+        let mut add_ids: Vec<String> = selection
             .adds
             .into_iter()
             .filter(|id| !id.is_empty())
             .collect();
-        let update_pairs: Vec<ApplyUpdatePair> = selection
+        let mut update_pairs: Vec<ApplyUpdatePair> = selection
             .updates
             .into_iter()
             .filter(|p| !p.old_id.is_empty() && !p.new_id.is_empty())
             .collect();
-        let remove_ids: Vec<String> = selection
+        let mut remove_ids: Vec<String> = selection
             .removes
             .into_iter()
             .filter(|id| !id.is_empty())
             .collect();
-        let conflict_ids: Vec<String> = selection
+        let mut conflict_ids: Vec<String> = selection
             .accept_branch_conflicts
             .into_iter()
             .filter(|id| !id.is_empty())
@@ -1227,6 +1254,71 @@ impl GitForDataService {
 
         let mut result = ApplyResult::default();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+
+        let mut selected_ids: Vec<String> = add_ids
+            .iter()
+            .chain(&remove_ids)
+            .chain(&conflict_ids)
+            .cloned()
+            .collect();
+        for pair in &update_pairs {
+            selected_ids.extend([pair.old_id.clone(), pair.new_id.clone()]);
+        }
+        for conflict in conflict_map.values() {
+            selected_ids.extend(conflict.main_side.superseded_by.iter().cloned());
+            selected_ids.extend(conflict.branch_side.superseded_by.iter().cloned());
+        }
+        selected_ids.sort();
+        selected_ids.dedup();
+        let mut protected =
+            protected_memory_ids(&mut *tx, &main_table_ref, user_id, &selected_ids).await?;
+        // Branch reads retain the existing MatrixOne zero-copy pool contract.
+        protected.extend(
+            protected_memory_ids(&self.pool, &branch_table_ref, user_id, &selected_ids).await?,
+        );
+        add_ids.retain(|id| {
+            if protected.contains(id) {
+                result.skipped_adds.push(id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        remove_ids.retain(|id| {
+            if protected.contains(id) {
+                result.skipped_removes.push(id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        update_pairs.retain(|pair| {
+            if protected.contains(&pair.old_id) || protected.contains(&pair.new_id) {
+                result
+                    .skipped_updates
+                    .push(format!("{}→{}", pair.old_id, pair.new_id));
+                false
+            } else {
+                true
+            }
+        });
+        conflict_ids.retain(|id| {
+            let blocked = protected.contains(id)
+                || conflict_map.get(id.as_str()).is_some_and(|conflict| {
+                    conflict
+                        .main_side
+                        .superseded_by
+                        .iter()
+                        .chain(&conflict.branch_side.superseded_by)
+                        .any(|id| protected.contains(id))
+                });
+            if blocked {
+                result.skipped_conflicts.push(id.clone());
+                false
+            } else {
+                true
+            }
+        });
 
         if !add_ids.is_empty() {
             let placeholders = add_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
@@ -1331,7 +1423,9 @@ impl GitForDataService {
                     .collect::<Vec<_>>()
                     .join(",");
                 let delete_sql = format!(
-                    "DELETE FROM {main_table_ref} WHERE user_id = ? AND memory_id IN ({ph})"
+                    "DELETE FROM {main_table_ref} WHERE user_id = ? AND memory_id IN ({ph}) \
+                     AND JSON_EXTRACT(extra_metadata, '$._memoria_disabled') IS NULL \
+                     AND JSON_EXTRACT(extra_metadata, '$._memoria_erased') IS NULL"
                 );
                 let mut q = sqlx::query(&delete_sql).bind(user_id);
                 for id in &restore_adds {
@@ -1393,7 +1487,9 @@ impl GitForDataService {
 
                 if old_exists > 0 && branch_old_exists > 0 && branch_new_exists > 0 {
                     sqlx::query(&format!(
-                        "DELETE FROM {main_table_ref} WHERE user_id = ? AND memory_id = ?"
+                        "DELETE FROM {main_table_ref} WHERE user_id = ? AND memory_id = ? \
+                         AND JSON_EXTRACT(extra_metadata, '$._memoria_disabled') IS NULL \
+                         AND JSON_EXTRACT(extra_metadata, '$._memoria_erased') IS NULL"
                     ))
                     .bind(user_id)
                     .bind(&pair.old_id)
@@ -1493,7 +1589,9 @@ impl GitForDataService {
                     .collect::<Vec<_>>()
                     .join(",");
                 let del_sql = format!(
-                    "DELETE FROM {main_table_ref} WHERE user_id = ? AND memory_id IN ({ph})"
+                    "DELETE FROM {main_table_ref} WHERE user_id = ? AND memory_id IN ({ph}) \
+                     AND JSON_EXTRACT(extra_metadata, '$._memoria_disabled') IS NULL \
+                     AND JSON_EXTRACT(extra_metadata, '$._memoria_erased') IS NULL"
                 );
                 let mut q = sqlx::query(&del_sql).bind(user_id);
                 for id in &result.applied_removes {
@@ -1584,7 +1682,9 @@ impl GitForDataService {
                 }
 
                 let del_sql = format!(
-                    "DELETE FROM {main_table_ref} WHERE user_id = ? AND memory_id IN ({main_ph})"
+                    "DELETE FROM {main_table_ref} WHERE user_id = ? AND memory_id IN ({main_ph}) \
+                     AND JSON_EXTRACT(extra_metadata, '$._memoria_disabled') IS NULL \
+                     AND JSON_EXTRACT(extra_metadata, '$._memoria_erased') IS NULL"
                 );
                 let mut q = sqlx::query(&del_sql).bind(user_id);
                 for id in &main_ids {

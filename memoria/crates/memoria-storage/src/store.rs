@@ -1,11 +1,12 @@
+use crate::filter::append_memory_filter;
 use crate::router::DbRouter;
 use async_trait::async_trait;
 use chrono::{NaiveDateTime, Utc};
 use memoria_core::{
     interfaces::MemoryStore, is_safe_sql_identifier, nullable_str, nullable_str_from_row,
-    MemoriaError, Memory, MemoryType, TrustTier,
+    MemoriaError, Memory, MemoryFilter, MemoryType, TrustTier,
 };
-use sqlx::{mysql::MySqlPool, Connection, MySql, QueryBuilder, Row};
+use sqlx::{mysql::MySqlPool, Connection, MySql, MySqlConnection, QueryBuilder, Row};
 use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
@@ -39,9 +40,9 @@ pub fn validate_extra_metadata_filter(
         )));
     }
     for (key, value) in filter {
-        if key == memoria_core::STORE_REQUEST_HASH_FIELD {
+        if memoria_core::is_reserved_metadata_key(key) {
             return Err(MemoriaError::Validation(
-                "reserved receipt metadata is not queryable".into(),
+                "reserved metadata is not queryable".into(),
             ));
         }
         let mut chars = key.chars();
@@ -2534,9 +2535,7 @@ impl SqlMemoryStore {
                      (column was added by a concurrent request): {e}"
                 ),
                 Err(e) => {
-                    tracing::error!(
-                        "migration: failed to add subject_id to {memories_table}: {e}"
-                    );
+                    tracing::error!("migration: failed to add subject_id to {memories_table}: {e}");
                     return Err(db_err(e));
                 }
             }
@@ -2882,6 +2881,8 @@ impl SqlMemoryStore {
         let schema_name = self.current_schema_name().await?;
         let schema_name = schema_name.as_ref();
         let mut conn = self.conn().await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS mem_confidence_policy (user_id VARCHAR(64) PRIMARY KEY, enabled BOOLEAN NOT NULL, half_life_days DOUBLE NOT NULL, inactive_threshold DOUBLE NOT NULL)")
+            .execute(&mut *conn).await.map_err(db_err)?;
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS mem_user_registry (
                 user_id     VARCHAR(64)  PRIMARY KEY,
@@ -4164,6 +4165,132 @@ impl SqlMemoryStore {
         Ok(())
     }
 
+    fn confidence_policy_table(&self) -> String {
+        match &self.db_router {
+            Some(router) => format!("`{}`.mem_confidence_policy", router.shared_db_name()),
+            None => "mem_confidence_policy".into(),
+        }
+    }
+
+    pub async fn confidence_policy(
+        &self,
+        scope: &str,
+    ) -> Result<memoria_core::ConfidenceDecayPolicy, MemoriaError> {
+        let row = sqlx::query(&format!(
+            "SELECT enabled, half_life_days, inactive_threshold FROM {} WHERE user_id = ?",
+            self.confidence_policy_table()
+        ))
+        .bind(scope)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let policy = match row {
+            Some(row) => memoria_core::ConfidenceDecayPolicy {
+                enabled: row.try_get::<i8, _>("enabled").map_err(db_err)? != 0,
+                half_life_days: row.try_get("half_life_days").map_err(db_err)?,
+                inactive_threshold: row.try_get("inactive_threshold").map_err(db_err)?,
+            },
+            None => memoria_core::ConfidenceDecayPolicy::default(),
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub async fn set_confidence_policy(
+        &self,
+        scope: &str,
+        policy: &memoria_core::ConfidenceDecayPolicy,
+    ) -> Result<(), MemoriaError> {
+        policy.validate()?;
+        sqlx::query(&format!("INSERT INTO {} (user_id, enabled, half_life_days, inactive_threshold) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE enabled=VALUES(enabled), half_life_days=VALUES(half_life_days), inactive_threshold=VALUES(inactive_threshold)", self.confidence_policy_table()))
+            .bind(scope).bind(policy.enabled).bind(policy.half_life_days).bind(policy.inactive_threshold)
+            .execute(&self.pool).await.map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Scoped opt-in policies include groups, unlike the personal-user registry.
+    pub async fn apply_confidence_policies(&self) -> Result<u64, MemoriaError> {
+        // Do not provision a database for a deleted scope left in the policy table.
+        let scope_clause = if self.db_router.is_some() {
+            " AND (EXISTS (SELECT 1 FROM mem_user_registry u WHERE u.user_id = p.user_id AND u.status = 'active') OR EXISTS (SELECT 1 FROM mem_groups g WHERE g.group_id = p.user_id AND g.status = 'active'))"
+        } else {
+            ""
+        };
+        let scopes: Vec<(String,)> = sqlx::query_as(&format!(
+            "SELECT p.user_id FROM {} p WHERE p.enabled = 1{scope_clause} ORDER BY p.user_id",
+            self.confidence_policy_table()
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut total = 0;
+        for (scope,) in scopes {
+            let store = match &self.db_router {
+                Some(router) => router.scope_store(&scope).await?,
+                None => Arc::new(self.clone()),
+            };
+            loop {
+                let changed = store.apply_confidence_policy(&scope).await?;
+                total += changed;
+                if changed < 500 {
+                    break;
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// Only mark inactive. Never overwrite initial confidence or delete evidence.
+    /// The policy row lock serializes this operation with policy changes.
+    pub async fn apply_confidence_policy(&self, scope: &str) -> Result<u64, MemoriaError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let row = sqlx::query(&format!("SELECT enabled, half_life_days, inactive_threshold FROM {} WHERE user_id = ? FOR UPDATE", self.confidence_policy_table()))
+            .bind(scope).fetch_optional(&mut *tx).await.map_err(db_err)?;
+        let Some(row) = row else {
+            tx.commit().await.map_err(db_err)?;
+            return Ok(0);
+        };
+        let policy = memoria_core::ConfidenceDecayPolicy {
+            enabled: row.try_get::<i8, _>("enabled").map_err(db_err)? != 0,
+            half_life_days: row.try_get("half_life_days").map_err(db_err)?,
+            inactive_threshold: row.try_get("inactive_threshold").map_err(db_err)?,
+        };
+        policy.validate()?;
+        if !policy.enabled {
+            tx.commit().await.map_err(db_err)?;
+            return Ok(0);
+        }
+        let table = self.t("mem_memories");
+        let marker = memoria_core::CONFIDENCE_INACTIVE_FIELD;
+        let now = Utc::now().naive_utc();
+        let changed = sqlx::query(&format!(
+            "UPDATE {table} SET is_active = 0, extra_metadata = JSON_SET(COALESCE(extra_metadata, JSON_OBJECT()), '$.{marker}', true), updated_at = ? \
+             WHERE user_id = ? AND is_active = 1 AND observed_at IS NOT NULL \
+             AND (superseded_by IS NULL OR superseded_by = '') \
+             AND initial_confidence * EXP(-GREATEST(0, TIMESTAMPDIFF(SECOND, observed_at, ?)) * ? / ?) < ? LIMIT 500"
+        ))
+            .bind(now).bind(scope).bind(now).bind(std::f64::consts::LN_2)
+            .bind(policy.half_life_days * 86400.0).bind(policy.inactive_threshold)
+            .execute(&mut *tx).await.map_err(db_err)?.rows_affected();
+        tx.commit().await.map_err(db_err)?;
+        Ok(changed)
+    }
+
+    /// Governance view: expired confidence values, not operator-disabled rows.
+    pub async fn list_confidence_inactive(
+        &self,
+        scope: &str,
+        subject: &str,
+        after: &str,
+        limit: i64,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        let table = self.t("mem_memories");
+        let marker = memoria_core::CONFIDENCE_INACTIVE_FIELD;
+        let rows = sqlx::query(&format!("SELECT {FULLTEXT_MEMORY_COLUMNS} FROM {table} WHERE user_id = ? AND subject_id = ? AND is_active = 0 AND memory_id > ? AND (superseded_by IS NULL OR superseded_by = '') AND JSON_EXTRACT(extra_metadata, '$.{marker}') IS NOT NULL ORDER BY memory_id LIMIT ?"))
+            .bind(scope).bind(subject).bind(after).bind(limit).fetch_all(&self.pool).await.map_err(db_err)?;
+        rows.iter().map(row_to_memory).collect()
+    }
+
     /// Quarantine memories whose effective confidence has decayed below threshold.
     /// effective_confidence = initial_confidence * EXP(-age_days / half_life)
     pub async fn quarantine_low_confidence(&self, user_id: &str) -> Result<i64, MemoriaError> {
@@ -4209,6 +4336,9 @@ impl SqlMemoryStore {
             let res = sqlx::query(&format!(
                 "DELETE FROM {memories_table} WHERE user_id = ? AND is_active = 0 \
                   AND (superseded_by IS NULL OR superseded_by = '') \
+                  AND JSON_EXTRACT(extra_metadata, '$._memoria_disabled') IS NULL \
+                  AND JSON_EXTRACT(extra_metadata, '$._memoria_erased') IS NULL \
+                  AND JSON_EXTRACT(extra_metadata, '$._memoria_confidence_inactive') IS NULL \
                   AND updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR) LIMIT 500"
             ))
             .bind(user_id)
@@ -4257,6 +4387,8 @@ impl SqlMemoryStore {
             let res = sqlx::query(&format!(
                 "DELETE FROM {memories_table} \
                  WHERE memory_type = 'tool_result' \
+                   AND JSON_EXTRACT(extra_metadata, '$._memoria_disabled') IS NULL \
+                   AND JSON_EXTRACT(extra_metadata, '$._memoria_erased') IS NULL \
                    AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > ? \
                  LIMIT 5000"
             ))
@@ -6032,6 +6164,8 @@ impl SqlMemoryStore {
         let (inactive,): (i64,) = sqlx::query_as(&format!(
             "SELECT COUNT(*) FROM {memories_table} WHERE user_id = ? AND is_active = 0 \
              AND (superseded_by IS NULL OR superseded_by = '') \
+             AND JSON_EXTRACT(extra_metadata, '$._memoria_disabled') IS NULL \
+             AND JSON_EXTRACT(extra_metadata, '$._memoria_erased') IS NULL \
              AND updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)"
         ))
         .bind(user_id)
@@ -6099,6 +6233,8 @@ impl SqlMemoryStore {
         let (inactive,): (i64,) = sqlx::query_as(&format!(
             "SELECT COUNT(*) FROM {memories_table} WHERE is_active = 0 \
              AND (superseded_by IS NULL OR superseded_by = '') \
+             AND JSON_EXTRACT(extra_metadata, '$._memoria_disabled') IS NULL \
+             AND JSON_EXTRACT(extra_metadata, '$._memoria_erased') IS NULL \
              AND updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)"
         ))
         .fetch_one(&mut *conn)
@@ -6332,10 +6468,7 @@ impl SqlMemoryStore {
         // None means the memory is not subject-scoped; only compare against
         // other unscoped rows (subject_id IS NULL).
         let subject_clause = match subject_id {
-            Some(sid) => format!(
-                " AND subject_id = '{}'",
-                sanitize_sql_literal(sid)
-            ),
+            Some(sid) => format!(" AND subject_id = '{}'", sanitize_sql_literal(sid)),
             None => " AND subject_id IS NULL".to_string(),
         };
         let sql = format!(
@@ -6395,6 +6528,205 @@ impl SqlMemoryStore {
         .await
         .map_err(db_err)?;
         Ok(res.rows_affected())
+    }
+
+    /// An owned row in any state; operator governance must see disabled rows.
+    pub async fn get_owned_from(
+        &self,
+        table: &str,
+        memory_id: &str,
+        owner: &str,
+    ) -> Result<Option<Memory>, MemoriaError> {
+        let table = self.t(table);
+        let row = sqlx::query(&format!(
+            "SELECT {FULLTEXT_MEMORY_COLUMNS} FROM {table} WHERE memory_id = ? AND user_id = ?"
+        ))
+        .bind(memory_id)
+        .bind(owner)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|row| row_to_memory(&row)).transpose()
+    }
+
+    /// Deactivate an active memory and store the caller-built metadata that marks it disabled.
+    /// Returns the number of rows changed: 0 when the row was no longer active.
+    pub async fn disable_in(
+        &self,
+        table: &str,
+        expected: &Memory,
+        extra_metadata: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<u64, MemoriaError> {
+        let table = self.t(table);
+        let res = sqlx::query(&format!(
+            "UPDATE {table} SET is_active = 0, extra_metadata = ?, updated_at = ? \
+             WHERE memory_id = ? AND user_id = ? AND is_active = 1 AND updated_at = ?"
+        ))
+        .bind(serde_json::to_string(extra_metadata)?)
+        .bind(Utc::now().naive_utc())
+        .bind(&expected.memory_id)
+        .bind(&expected.user_id)
+        .bind(
+            expected
+                .updated_at
+                .ok_or_else(|| {
+                    MemoriaError::Validation("memory revision timestamp is missing".into())
+                })?
+                .naive_utc(),
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected())
+    }
+
+    /// Reactivate a disabled memory with its marker removed. A superseded revision is never
+    /// reactivated. Returns the number of rows changed.
+    pub async fn restore_in(
+        &self,
+        table: &str,
+        expected: &Memory,
+        extra_metadata: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<u64, MemoriaError> {
+        let table = self.t(table);
+        let res = sqlx::query(&format!(
+            "UPDATE {table} SET is_active = 1, extra_metadata = ?, updated_at = ? \
+             WHERE memory_id = ? AND user_id = ? AND is_active = 0 AND updated_at = ? \
+             AND JSON_EXTRACT(extra_metadata, '$._memoria_disabled') IS NOT NULL \
+             AND (superseded_by IS NULL OR superseded_by = '')"
+        ))
+        .bind(serde_json::to_string(extra_metadata)?)
+        .bind(Utc::now().naive_utc())
+        .bind(&expected.memory_id)
+        .bind(&expected.user_id)
+        .bind(
+            expected
+                .updated_at
+                .ok_or_else(|| {
+                    MemoriaError::Validation("memory revision timestamp is missing".into())
+                })?
+                .naive_utc(),
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected())
+    }
+
+    /// Erase content. Idempotent rows retain a content-free, inactive receipt so
+    /// at-least-once clients cannot recreate an erased memory with the same key.
+    pub async fn erase_from(&self, table: &str, expected: &Memory) -> Result<u64, MemoriaError> {
+        let table = self.t(table);
+        let receipt = expected
+            .extra_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(memoria_core::STORE_REQUEST_HASH_FIELD));
+        let statement = if receipt.is_some() {
+            format!(
+                "UPDATE {table} SET content = '', embedding = NULL, session_id = NULL, \
+                author_id = NULL, subject_id = NULL, source_event_ids = '[]', \
+                extra_metadata = ?, is_active = 0, updated_at = ? "
+            )
+        } else {
+            format!("DELETE FROM {table} ")
+        };
+        let statement = format!(
+            "{statement}WHERE memory_id = ? AND user_id = ? \
+            AND updated_at = ? AND (superseded_by IS NULL OR superseded_by = '') \
+            AND JSON_EXTRACT(extra_metadata, '$._memoria_erased') IS NULL"
+        );
+        let mut query = sqlx::query(&statement);
+        if let Some(receipt) = receipt {
+            query = query
+                .bind(
+                    serde_json::json!({
+                    (memoria_core::STORE_REQUEST_HASH_FIELD): receipt,
+                    (memoria_core::ERASED_FIELD): true,
+                        })
+                    .to_string(),
+                )
+                .bind(Utc::now().naive_utc());
+        }
+        let res = query
+            .bind(&expected.memory_id)
+            .bind(&expected.user_id)
+            .bind(
+                expected
+                    .updated_at
+                    .ok_or_else(|| {
+                        MemoriaError::Validation("memory revision timestamp is missing".into())
+                    })?
+                    .naive_utc(),
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected())
+    }
+
+    /// Disabled memories of one owner, most recently disabled first.
+    pub async fn list_disabled_from(
+        &self,
+        table: &str,
+        user_id: &str,
+        subject_id: Option<&str>,
+        limit: i64,
+        cursor: Option<&str>,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        let table = self.t(table);
+        let subject_clause = if subject_id.is_some() {
+            " AND subject_id = ?"
+        } else {
+            ""
+        };
+        let position: Option<(chrono::DateTime<chrono::Utc>, String)> = cursor
+            .map(|value| {
+                if value.len() > 512 {
+                    return Err(MemoriaError::Validation(
+                        "disabled memory cursor is too long".into(),
+                    ));
+                }
+                let position: (chrono::DateTime<chrono::Utc>, String) = serde_json::from_str(value)
+                    .map_err(|_| {
+                        MemoriaError::Validation("invalid disabled memory cursor".into())
+                    })?;
+                if position.1.is_empty() || position.1.len() > 128 {
+                    return Err(MemoriaError::Validation(
+                        "invalid disabled memory cursor identity".into(),
+                    ));
+                }
+                Ok(position)
+            })
+            .transpose()?;
+        let cursor_clause = if position.is_some() {
+            " AND (updated_at < ? OR (updated_at = ? AND memory_id < ?))"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT {FULLTEXT_MEMORY_COLUMNS} FROM {table} \
+             WHERE user_id = ? AND is_active = 0 \
+               AND (superseded_by IS NULL OR superseded_by = '') \
+               AND JSON_EXTRACT(extra_metadata, '$.{disabled}') IS NOT NULL{subject_clause}{cursor_clause} \
+             ORDER BY updated_at DESC, memory_id DESC LIMIT ?",
+            disabled = memoria_core::DISABLED_FIELD,
+        );
+        let mut query = sqlx::query(&sql).bind(user_id);
+        if let Some(subject_id) = subject_id {
+            query = query.bind(subject_id);
+        }
+        if let Some((timestamp, memory_id)) = position {
+            query = query
+                .bind(timestamp.naive_utc())
+                .bind(timestamp.naive_utc())
+                .bind(memory_id);
+        }
+        let rows = query
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+        rows.iter().map(row_to_memory).collect()
     }
 
     /// Batch soft-delete: deactivate multiple memories in one round trip per chunk.
@@ -6494,6 +6826,26 @@ impl SqlMemoryStore {
         row.map(|r| row_to_memory(&r)).transpose()
     }
 
+    /// Retry receipts survive soft deletion/supersession. Reading only active
+    /// rows would turn an already-consumed key into an INSERT collision and a
+    /// database error. This lookup is internal and always fenced by its owner.
+    pub async fn get_retry_receipt_from(
+        &self,
+        table: &str,
+        memory_id: &str,
+        owner: &str,
+    ) -> Result<Option<Memory>, MemoriaError> {
+        let row = sqlx::query(&format!(
+            "SELECT {FULLTEXT_MEMORY_COLUMNS} FROM {table} WHERE memory_id = ? AND user_id = ?"
+        ))
+        .bind(memory_id)
+        .bind(owner)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|row| row_to_memory(&row)).transpose()
+    }
+
     /// Internal observe lookup: inactive facts still need to be excluded after
     /// correction/deletion. Scope predicates apply before content leaves storage.
     pub async fn observe_exclusion_content_from(
@@ -6568,6 +6920,15 @@ impl SqlMemoryStore {
             .ok_or_else(|| {
                 MemoriaError::Blocked("memory erase is already running for this scope".into())
             })?;
+        let mut connection = self.pool.acquire().await.map_err(db_err)?;
+        Self::insert_on_connection(&mut connection, table, memory).await
+    }
+
+    async fn insert_on_connection(
+        connection: &mut MySqlConnection,
+        table: &str,
+        memory: &Memory,
+    ) -> Result<(), MemoriaError> {
         let now = Utc::now().naive_utc();
         let observed_at = memory.observed_at.map(|dt| dt.naive_utc()).unwrap_or(now);
         let created_at = memory.created_at.map(|dt| dt.naive_utc()).unwrap_or(now);
@@ -6634,10 +6995,95 @@ impl SqlMemoryStore {
             .bind(observed_at)
             .bind(created_at)
             .bind(now)
-            .execute(&self.pool)
+            .execute(connection)
             .await
             .map_err(db_err)?;
         Ok(())
+    }
+
+    /// Replace a previously read active fact and retire its graph references in
+    /// one transaction. No second active memory may survive a failed correction.
+    /// The caller supplies a table resolved by table_for_branch, never user SQL.
+    #[tracing::instrument(skip_all)]
+    pub async fn replace_memory_atomically(
+        &self,
+        table: &str,
+        expected: &Memory,
+        replacement: &Memory,
+    ) -> Result<(), MemoriaError> {
+        if expected.user_id != replacement.user_id
+            || expected.subject_id != replacement.subject_id
+            || expected.memory_id == replacement.memory_id
+            || !expected.is_active
+            || !replacement.is_active
+        {
+            return Err(MemoriaError::Validation(
+                "invalid correction identity".into(),
+            ));
+        }
+        let mut transaction = self.pool.begin().await.map_err(db_err)?;
+        let row = sqlx::query(&format!(
+            "SELECT {FULLTEXT_MEMORY_COLUMNS} FROM {table} WHERE memory_id = ? AND user_id = ? FOR UPDATE"
+        ))
+        .bind(&expected.memory_id)
+        .bind(&expected.user_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| MemoriaError::NotFound("memory".into()))?;
+        let current = row_to_memory(&row)?;
+        if !current.is_active
+            || current.subject_id != expected.subject_id
+            || current.content != expected.content
+            || current.memory_type != expected.memory_type
+            || current.extra_metadata != expected.extra_metadata
+            || current.updated_at != expected.updated_at
+        {
+            return Err(MemoriaError::Conflict(
+                "memory changed during correction".into(),
+            ));
+        }
+        let changed = sqlx::query(&format!(
+            "UPDATE {table} SET is_active = 0, superseded_by = ?, updated_at = NOW() WHERE memory_id = ? AND user_id = ? AND is_active = 1"
+        ))
+        .bind(&replacement.memory_id)
+        .bind(&expected.memory_id)
+        .bind(&expected.user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(db_err)?;
+        if changed.rows_affected() != 1 {
+            return Err(MemoriaError::Conflict(
+                "memory changed during correction".into(),
+            ));
+        }
+        // Keep the nullable parameter shapes identical to every other insertion.
+        Self::insert_on_connection(&mut transaction, table, replacement).await?;
+        // Graph retrieval is main-only. A branch clone may share IDs with main;
+        // correcting it must not retire the main branch's graph references.
+        if table == self.t("mem_memories") {
+            sqlx::query(&format!(
+                "UPDATE {} SET is_active = 0 WHERE memory_id = ? AND user_id = ?",
+                self.t("memory_graph_nodes")
+            ))
+            .bind(&expected.memory_id)
+            .bind(&expected.user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(db_err)?;
+            for relation in ["mem_memory_entity_links", "mem_entity_links"] {
+                sqlx::query(&format!(
+                    "DELETE FROM {} WHERE memory_id = ? AND user_id = ?",
+                    self.t(relation)
+                ))
+                .bind(&expected.memory_id)
+                .bind(&expected.user_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(db_err)?;
+            }
+        }
+        transaction.commit().await.map_err(db_err)
     }
 
     /// Batch-insert multiple memories in a single multi-row INSERT statement.
@@ -6698,9 +7144,7 @@ impl SqlMemoryStore {
                 if let Some(subject_id) = &m.subject_id {
                     q = q.bind(subject_id.clone());
                 }
-                q = q
-                    .bind(m.memory_type.to_string())
-                    .bind(m.content.clone());
+                q = q.bind(m.memory_type.to_string()).bind(m.content.clone());
                 if let Some(embedding) = embedding {
                     q = q.bind(embedding);
                 }
@@ -6838,6 +7282,7 @@ impl SqlMemoryStore {
         cursor: Option<&str>,
         subject_id: Option<&str>,
         extra_metadata_filter: &std::collections::HashMap<String, serde_json::Value>,
+        filter: &MemoryFilter,
     ) -> Result<Vec<Memory>, MemoriaError> {
         if !(1..=501).contains(&limit) {
             return Err(MemoriaError::Validation(
@@ -6849,64 +7294,46 @@ impl SqlMemoryStore {
         let mut metadata_filters: Vec<_> = extra_metadata_filter.iter().collect();
         metadata_filters.sort_by_key(|(key, _)| *key);
 
-        let mut inner =
-            format!("SELECT memory_id FROM {table} WHERE user_id = ? AND is_active = 1");
-        if let Some(types) = memory_types.filter(|types| !types.is_empty()) {
-            inner.push_str(" AND memory_type IN (");
-            inner.push_str(&vec!["?"; types.len()].join(", "));
-            inner.push(')');
-        }
-        if session_id.is_some() {
-            inner.push_str(" AND session_id = ?");
-        }
-        if trust_tier.is_some() {
-            inner.push_str(" AND trust_tier = ?");
-        }
-        if subject_id.is_some() {
-            inner.push_str(" AND subject_id = ?");
-        }
-        if cursor.is_some() {
-            inner.push_str(" AND memory_id < ?");
-        }
-        for (key, _) in &metadata_filters {
-            inner.push_str(&format!(
-                " AND json_extract(extra_metadata, '$.{key}') = CAST(? AS JSON)"
-            ));
-        }
-        inner.push_str(" ORDER BY memory_id DESC LIMIT ?");
-
-        let sql = format!(
+        let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
             "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
-             session_id, is_active, superseded_by, trust_tier, \
-             initial_confidence, observed_at, created_at, updated_at, \
-             CAST(extra_metadata AS CHAR) AS extra_meta \
-             FROM {table} WHERE memory_id IN ({inner}) \
-             ORDER BY memory_id DESC"
-        );
-
-        let mut query = sqlx::query(&sql).bind(user_id);
+             session_id, is_active, superseded_by, trust_tier, initial_confidence, \
+             observed_at, created_at, updated_at, CAST(extra_metadata AS CHAR) AS extra_meta \
+             FROM {table} WHERE user_id = "
+        ));
+        query.push_bind(user_id).push(" AND is_active = 1");
         if let Some(types) = memory_types.filter(|types| !types.is_empty()) {
+            query.push(" AND memory_type IN (");
+            let mut values = query.separated(", ");
             for memory_type in types {
-                query = query.bind(memory_type.to_string());
+                values.push_bind(memory_type.to_string());
             }
+            values.push_unseparated(")");
         }
         if let Some(value) = session_id {
-            query = query.bind(value);
+            query.push(" AND session_id = ").push_bind(value);
         }
         if let Some(value) = trust_tier {
-            query = query.bind(value);
+            query.push(" AND trust_tier = ").push_bind(value);
         }
         if let Some(value) = subject_id {
-            query = query.bind(value);
+            query.push(" AND subject_id = ").push_bind(value);
         }
         if let Some(value) = cursor {
-            query = query.bind(value);
+            query.push(" AND memory_id < ").push_bind(value);
         }
-        for (_, value) in metadata_filters {
-            query = query.bind(serde_json::to_string(value)?);
+        for (key, value) in metadata_filters {
+            query
+                .push(" AND json_extract(extra_metadata, ")
+                .push_bind(format!("$.{key}"))
+                .push(") = CAST(")
+                .push_bind(serde_json::to_string(value)?)
+                .push(" AS JSON)");
         }
-        query = query.bind(limit);
-        let rows = query.fetch_all(&self.pool).await.map_err(db_err)?;
+        append_memory_filter(&mut query, filter)?;
+        query
+            .push(" ORDER BY memory_id DESC LIMIT ")
+            .push_bind(limit);
+        let rows = query.build().fetch_all(&self.pool).await.map_err(db_err)?;
         rows.iter().map(row_to_memory_lite).collect()
     }
 
@@ -7016,8 +7443,17 @@ impl SqlMemoryStore {
         query: &str,
         limit: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
-        self.search_fulltext_from_scoped(table, user_id, query, limit, None, None, None)
-            .await
+        self.search_fulltext_from_scoped(
+            table,
+            user_id,
+            query,
+            limit,
+            None,
+            None,
+            None,
+            &MemoryFilter::default(),
+        )
+        .await
     }
 
     /// Search all distinct terms in bounded batches. Fusion is approximate:
@@ -7033,7 +7469,9 @@ impl SqlMemoryStore {
         session_id: Option<&str>,
         subject_id: Option<&str>,
         memory_types: Option<&[MemoryType]>,
+        filter: &MemoryFilter,
     ) -> Result<Vec<Memory>, MemoriaError> {
+        filter.validate()?;
         let batches = fulltext_query_batches(query);
         if batches.is_empty() || limit <= 0 {
             return Ok(Vec::new());
@@ -7049,6 +7487,7 @@ impl SqlMemoryStore {
                     subject_id,
                     memory_types,
                     true,
+                    filter,
                 )
                 .await?;
             return rows
@@ -7086,6 +7525,7 @@ impl SqlMemoryStore {
                 subject_id,
                 memory_types,
                 false,
+                filter,
             )
             .await
         }))
@@ -7126,6 +7566,7 @@ impl SqlMemoryStore {
                 }
                 stmt.push(")");
             }
+            append_memory_filter(&mut stmt, filter)?;
             stmt.push(" AND memory_id IN (");
             let mut separated = stmt.separated(", ");
             for (id, _) in chunk {
@@ -7160,6 +7601,7 @@ impl SqlMemoryStore {
         subject_id: Option<&str>,
         memory_types: Option<&[MemoryType]>,
         include_memory: bool,
+        filter: &MemoryFilter,
     ) -> Result<Vec<sqlx::mysql::MySqlRow>, MemoriaError> {
         let session_clause = match session_id {
             Some(session) => format!(
@@ -7192,7 +7634,22 @@ impl SqlMemoryStore {
         // MatrixOne 4.1.2 can return no rows when re-executing a prepared MATCH
         // query. Use the text protocol, as in vector search, with escaped scope
         // literals and an already-sanitized query. Hydration still uses binds.
-        match fulltext_rows_or_degraded(sqlx::raw_sql(&sql).fetch_all(&self.pool).await)? {
+        let result = if filter.is_empty() {
+            sqlx::raw_sql(&sql).fetch_all(&self.pool).await
+        } else {
+            let mut statement = QueryBuilder::<MySql>::new(format!(
+                "SELECT {columns}, MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) AS ft_score \
+                 FROM {table} WHERE user_id = '{}' AND is_active = 1{session_clause}{subject_clause}{types_clause}",
+                sanitize_sql_literal(user_id),
+            ));
+            append_memory_filter(&mut statement, filter)?;
+            statement.push(format!(
+                " AND MATCH(content) AGAINST('{safe}' IN BOOLEAN MODE) \
+                 ORDER BY ft_score DESC, memory_id ASC LIMIT {limit}"
+            ));
+            statement.build().fetch_all(&self.pool).await
+        };
+        match fulltext_rows_or_degraded(result)? {
             FulltextRows::Rows(rows) => Ok(rows),
             FulltextRows::IndexUnavailable => {
                 self.search_like_fallback_batch(
@@ -7204,6 +7661,7 @@ impl SqlMemoryStore {
                     subject_id,
                     memory_types,
                     include_memory,
+                    filter,
                 )
                 .await
             }
@@ -7224,6 +7682,7 @@ impl SqlMemoryStore {
         subject_id: Option<&str>,
         memory_types: Option<&[MemoryType]>,
         include_memory: bool,
+        filter: &MemoryFilter,
     ) -> Result<Vec<sqlx::mysql::MySqlRow>, MemoriaError> {
         let patterns = fulltext_like_fallback_patterns(safe);
         if patterns.is_empty() || limit <= 0 {
@@ -7255,6 +7714,7 @@ impl SqlMemoryStore {
             }
             stmt.push(")");
         }
+        append_memory_filter(&mut stmt, filter)?;
         push_like_fallback_predicate(&mut stmt, &patterns);
         stmt.push(" ORDER BY ft_score DESC, memory_id ASC LIMIT ")
             .push_bind(limit);
@@ -7278,13 +7738,12 @@ impl SqlMemoryStore {
         trust_tier: Option<&str>,
         subject_id: Option<&str>,
         extra_metadata_filter: &std::collections::HashMap<String, serde_json::Value>,
+        filter: &MemoryFilter,
     ) -> Result<Vec<Memory>, MemoriaError> {
         if !(1..=FULLTEXT_SEARCH_MAX_LIMIT).contains(&limit) {
-            return Err(MemoriaError::Validation(
-                format!(
-                    "fulltext search storage limit must be between 1 and {FULLTEXT_SEARCH_MAX_LIMIT}"
-                ),
-            ));
+            return Err(MemoriaError::Validation(format!(
+                "fulltext search storage limit must be between 1 and {FULLTEXT_SEARCH_MAX_LIMIT}"
+            )));
         }
         validate_fulltext_query(query)?;
         validate_extra_metadata_filter(extra_metadata_filter)?;
@@ -7300,7 +7759,7 @@ impl SqlMemoryStore {
             .collect::<Result<Vec<_>, MemoriaError>>()?;
         // Shared by the FULLTEXT query and its degraded LIKE form so both
         // apply exactly the same structured scope.
-        let push_scope = |stmt: &mut QueryBuilder<'_, MySql>| {
+        let push_scope = |stmt: &mut QueryBuilder<'_, MySql>| -> Result<(), MemoriaError> {
             stmt.push(format!(" FROM {table} WHERE user_id = "))
                 .push_bind(user_id.to_string())
                 .push(" AND is_active = 1");
@@ -7328,6 +7787,7 @@ impl SqlMemoryStore {
                 .push_bind(value.clone())
                 .push(" AS JSON)");
             }
+            append_memory_filter(stmt, filter)
         };
         const LITE_COLUMNS: &str =
             "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
@@ -7338,7 +7798,7 @@ impl SqlMemoryStore {
         let mut stmt = QueryBuilder::<MySql>::new(format!(
             "{LITE_COLUMNS}, MATCH(content) AGAINST('{safe_query}' IN BOOLEAN MODE) AS ft_score"
         ));
-        push_scope(&mut stmt);
+        push_scope(&mut stmt)?;
         stmt.push(format!(
             " AND MATCH(content) AGAINST('{safe_query}' IN BOOLEAN MODE) \
              ORDER BY ft_score DESC, memory_id DESC LIMIT "
@@ -7351,7 +7811,7 @@ impl SqlMemoryStore {
                 let patterns = fulltext_like_fallback_patterns(&safe_query);
                 let mut fallback = QueryBuilder::<MySql>::new(LITE_COLUMNS);
                 push_like_fallback_score(&mut fallback, &patterns);
-                push_scope(&mut fallback);
+                push_scope(&mut fallback)?;
                 push_like_fallback_predicate(&mut fallback, &patterns);
                 fallback
                     .push(" ORDER BY ft_score DESC, memory_id DESC LIMIT ")
@@ -7392,7 +7852,15 @@ impl SqlMemoryStore {
         session_id: Option<&str>,
     ) -> Result<Vec<Memory>, MemoriaError> {
         self.search_vector_from_filtered_scoped(
-            table, user_id, embedding, limit, None, session_id, None, None,
+            table,
+            user_id,
+            embedding,
+            limit,
+            None,
+            session_id,
+            None,
+            None,
+            &MemoryFilter::default(),
         )
         .await
     }
@@ -7407,7 +7875,15 @@ impl SqlMemoryStore {
         memory_type: Option<&str>,
     ) -> Result<Vec<Memory>, MemoriaError> {
         self.search_vector_from_filtered_scoped(
-            table, user_id, embedding, limit, memory_type, None, None, None,
+            table,
+            user_id,
+            embedding,
+            limit,
+            memory_type,
+            None,
+            None,
+            None,
+            &MemoryFilter::default(),
         )
         .await
     }
@@ -7426,7 +7902,15 @@ impl SqlMemoryStore {
         session_id: Option<&str>,
         subject_id: Option<&str>,
         memory_types: Option<&[MemoryType]>,
+        filter: &MemoryFilter,
     ) -> Result<Vec<Memory>, MemoriaError> {
+        if embedding.len() != self.embedding_dim || embedding.iter().any(|value| !value.is_finite())
+        {
+            return Err(MemoriaError::Validation(
+                "query_vector must have the configured dimension and finite components".into(),
+            ));
+        }
+        filter.validate()?;
         let vec_literal = vec_to_mo(embedding);
         let type_clause = match memory_type {
             Some(mt) => format!(" AND memory_type = '{}'", sanitize_sql_literal(mt)),
@@ -7443,13 +7927,23 @@ impl SqlMemoryStore {
             Some(sid) => format!(" AND subject_id = '{}'", sanitize_sql_literal(sid)),
             None => String::new(),
         };
-        let rank_mode = if session_id.is_some() { "pre" } else { "post" };
-        let build_sql = |rank_mode: Option<&str>| {
-            let limit_clause = match rank_mode {
-                Some(mode) => format!("LIMIT {limit} by rank with option 'mode={mode}'"),
-                None => format!("LIMIT {limit}"),
-            };
-            format!(
+        let rank_mode = if session_id.is_some()
+            || subject_id.is_some()
+            || memory_type.is_some()
+            || memory_types.is_some_and(|types| !types.is_empty())
+            || !filter.is_empty()
+        {
+            "pre"
+        } else {
+            "post"
+        };
+        let build_sql =
+            |rank_mode: Option<&str>| -> Result<QueryBuilder<'static, MySql>, MemoriaError> {
+                let limit_clause = match rank_mode {
+                    Some(mode) => format!("LIMIT {limit} by rank with option 'mode={mode}'"),
+                    None => format!("LIMIT {limit}"),
+                };
+                let mut statement = QueryBuilder::<MySql>::new(format!(
                 "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
                  session_id, \
                  CAST(source_event_ids AS CHAR) AS src_ids, \
@@ -7458,22 +7952,29 @@ impl SqlMemoryStore {
                  observed_at, created_at, updated_at, \
                  l2_distance(embedding, '{vec_literal}') AS l2_dist \
                  FROM {table} \
-                 WHERE user_id = '{}' AND is_active = 1 AND embedding IS NOT NULL{type_clause}{session_clause}{subject_clause} \
-                 ORDER BY l2_distance(embedding, '{vec_literal}') ASC \
-                 {limit_clause}",
+                 WHERE user_id = '{}' AND is_active = 1 AND embedding IS NOT NULL{type_clause}{session_clause}{subject_clause}",
                 sanitize_sql_literal(user_id),
-            )
-        };
-        // MatrixOne bug workaround: prepared statement with l2_distance in ORDER BY returns 0 rows
-        // Solution: inline all parameters instead of using bind()
-        let mut rows = sqlx::query(&build_sql(Some(rank_mode)))
+            ));
+                append_memory_filter(&mut statement, filter)?;
+                statement.push(format!(
+                    " ORDER BY l2_distance(embedding, '{vec_literal}') ASC {limit_clause}"
+                ));
+                Ok(statement)
+            };
+        // Retain the existing inline vector/scope expressions needed by
+        // MatrixOne's vector plan. Common predicate values remain bound.
+        let mut statement = build_sql(Some(rank_mode))?;
+        let mut rows = statement
+            .build()
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
         // Strict session retrieval must preserve session-scoped semantics even if
         // MatrixOne's IVF pre-filter path under-fills top_k on a tiny candidate set.
         if session_id.is_some() && rows.len() < limit as usize {
-            rows = sqlx::query(&build_sql(None))
+            let mut statement = build_sql(None)?;
+            rows = statement
+                .build()
                 .fetch_all(&self.pool)
                 .await
                 .map_err(db_err)?;
@@ -7532,6 +8033,7 @@ impl SqlMemoryStore {
                 session_id,
                 None,
                 None,
+                &MemoryFilter::default(),
             )
             .await?;
         Ok(mems)
@@ -7558,6 +8060,7 @@ impl SqlMemoryStore {
             None,
             None,
             None,
+            &MemoryFilter::default(),
         )
         .await
     }
@@ -7574,18 +8077,34 @@ impl SqlMemoryStore {
         session_id: Option<&str>,
         subject_id: Option<&str>,
         memory_types: Option<&[MemoryType]>,
+        filter: &MemoryFilter,
     ) -> Result<(Vec<Memory>, Vec<(String, f64, f64, f64, f64, f64)>), MemoriaError> {
         let fetch_k = (limit * 3).max(20);
         let (vec_results, ft_results) = tokio::join!(
             self.search_vector_from_filtered_scoped(
-                table, user_id, embedding, fetch_k, None, session_id, subject_id, memory_types
+                table,
+                user_id,
+                embedding,
+                fetch_k,
+                None,
+                session_id,
+                subject_id,
+                memory_types,
+                filter
             ),
             self.search_fulltext_from_scoped(
-                table, user_id, query, fetch_k, session_id, subject_id, memory_types
+                table,
+                user_id,
+                query,
+                fetch_k,
+                session_id,
+                subject_id,
+                memory_types,
+                filter
             )
         );
         let vec_results = vec_results?;
-        let ft_results = ft_results.unwrap_or_default();
+        let ft_results = ft_results?;
 
         let (mut candidates, ft_map) = merge_hybrid_results(vec_results, ft_results);
 
@@ -8676,7 +9195,10 @@ impl MemoryStore for SqlMemoryStore {
 
     /// Reads inactive history from main (`mem_memories`) only. For branch-scoped
     /// observe exclusions, use `observe_exclusion_content_from` with that table.
-    async fn get_including_inactive(&self, memory_id: &str) -> Result<Option<Memory>, MemoriaError> {
+    async fn get_including_inactive(
+        &self,
+        memory_id: &str,
+    ) -> Result<Option<Memory>, MemoriaError> {
         let table = self.t("mem_memories");
         let row = sqlx::query(&format!(
             "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \

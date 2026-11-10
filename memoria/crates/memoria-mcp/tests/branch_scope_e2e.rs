@@ -121,6 +121,7 @@ async fn assert_scoped_read(ctx: &Context, id: &str) {
                 None,
                 Some(subject),
                 None,
+                &memoria_core::MemoryFilter::default(),
             )
             .await
             .unwrap();

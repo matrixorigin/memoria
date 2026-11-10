@@ -1,7 +1,7 @@
 //! Request/Response types for the REST API.
 //! Mirrors Python's api/models.py and api/_model_types.py.
 
-use memoria_core::{Memory, MemoryType, TrustTier};
+use memoria_core::{Memory, MemoryFilter, MemoryType, TrustTier};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -50,6 +50,8 @@ pub struct RetrieveRequest {
     pub subject_id: Option<String>,
     pub memory_types: Option<Vec<String>>,
     pub branch: Option<String>,
+    #[serde(default)]
+    pub filter: MemoryFilter,
     /// Explain level: false/"none" = off, true/"basic" = basic, "verbose" = per-candidate scores, "analyze" = full
     #[serde(default, deserialize_with = "deserialize_explain")]
     pub explain: String,
@@ -68,7 +70,7 @@ fn parse_session_scope(
         .transpose()
 }
 
-fn parse_memory_types_opt(
+pub(crate) fn parse_memory_types_opt(
     types: Option<&Vec<String>>,
 ) -> Result<Option<Vec<MemoryType>>, String> {
     let mut parsed = types
@@ -110,15 +112,15 @@ impl RetrieveRequest {
     }
 
     pub fn retrieve_options(&self) -> Result<memoria_service::RetrieveOptions, String> {
+        self.filter.validate().map_err(|error| error.to_string())?;
         let memory_types = parse_memory_types_opt(self.memory_types.as_ref())?;
-        Ok(
-            memoria_service::RetrieveOptions::from_session_scope(
-                self.session_id.as_deref(),
-                self.session_scope()?,
-            )
-            .with_subject_id(self.subject_id.clone())
-            .with_memory_types(memory_types),
+        Ok(memoria_service::RetrieveOptions::from_session_scope(
+            self.session_id.as_deref(),
+            self.session_scope()?,
         )
+        .with_subject_id(self.subject_id.clone())
+        .with_memory_types(memory_types)
+        .with_filter(self.filter.clone()))
     }
 }
 
@@ -132,6 +134,8 @@ pub struct SearchRequest {
     pub subject_id: Option<String>,
     pub memory_types: Option<Vec<String>>,
     pub branch: Option<String>,
+    #[serde(default)]
+    pub filter: MemoryFilter,
     #[serde(default, deserialize_with = "deserialize_explain")]
     pub explain: String,
 }
@@ -149,20 +153,34 @@ impl SearchRequest {
     }
 
     pub fn retrieve_options(&self) -> Result<memoria_service::RetrieveOptions, String> {
+        self.filter.validate().map_err(|error| error.to_string())?;
         let memory_types = parse_memory_types_opt(self.memory_types.as_ref())?;
-        Ok(
-            memoria_service::RetrieveOptions::from_session_scope(
-                self.session_id.as_deref(),
-                self.session_scope()?,
-            )
-            .with_subject_id(self.subject_id.clone())
-            .with_memory_types(memory_types),
+        Ok(memoria_service::RetrieveOptions::from_session_scope(
+            self.session_id.as_deref(),
+            self.session_scope()?,
         )
+        .with_subject_id(self.subject_id.clone())
+        .with_memory_types(memory_types)
+        .with_filter(self.filter.clone()))
     }
 }
 
 fn default_structured_query_limit() -> i64 {
     100
+}
+
+/// The vector must be generated with the same embedding model and dimension as
+/// stored memories. Dimension equality alone does not imply model compatibility.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VectorSearchRequest {
+    pub query_vector: Vec<f32>,
+    pub top_k: i64,
+    pub subject_id: Option<String>,
+    pub memory_types: Option<Vec<String>>,
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub filter: MemoryFilter,
 }
 
 /// A pure structured query. All supplied selectors are combined with AND.
@@ -171,6 +189,8 @@ fn default_structured_query_limit() -> i64 {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StructuredQueryRequest {
+    #[serde(default)]
+    pub filter: MemoryFilter,
     #[serde(default)]
     pub extra_metadata_filter: HashMap<String, serde_json::Value>,
     pub subject_id: Option<String>,
@@ -185,6 +205,7 @@ pub struct StructuredQueryRequest {
 
 impl StructuredQueryRequest {
     pub fn structured_options(&self) -> Result<memoria_service::StructuredQueryOptions, String> {
+        self.filter.validate().map_err(|err| err.to_string())?;
         if !(1..=500).contains(&self.limit) {
             return Err("limit must be between 1 and 500".to_string());
         }
@@ -193,8 +214,7 @@ impl StructuredQueryRequest {
 
         let subject_id = normalized_filter("subject_id", self.subject_id.as_deref())?;
         let session_id = normalized_filter("session_id", self.session_id.as_deref())?;
-        let normalized_trust_tier =
-            normalized_filter("trust_tier", self.trust_tier.as_deref())?;
+        let normalized_trust_tier = normalized_filter("trust_tier", self.trust_tier.as_deref())?;
         let branch = normalized_filter("branch", self.branch.as_deref())?;
         let trust_tier = normalized_trust_tier
             .as_deref()
@@ -209,6 +229,7 @@ impl StructuredQueryRequest {
         }
         let memory_types = parse_memory_types_opt(self.memory_types.as_ref())?;
         if self.extra_metadata_filter.is_empty()
+            && self.filter.is_empty()
             && subject_id.is_none()
             && session_id.is_none()
             && trust_tier.is_none()
@@ -234,6 +255,7 @@ impl StructuredQueryRequest {
             cursor,
             subject_id,
             extra_metadata_filter: self.extra_metadata_filter.clone(),
+            filter: self.filter.clone(),
         })
     }
 }
@@ -247,6 +269,8 @@ fn default_fulltext_search_limit() -> i64 {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FulltextSearchRequest {
+    #[serde(default)]
+    pub filter: MemoryFilter,
     pub query: String,
     #[serde(default)]
     pub extra_metadata_filter: HashMap<String, serde_json::Value>,
@@ -261,6 +285,7 @@ pub struct FulltextSearchRequest {
 
 impl FulltextSearchRequest {
     pub fn fulltext_options(&self) -> Result<memoria_service::FulltextSearchOptions, String> {
+        self.filter.validate().map_err(|err| err.to_string())?;
         if !(1..=memoria_storage::FULLTEXT_SEARCH_MAX_LIMIT).contains(&self.limit) {
             return Err(format!(
                 "limit must be between 1 and {}",
@@ -284,6 +309,7 @@ impl FulltextSearchRequest {
             trust_tier,
             subject_id,
             extra_metadata_filter: self.extra_metadata_filter.clone(),
+            filter: self.filter.clone(),
         })
     }
 
@@ -328,6 +354,19 @@ pub struct CorrectRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdempotentCorrectRequest {
+    pub new_content: String,
+    pub subject_id: String,
+    pub branch: String,
+    pub idempotency_key: String,
+    /// Removes structured_content from the new version inside this correction.
+    /// Absent means false so an existing text correction keeps its payload hash.
+    #[serde(default)]
+    pub omit_structured_content: bool,
+}
+
+#[derive(Deserialize)]
 pub struct CorrectByQueryRequest {
     pub query: String,
     pub new_content: String,
@@ -349,14 +388,12 @@ impl CorrectByQueryRequest {
 
     pub fn retrieve_options(&self) -> Result<memoria_service::RetrieveOptions, String> {
         let memory_types = parse_memory_types_opt(self.memory_types.as_ref())?;
-        Ok(
-            memoria_service::RetrieveOptions::from_session_scope(
-                self.session_id.as_deref(),
-                parse_session_scope(self.session_scope.as_deref())?,
-            )
-            .with_subject_id(self.subject_id.clone())
-            .with_memory_types(memory_types),
+        Ok(memoria_service::RetrieveOptions::from_session_scope(
+            self.session_id.as_deref(),
+            parse_session_scope(self.session_scope.as_deref())?,
         )
+        .with_subject_id(self.subject_id.clone())
+        .with_memory_types(memory_types))
     }
 }
 
@@ -446,6 +483,7 @@ pub struct MemoryResponse {
     pub session_id: Option<String>,
     pub observed_at: Option<String>,
     pub created_at: Option<String>,
+    pub updated_at: Option<String>,
     pub retrieval_score: Option<f64>,
     /// 业务元数据（如 scene/agent）从 memories.extra_metadata 原样透传回给调用方；结构化 query
     /// 可做精确过滤，但不参与相关性检索或打分。
@@ -456,7 +494,7 @@ pub struct MemoryResponse {
 impl From<Memory> for MemoryResponse {
     fn from(mut m: Memory) -> Self {
         if let Some(metadata) = m.extra_metadata.as_mut() {
-            metadata.remove(memoria_core::STORE_REQUEST_HASH_FIELD);
+            metadata.retain(|key, _| !memoria_core::is_reserved_metadata_key(key));
         }
         Self {
             memory_id: m.memory_id,
@@ -471,10 +509,76 @@ impl From<Memory> for MemoryResponse {
             session_id: m.session_id,
             observed_at: m.observed_at.map(|dt| dt.to_rfc3339()),
             created_at: m.created_at.map(|dt| dt.to_rfc3339()),
+            updated_at: m.updated_at.map(|dt| dt.to_rfc3339()),
             retrieval_score: m.retrieval_score,
             // 空 map 在响应里归一为 None（省略），与读取侧「"{}" → None」一致：新写记录直接
             // 返回内存对象时也不会出现「POST 带 {} 而后续 list/get 无该字段」的不一致。
             extra_metadata: m.extra_metadata.filter(|md| !md.is_empty()),
+        }
+    }
+}
+
+/// Operator disable. `subject_id`, when set,
+/// fences the target: a memory of another subject is reported as not found.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryGovernanceRequest {
+    pub subject_id: Option<String>,
+    /// Recorded with the disable marker.
+    #[serde(default)]
+    pub reason: String,
+    pub branch: Option<String>,
+}
+
+/// Restore and erase do not record a reason; reject it rather than silently ignoring it.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryLifecycleRequest {
+    pub subject_id: Option<String>,
+    pub branch: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct DisabledMemoriesQuery {
+    pub subject_id: Option<String>,
+    pub limit: Option<i64>,
+    pub branch: Option<String>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct DisabledMemoriesResponse {
+    pub items: Vec<DisabledMemoryResponse>,
+    pub next_cursor: Option<String>,
+}
+
+/// A disabled memory with its disable marker lifted out of the (reserved) metadata.
+#[derive(Serialize)]
+pub struct DisabledMemoryResponse {
+    #[serde(flatten)]
+    pub memory: MemoryResponse,
+    pub disabled_at: Option<String>,
+    pub disabled_reason: Option<String>,
+}
+
+impl From<Memory> for DisabledMemoryResponse {
+    fn from(memory: Memory) -> Self {
+        let marker = memory
+            .extra_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(memoria_core::DISABLED_FIELD))
+            .cloned();
+        let field = |name: &str| {
+            marker
+                .as_ref()
+                .and_then(|marker| marker.get(name))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        Self {
+            disabled_at: field("at"),
+            disabled_reason: field("reason").filter(|reason| !reason.is_empty()),
+            memory: memory.into(),
         }
     }
 }
@@ -854,5 +958,37 @@ mod tests {
             connector_id: None,
         };
         assert!(mismatched.selector().is_err());
+    }
+
+    #[test]
+    fn idempotent_correction_omission_is_optional_and_not_a_metadata_editor() {
+        let plain: super::IdempotentCorrectRequest = serde_json::from_value(serde_json::json!({
+            "new_content": "text",
+            "subject_id": "consumer",
+            "branch": "main",
+            "idempotency_key": "key",
+        }))
+        .unwrap();
+        assert!(!plain.omit_structured_content);
+        let confirmed: super::IdempotentCorrectRequest =
+            serde_json::from_value(serde_json::json!({
+                "new_content": "text",
+                "subject_id": "consumer",
+                "branch": "main",
+                "idempotency_key": "key",
+                "omit_structured_content": true,
+            }))
+            .unwrap();
+        assert!(confirmed.omit_structured_content);
+        assert!(
+            serde_json::from_value::<super::IdempotentCorrectRequest>(serde_json::json!({
+                "new_content": "text",
+                "subject_id": "consumer",
+                "branch": "main",
+                "idempotency_key": "key",
+                "extra_metadata": {"structured_content": null},
+            }))
+            .is_err()
+        );
     }
 }

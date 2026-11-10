@@ -130,6 +130,7 @@ impl ApiKeyCache {
 #[derive(Clone)]
 pub struct AppState {
     pub service: Arc<MemoryService>,
+    pub memory_sql: Option<Arc<memoria_storage::readonly_sql::MemorySqlGateway>>,
     pub git: Arc<GitForDataService>,
     /// Master key for auth (empty = no auth)
     pub master_key: String,
@@ -200,6 +201,7 @@ impl AppState {
         };
         Self {
             service,
+            memory_sql: None,
             git,
             master_key,
             owner_content_filter_enabled: owner_content_filter_enabled(
@@ -225,6 +227,46 @@ impl AppState {
                 handles: Vec::new(),
             })),
         }
+    }
+
+    /// SQL remains unavailable unless explicitly enabled with a stable private
+    /// reader seed and authenticated key storage. Do not log the seed or config.
+    pub fn init_memory_sql(mut self) -> Result<Self, MemoriaError> {
+        let enabled = match std::env::var("MEMORIA_SQL_QUERY_ENABLED") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => "false".into(),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(MemoriaError::Validation(
+                    "MEMORIA_SQL_QUERY_ENABLED must be true or false".into(),
+                ))
+            }
+        };
+        match enabled.as_str() {
+            "false" => return Ok(self),
+            "true" => (),
+            _ => {
+                return Err(MemoriaError::Validation(
+                    "MEMORIA_SQL_QUERY_ENABLED must be true or false".into(),
+                ))
+            }
+        }
+        if self.master_key.is_empty() || self.auth_pool.is_none() {
+            return Err(MemoriaError::Validation(
+                "memory SQL requires authenticated API key storage".into(),
+            ));
+        }
+        let seed = std::env::var("MEMORIA_SQL_READER_SEED")
+            .map_err(|_| MemoriaError::Validation("memory SQL reader seed is required".into()))?;
+        self.memory_sql = Some(
+            memoria_storage::readonly_sql::MemorySqlGateway::new(seed.into_bytes()).map_err(
+                |_| {
+                    MemoriaError::Validation(
+                        "memory SQL reader seed must contain 32..1024 bytes".into(),
+                    )
+                },
+            )?,
+        );
+        Ok(self)
     }
 
     /// Create a dedicated auth pool and start the batched last_used_at flusher.
