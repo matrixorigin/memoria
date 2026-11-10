@@ -405,6 +405,8 @@ Full API details: [API Reference Skill](skills/api-reference/SKILL.md)
 
 Retry-safe single-memory writes: [Idempotent store protocol](docs/api/idempotent_store.md).
 
+Trusted adapter content preservation: [Content-filter policy](docs/api/content_filter_policy.md).
+
 ---
 
 ## 🔧 Commands

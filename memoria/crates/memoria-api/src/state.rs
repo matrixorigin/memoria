@@ -20,6 +20,19 @@ use tracing::{info, warn};
 const METRICS_CACHE_TTL_MAX_SECS: u64 = 300; // 5 min
 const AUTH_POOL_ACQUIRE_TIMEOUT_MAX_SECS: u64 = 30;
 
+fn owner_content_filter_enabled(value: Option<&str>) -> bool {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("true" | "1") => true,
+        Some("false" | "0") => false,
+        Some(_) => {
+            warn!(
+                "Invalid MEMORIA_OWNER_CONTENT_FILTER_ENABLED; keeping content filtering enabled"
+            );
+            true
+        }
+    }
+}
+
 pub struct CachedMetrics {
     pub body: Arc<String>,
     pub generated_at: Instant,
@@ -120,6 +133,9 @@ pub struct AppState {
     pub git: Arc<GitForDataService>,
     /// Master key for auth (empty = no auth)
     pub master_key: String,
+    /// Built-in content filtering for authenticated Memoria-Owner requests.
+    /// Defaults to true; ordinary API-key/Bearer requests are always filtered.
+    pub owner_content_filter_enabled: bool,
     /// Cross-instance async task store (DB-backed when sql_store is available)
     pub task_store: Option<Arc<dyn AsyncTaskStore>>,
     /// Instance identifier for distributed coordination
@@ -186,6 +202,11 @@ impl AppState {
             service,
             git,
             master_key,
+            owner_content_filter_enabled: owner_content_filter_enabled(
+                std::env::var("MEMORIA_OWNER_CONTENT_FILTER_ENABLED")
+                    .ok()
+                    .as_deref(),
+            ),
             task_store,
             instance_id: "single".into(),
             api_key_cache: ApiKeyCache::new(Duration::from_secs(300)),
@@ -378,6 +399,24 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owner_content_filter_defaults_and_invalid_values_fail_closed() {
+        for value in [
+            None,
+            Some("true"),
+            Some("1"),
+            Some(" TRUE "),
+            Some(""),
+            Some("off"),
+            Some("typo"),
+        ] {
+            assert!(super::owner_content_filter_enabled(value));
+        }
+        for value in [Some("false"), Some("0"), Some(" FALSE ")] {
+            assert!(!super::owner_content_filter_enabled(value));
+        }
+    }
+
     use super::*;
 
     fn cached_principal(expires_at: Option<chrono::NaiveDateTime>) -> CachedApiKeyPrincipal {

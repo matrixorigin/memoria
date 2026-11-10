@@ -490,6 +490,30 @@ pub async fn group_merge_guard(
     next.run(req).await
 }
 
+/// Install an unfiltered scope only after validating the trusted-owner scheme.
+/// The normal AuthUser extractor still performs route-scope admission. Invalid
+/// credentials/owners fall through to its ordinary rejection and accounting.
+pub async fn owner_content_filter_layer(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    // Remote MCP deliberately retains filtering, independently of whether its
+    // dispatcher happens to move execution onto a separate task/thread.
+    let owner = if state.owner_content_filter_enabled || req.uri().path() == "/mcp" {
+        None
+    } else {
+        req.headers()
+            .get("Authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Memoria-Owner "))
+            .and_then(|token| {
+                validate_owner_scoped_master_request(token, &state.master_key, req.headers()).ok()
+            })
+    };
+    memoria_service::content_filter::with_content_filter_scope(owner, next.run(req)).await
+}
+
 // ── Actor scope middleware ───────────────────────────────────────────────────
 
 /// Axum middleware that sets the `ACTOR_USER_ID` task-local for group-scoped

@@ -600,6 +600,11 @@ mints a replacement record and supersedes the original, so a replay either 404s
 on the already-superseded memory or creates a second replacement. It is
 classified with the non-idempotent column below.
 
+`memories.query()` and `memories.fulltext_search()` use POST to carry structured
+filters but only read memory data. Both sync and async clients classify these
+operations with the idempotent column below, retaining the same request body,
+retry budget, and backoff. They do not require `retry_unsafe_writes=True`.
+
 | Condition | Idempotent (GET/PUT/DELETE/…) | Non-idempotent (POST/PATCH, `memories.correct`) |
 |-----------|-------------------------------|------------------------------|
 | 500 | Yes — exponential backoff (`max_retries=3`) | No |
