@@ -1,4 +1,5 @@
 mod branch_capability;
+pub mod erase_barrier;
 pub mod graph;
 mod keyed_gates;
 pub mod migration;
@@ -26,7 +27,9 @@ pub use pool_config::{
 pub use router::{DbRouter, UserDatabaseRecord};
 pub use store::{
     snapshot_extra_memory_count, snapshot_extra_with_memory_count, validate_extra_metadata_filter,
-    validate_fulltext_query, run_gated_erase_step, EraseStatementHold, EraseStepGate,
+    validate_fulltext_query, run_gated_erase_step, EraseLockConnection, EraseStatementHold,
+    EraseStepFuture,
+    EraseStepGate,
     FeedbackStats, MemoryEraseReport, MemoryEraseSelector,
     MemoryFeedback, OwnedEditLogEntry, PoolHealthLevel,
     PoolHealthSnapshot, SqlMemoryStore, TierFeedback, UserRetrievalParams, ACTOR_USER_ID,

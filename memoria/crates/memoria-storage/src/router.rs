@@ -101,6 +101,7 @@ pub struct DbRouter {
     init_timeout: Duration,
     invalidation_timeout: Duration,
     user_init_semaphore: Arc<Semaphore>,
+    erase_barrier: Arc<crate::erase_barrier::EraseBarrier>,
 }
 
 impl DbRouter {
@@ -222,6 +223,7 @@ impl DbRouter {
                 15,
             ),
             user_init_semaphore: Arc::new(Semaphore::new(user_init_max)),
+            erase_barrier: Arc::new(crate::erase_barrier::EraseBarrier::new()),
         };
         router.ensure_user_registry_table().await?;
         Ok(router)
@@ -376,6 +378,10 @@ impl DbRouter {
         .await
     }
 
+    pub fn erase_barrier(&self) -> Arc<crate::erase_barrier::EraseBarrier> {
+        Arc::clone(&self.erase_barrier)
+    }
+
     pub async fn user_store(&self, user_id: &str) -> Result<Arc<SqlMemoryStore>, MemoriaError> {
         let cache_key = ScopeKey::User(user_id.to_owned());
         if let Some(cached) = self.user_store_cache.get(&cache_key) {
@@ -401,6 +407,7 @@ impl DbRouter {
                 let user_db_cache = self.user_db_cache.clone();
                 let user_schema_cache = self.user_schema_cache.clone();
                 let user_init_semaphore = self.user_init_semaphore.clone();
+                let erase_barrier = self.erase_barrier.clone();
                 let user_id_owned = user_id.to_string();
                 let existing = sqlx::query(
                     "SELECT db_name FROM mem_user_registry WHERE user_id = ? AND status = 'active'",
@@ -426,6 +433,7 @@ impl DbRouter {
                         embedding_dim,
                         &instance_id,
                         &db_name,
+                        &erase_barrier,
                     )?;
                     let init_result = init_store.migrate_user().await;
                     if let Err(err) = init_result {
@@ -463,6 +471,7 @@ impl DbRouter {
                     embedding_dim,
                     &instance_id,
                     &db_name,
+                    &erase_barrier,
                 )?);
                 self.user_store_cache
                     .insert(cache_key.clone(), store.clone());
@@ -484,6 +493,7 @@ impl DbRouter {
             self.embedding_dim,
             &self.instance_id,
             db_name,
+            &self.erase_barrier,
         )
     }
 
@@ -719,6 +729,7 @@ impl DbRouter {
                     self.embedding_dim,
                     &self.instance_id,
                     &db_name,
+                    &self.erase_barrier,
                 )?;
                 store.set_db_router(Arc::new(self.clone()));
                 let store = Arc::new(store);
@@ -749,11 +760,13 @@ fn build_routed_store(
     embedding_dim: usize,
     instance_id: &str,
     db_name: &str,
+    erase_barrier: &Arc<crate::erase_barrier::EraseBarrier>,
 ) -> Result<SqlMemoryStore, MemoriaError> {
     let db_url = user_db_url_from_shared(shared_db_url, db_name)?;
     let mut store = SqlMemoryStore::new(global_user_pool, embedding_dim, instance_id.to_string());
     store.set_db_name(db_name.to_string());
     store.set_database_url(db_url);
+    store.set_erase_barrier(Arc::clone(erase_barrier));
     Ok(store)
 }
 
@@ -1000,6 +1013,7 @@ mod tests {
             init_timeout,
             invalidation_timeout,
             user_init_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            erase_barrier: std::sync::Arc::new(crate::erase_barrier::EraseBarrier::new()),
         }
     }
 
