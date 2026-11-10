@@ -151,11 +151,15 @@ pub struct SealGuard {
 }
 
 impl SealGuard {
-    pub fn new(barrier: Arc<EraseBarrier>, scope: impl Into<String>) -> Self {
-        Self {
+    /// Own the seal before its first cancellation point. The caller must hold
+    /// the guard until all already-started erase statements have finished.
+    pub async fn acquire(barrier: Arc<EraseBarrier>, scope: impl Into<String>) -> Self {
+        let guard = Self {
             barrier,
             scope: scope.into(),
-        }
+        };
+        guard.barrier.seal(&guard.scope).await;
+        guard
     }
 }
 
@@ -169,6 +173,61 @@ impl Drop for SealGuard {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn cancelled_seal_wait_reopens_writes_and_snapshots() {
+        for snapshot in [false, true] {
+            let barrier = Arc::new(EraseBarrier::new());
+            let permit = if snapshot {
+                barrier.try_enter_snapshot().unwrap()
+            } else {
+                barrier.try_enter("grp").unwrap()
+            };
+            let mut waiting = Box::pin(SealGuard::acquire(barrier.clone(), "grp"));
+            // Poll to the pending drain without relying on scheduler timing.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                    .await
+                    .is_err()
+            );
+            assert!(barrier.try_enter("grp").is_none());
+            drop(waiting);
+            drop(permit);
+            assert!(barrier.try_enter("grp").is_some());
+            assert!(barrier.try_enter_snapshot().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_does_not_unseal_a_detached_statement() {
+        let barrier = Arc::new(EraseBarrier::new());
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let caller_barrier = barrier.clone();
+        let caller = tokio::spawn(async move {
+            let seal = SealGuard::acquire(caller_barrier, "grp").await;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let _seal = seal;
+                ready_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                drop(_seal);
+                let _ = tx.send(());
+                done_tx.send(()).unwrap();
+            });
+            let _ = rx.await;
+        });
+        ready_rx.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(barrier.try_enter("grp").is_none());
+        assert!(barrier.try_enter_snapshot().is_none());
+        release_tx.send(()).unwrap();
+        done_rx.await.unwrap();
+        assert!(barrier.try_enter("grp").is_some());
+        assert!(barrier.try_enter_snapshot().is_some());
+    }
 
     #[tokio::test]
     async fn seal_waits_for_an_accepted_write_then_rejects_the_next_one() {

@@ -5561,15 +5561,12 @@ impl SqlMemoryStore {
         if registered.0 > 0 {
             return Ok(true);
         }
-        self.safety_snapshots_with_prefix_exist(self.snapshot_search_prefix())
-            .await
-    }
-
-    fn snapshot_search_prefix(&self) -> String {
-        match self.database_name() {
-            Some(name) => safety_snapshot_prefix(Some(name)),
-            None => safety_snapshot_prefix(None),
+        for prefix in retained_safety_snapshot_prefixes(self.database_name()) {
+            if self.safety_snapshots_with_prefix_exist(prefix).await? {
+                return Ok(true);
+            }
         }
+        Ok(false)
     }
 
     async fn safety_snapshots_with_prefix_exist(
@@ -5591,15 +5588,7 @@ impl SqlMemoryStore {
         user_id: &str,
         gate: &mut EraseStepGate<H>,
     ) -> Result<(u64, bool), MemoriaError> {
-        let mut prefixes = Vec::new();
-        if let Some(name) = self.database_name() {
-            prefixes.push(safety_snapshot_prefix(Some(name)));
-            if let Some(legacy) = legacy_safety_snapshot_prefix(Some(name)) {
-                if !prefixes.contains(&legacy) {
-                    prefixes.push(legacy);
-                }
-            }
-        }
+        let prefixes = database_safety_snapshot_prefixes(self.database_name());
         let snapshots = self.t("mem_snapshots");
         let registered: Vec<(String,)> = sqlx::query_as(&format!(
             "SELECT snapshot_name FROM {snapshots} WHERE user_id = ? AND status = 'active'"
@@ -8442,6 +8431,27 @@ fn legacy_safety_snapshot_prefix(db_name: Option<&str>) -> Option<String> {
     db_name.map(|db_name| format!("mem_snap_{db_name}_pre_"))
 }
 
+// Shared by group deletion and subject retention checks. Account snapshots
+// are deliberately excluded here: callers may inspect, but not bulk-delete them.
+fn database_safety_snapshot_prefixes(db_name: Option<&str>) -> Vec<String> {
+    let Some(name) = db_name else {
+        return Vec::new();
+    };
+    let mut prefixes = vec![safety_snapshot_prefix(Some(name))];
+    if let Some(legacy) = legacy_safety_snapshot_prefix(Some(name)) {
+        if !prefixes.contains(&legacy) {
+            prefixes.push(legacy);
+        }
+    }
+    prefixes
+}
+
+fn retained_safety_snapshot_prefixes(db_name: Option<&str>) -> Vec<String> {
+    let mut prefixes = database_safety_snapshot_prefixes(db_name);
+    prefixes.push(safety_snapshot_prefix(None));
+    prefixes
+}
+
 fn build_safety_snapshot_name(db_name: Option<&str>, operation: &str) -> String {
     let prefix = safety_snapshot_prefix(db_name);
     let operation = compact_identifier_fragment(operation, SAFETY_SNAPSHOT_OPERATION_MAX_LEN);
@@ -8955,6 +8965,26 @@ mod tests {
     }
 
     static LOG_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn erase_snapshot_prefixes_include_legacy_without_widening_deletion() {
+        let database = "synthetic_database_with_a_name_long_enough_to_be_compacted_for_snapshots";
+        let prefixes = super::database_safety_snapshot_prefixes(Some(database));
+        assert!(prefixes.contains(&super::safety_snapshot_prefix(Some(database))));
+        assert!(prefixes.contains(&super::legacy_safety_snapshot_prefix(Some(database)).unwrap()));
+        assert!(!prefixes.contains(&super::safety_snapshot_prefix(None)));
+        assert!(super::database_safety_snapshot_prefixes(None).is_empty());
+        let short = super::database_safety_snapshot_prefixes(Some("db"));
+        let unique: std::collections::HashSet<_> = short.iter().collect();
+        assert_eq!(unique.len(), short.len());
+        let retained = super::retained_safety_snapshot_prefixes(Some(database));
+        assert!(prefixes.iter().all(|prefix| retained.contains(prefix)));
+        assert!(retained.contains(&super::safety_snapshot_prefix(None)));
+        assert_eq!(
+            super::retained_safety_snapshot_prefixes(None),
+            vec![super::safety_snapshot_prefix(None)]
+        );
+    }
 
     #[tokio::test]
     async fn atomic_correction_rejects_sealed_scope_before_database_access() {

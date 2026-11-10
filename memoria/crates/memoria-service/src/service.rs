@@ -2619,14 +2619,16 @@ impl MemoryService {
             }
         };
         let barrier = store.erase_barrier();
-        barrier.seal(scope_id).await;
+        let seal = memoria_storage::erase_barrier::SealGuard::acquire(barrier, scope_id).await;
         self.flush_edit_log().await;
-        let _seal = memoria_storage::erase_barrier::SealGuard::new(barrier, scope_id);
         let (cancel, lease, gate) = session.handoff();
         let scope = scope_id.to_string();
         let selector = selector.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
+            // Caller cancellation stops future steps, but must not reopen
+            // writes or snapshots while the current statement is in flight.
+            let _seal = seal;
             let mut steps = EraseStepGate::new(gate.clone());
             let result = store.erase_memories(&scope, &selector, &mut steps).await;
             let result = crate::erase_guard::conclude_erase(result, &gate).await;
