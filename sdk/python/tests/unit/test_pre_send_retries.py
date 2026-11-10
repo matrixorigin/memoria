@@ -184,3 +184,19 @@ def test_existing_safe_and_opt_in_retry_policy_is_preserved(send, method, unsafe
     assert invoke(handle, method=method, unsafe=unsafe) == {"ok": True}
     assert len(requests) == 2
     assert delays == [0.5]
+
+
+def test_idempotent_request_recovers_after_proxy_error(send):
+    invoke, delays = send
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        check_request(request, "GET")
+        if len(requests) == 1:
+            raise httpx.ProxyError("proxy temporarily unavailable", request=request)
+        return httpx.Response(200, json={"ok": True})
+
+    assert invoke(handle, method="GET") == {"ok": True}
+    assert len(requests) == 2
+    assert delays == [0.5]
