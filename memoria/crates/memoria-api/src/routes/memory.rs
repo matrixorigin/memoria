@@ -307,21 +307,39 @@ pub async fn store_memory(
     Ok((StatusCode::CREATED, Json(m.into())))
 }
 
-pub async fn batch_store(
-    State(state): State<AppState>,
-    auth: AuthUser,
-    Json(req): Json<BatchStoreRequest>,
-) -> Result<(StatusCode, Json<Vec<MemoryResponse>>), (StatusCode, String)> {
-    if req
-        .memories
-        .iter()
-        .any(|memory| memory.idempotency_key.is_some())
-    {
+// Batch writes currently cannot preserve per-item time or confidence. Reject
+// these fields rather than silently importing historical facts as new ones.
+fn validate_batch_write_fields(memories: &[StoreRequest]) -> Result<(), (StatusCode, String)> {
+    if memories.iter().any(|memory| memory.idempotency_key.is_some()) {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             "idempotency_key requires the single-memory store endpoint".into(),
         ));
     }
+    if memories.iter().any(|memory| memory.observed_at.is_some()) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "observed_at requires the single-memory store endpoint".into(),
+        ));
+    }
+    if memories
+        .iter()
+        .any(|memory| memory.initial_confidence.is_some())
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "initial_confidence requires the single-memory store endpoint".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub async fn batch_store(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<BatchStoreRequest>,
+) -> Result<(StatusCode, Json<Vec<MemoryResponse>>), (StatusCode, String)> {
+    validate_batch_write_fields(&req.memories)?;
     if req.memories.len() > 100 {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1276,4 +1294,66 @@ pub async fn get_tool_usage(
         .map(|(tool, ts)| serde_json::json!({"tool_name": tool, "last_used_at": ts.to_rfc3339()}))
         .collect();
     Ok(Json(serde_json::json!(items)))
+}
+
+#[cfg(test)]
+mod batch_write_field_tests {
+    use super::*;
+
+    fn validate_payload(value: serde_json::Value) -> Result<(), (StatusCode, String)> {
+        let request: BatchStoreRequest = serde_json::from_value(value).unwrap();
+        validate_batch_write_fields(&request.memories)
+    }
+
+    #[test]
+    fn batch_rejects_historical_timestamp_instead_of_silently_replacing_it() {
+        let error = validate_payload(serde_json::json!({
+            "memories": [{"content": "historical", "observed_at": "2020-05-01T00:00:00Z"}]
+        }))
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(error.1.contains("observed_at"));
+    }
+
+    #[test]
+    fn batch_rejects_explicit_confidence_including_zero() {
+        for confidence in [0.0, 0.5, 1.0] {
+            let error = validate_payload(serde_json::json!({
+                "memories": [{"content": "imported", "initial_confidence": confidence}]
+            }))
+            .unwrap_err();
+            assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(error.1.contains("initial_confidence"));
+        }
+    }
+
+    #[test]
+    fn batch_accepts_default_fields_and_nulls_but_still_rejects_idempotency_keys() {
+        for memory in [
+            serde_json::json!({"content": "ordinary"}),
+            serde_json::json!({
+                "content": "ordinary", "observed_at": null, "initial_confidence": null
+            }),
+        ] {
+            validate_payload(serde_json::json!({"memories": [memory]})).unwrap();
+        }
+        let error = validate_payload(serde_json::json!({
+            "memories": [{"content": "ordinary", "idempotency_key": "retry-1"}]
+        }))
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(error.1.contains("idempotency_key"));
+    }
+
+    #[test]
+    fn batch_rejects_any_unsupported_item_before_writing_the_batch() {
+        let error = validate_payload(serde_json::json!({
+            "memories": [
+                {"content": "first is valid"},
+                {"content": "second has a timestamp", "observed_at": "2020-05-01T00:00:00Z"}
+            ]
+        }))
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
 }
