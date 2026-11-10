@@ -6572,7 +6572,7 @@ impl SqlMemoryStore {
     }
 
     /// Deactivate an active memory and store the caller-built metadata that marks it disabled.
-    /// Returns the number of rows changed: 0 when the row was no longer active.
+    /// Main graph/link retirement commits with the memory. Returns 0 on a stale revision/state.
     pub async fn disable_in(
         &self,
         table: &str,
@@ -6580,6 +6580,7 @@ impl SqlMemoryStore {
         extra_metadata: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<u64, MemoriaError> {
         let table = self.t(table);
+        let mut transaction = self.pool.begin().await.map_err(db_err)?;
         let res = sqlx::query(&format!(
             "UPDATE {table} SET is_active = 0, extra_metadata = ?, updated_at = ? \
              WHERE memory_id = ? AND user_id = ? AND is_active = 1 AND updated_at = ?"
@@ -6596,10 +6597,16 @@ impl SqlMemoryStore {
                 })?
                 .naive_utc(),
         )
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(db_err)?;
-        Ok(res.rows_affected())
+        let changed = res.rows_affected();
+        if changed > 0 && table == self.t("mem_memories") {
+            self.retire_memory_relations(&mut transaction, expected)
+                .await?;
+        }
+        transaction.commit().await.map_err(db_err)?;
+        Ok(changed)
     }
 
     /// Reactivate a disabled memory with its marker removed. A superseded revision is never
@@ -7090,28 +7097,39 @@ impl SqlMemoryStore {
         // Graph retrieval is main-only. A branch clone may share IDs with main;
         // correcting it must not retire the main branch's graph references.
         if table == self.t("mem_memories") {
+            self.retire_memory_relations(&mut transaction, expected)
+                .await?;
+        }
+        transaction.commit().await.map_err(db_err)
+    }
+
+    /// Main-only relations; the caller owns the memory mutation transaction.
+    async fn retire_memory_relations(
+        &self,
+        connection: &mut MySqlConnection,
+        expected: &Memory,
+    ) -> Result<(), MemoriaError> {
+        sqlx::query(&format!(
+            "UPDATE {} SET is_active = 0 WHERE memory_id = ? AND user_id = ?",
+            self.t("memory_graph_nodes")
+        ))
+        .bind(&expected.memory_id)
+        .bind(&expected.user_id)
+        .execute(&mut *connection)
+        .await
+        .map_err(db_err)?;
+        for relation in ["mem_memory_entity_links", "mem_entity_links"] {
             sqlx::query(&format!(
-                "UPDATE {} SET is_active = 0 WHERE memory_id = ? AND user_id = ?",
-                self.t("memory_graph_nodes")
+                "DELETE FROM {} WHERE memory_id = ? AND user_id = ?",
+                self.t(relation)
             ))
             .bind(&expected.memory_id)
             .bind(&expected.user_id)
-            .execute(&mut *transaction)
+            .execute(&mut *connection)
             .await
             .map_err(db_err)?;
-            for relation in ["mem_memory_entity_links", "mem_entity_links"] {
-                sqlx::query(&format!(
-                    "DELETE FROM {} WHERE memory_id = ? AND user_id = ?",
-                    self.t(relation)
-                ))
-                .bind(&expected.memory_id)
-                .bind(&expected.user_id)
-                .execute(&mut *transaction)
-                .await
-                .map_err(db_err)?;
-            }
         }
-        transaction.commit().await.map_err(db_err)
+        Ok(())
     }
 
     /// Batch-insert multiple memories in a single multi-row INSERT statement.

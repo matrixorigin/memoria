@@ -2733,7 +2733,7 @@ impl MemoryService {
         );
         if sql.disable_in(&table, &memory, &metadata).await? == 0 {
             return Err(MemoriaError::Conflict(format!(
-                "memory {memory_id} is not active"
+                "memory {memory_id} state or revision changed; refetch before retrying"
             )));
         }
         self.send_edit_log(user_id, "disable", Some(memory_id), None, reason, None);
@@ -2741,7 +2741,6 @@ impl MemoryService {
             self.report(StatsEvent::MemoryDeactivated {
                 user_id: user_id.to_string(),
             });
-            Self::cleanup_entity_data_for_memory(sql.as_ref(), memory_id, "disable").await;
         }
         Self::owned_governance_target(&sql, &table, user_id, subject_id, memory_id).await
     }
@@ -2771,7 +2770,7 @@ impl MemoryService {
         }
         if sql.restore_in(&table, &memory, &metadata).await? == 0 {
             return Err(MemoriaError::Conflict(format!(
-                "memory {memory_id} is not disabled"
+                "memory {memory_id} state or revision changed; refetch before retrying"
             )));
         }
         self.send_edit_log(user_id, "restore", Some(memory_id), None, "", None);

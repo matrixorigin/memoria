@@ -5,8 +5,45 @@ import json
 import pytest
 from pytest_httpx import HTTPXMock
 
-from memoria import AsyncMemoriaClient, DisabledMemoryPage, MemoriaClient
+from memoria import AsyncMemoriaClient, DisabledMemory, DisabledMemoryPage, MemoriaClient
 from tests.conftest import MEMORY_STUB
+
+
+def test_disable_returns_public_reason_and_time(
+    httpx_mock: HTTPXMock, sync_client: MemoriaClient
+) -> None:
+    httpx_mock.add_response(
+        json={
+            **MEMORY_STUB,
+            "is_active": False,
+            "disabled_at": "2026-01-01T00:00:00Z",
+            "disabled_reason": "reviewed",
+        }
+    )
+    result = sync_client.memories.disable("mem_abc123", reason="reviewed")
+    assert isinstance(result, DisabledMemory)
+    assert result.memory.is_active is False
+    assert result.disabled_reason == "reviewed"
+    assert result.disabled_at is not None
+
+
+@pytest.mark.asyncio
+async def test_async_disable_returns_public_reason_and_time(
+    httpx_mock: HTTPXMock, async_client: AsyncMemoriaClient
+) -> None:
+    httpx_mock.add_response(
+        json={
+            **MEMORY_STUB,
+            "is_active": False,
+            "disabled_at": "2026-01-01T00:00:00Z",
+            "disabled_reason": "reviewed",
+        }
+    )
+    result = await async_client.memories.disable("mem_abc123", reason="reviewed")
+    assert isinstance(result, DisabledMemory)
+    assert result.memory.is_active is False
+    assert result.disabled_reason == "reviewed"
+    assert result.disabled_at is not None
 
 
 @pytest.mark.parametrize("operation", ["disable", "restore", "erase"])

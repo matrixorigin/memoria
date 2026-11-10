@@ -35,7 +35,10 @@ the listing; pagination is not a database snapshot.
 
 The reserved `_memoria_disabled` metadata key cannot be supplied by clients or used
 as a metadata filter. Responses strip reserved internal keys. Disabled-list records
-instead expose `disabled_at` and an optional `disabled_reason`. Stale-inactive-row
+instead expose `disabled_at` and an optional `disabled_reason`; the disable response
+returns those same fields (Python SDK: `DisabledMemory`). Main-table disable commits
+memory deactivation, graph deactivation and entity-link deletion in one transaction;
+a relation failure rolls back the mutation. Stale-inactive-row
 cleanup and tool-result TTL cleanup exclude operator-disabled records so they cannot remove
 the ability to restore them.
 Hygiene's cleanable inactive count excludes those records and erasure receipts.
@@ -46,6 +49,8 @@ completed after the erase pre-read prevents deletion of its history row.
 Conflicting states or concurrent changes return HTTP 409; clients must refetch,
 not automatically replay mutations. Python sync/async SDK methods do not mark
 these POSTs as idempotent retries.
+When a compare-and-swap misses, the response reports a changed state or revision,
+not an assumed active/disabled state. Refetch before deciding how to proceed.
 
 Only main-table mutations update shared entity graph state and main-memory stats.
 Mutations on a cloned branch must not deactivate main graph nodes or enqueue main

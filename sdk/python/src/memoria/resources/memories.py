@@ -10,6 +10,7 @@ from urllib.parse import quote
 
 from ..exceptions import MemoriaResponseError, MemoriaValidationError
 from ..models import (
+    DisabledMemory,
     DisabledMemoryPage,
     EraseResult,
     Memory,
@@ -680,13 +681,13 @@ class MemoriesResource:
         subject_id: str | None = None,
         reason: str | None = None,
         branch: str | None = None,
-    ) -> Memory:
+    ) -> DisabledMemory:
         """Take a memory out of retrieval while keeping it restorable."""
         body = _strip_none({"subject_id": subject_id, "reason": reason, "branch": branch})
         data = self._client._request(
             "POST", _memory_path(id, "/disable"), json=body, idempotent=False
         )
-        return Memory.from_dict(data)
+        return DisabledMemory.from_dict(data)
 
     def restore(
         self,
@@ -1089,12 +1090,12 @@ class AsyncMemoriesResource:
         subject_id: str | None = None,
         reason: str | None = None,
         branch: str | None = None,
-    ) -> Memory:
+    ) -> DisabledMemory:
         body = _strip_none({"subject_id": subject_id, "reason": reason, "branch": branch})
         data = await self._client._arequest(
             "POST", _memory_path(id, "/disable"), json=body, idempotent=False
         )
-        return Memory.from_dict(data)
+        return DisabledMemory.from_dict(data)
 
     async def restore(
         self,

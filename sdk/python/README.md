@@ -133,7 +133,9 @@ mem = client.memories.correct_by_query(query="old content", new_content="new con
 client.memories.delete("mem_id", reason="done")
 
 # Operator disable/restore (distinct from the existing delete/purge lifecycle)
-client.memories.disable("mem_id", subject_id="customer-a", branch="main", reason="reviewed")
+disabled = client.memories.disable("mem_id", subject_id="customer-a", branch="main", reason="reviewed")
+# DisabledMemory wraps the memory and the public disable details.
+print(disabled.memory.memory_id, disabled.disabled_at, disabled.disabled_reason)
 page = client.memories.list_disabled(subject_id="customer-a", branch="main", limit=100)
 while page.next_cursor:
     page = client.memories.list_disabled(

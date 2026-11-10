@@ -884,7 +884,7 @@ pub async fn disable_memory(
     auth: AuthUser,
     Path(id): Path<String>,
     Json(req): Json<MemoryGovernanceRequest>,
-) -> ApiResult<MemoryResponse> {
+) -> ApiResult<DisabledMemoryResponse> {
     let subject = governance_subject(req.subject_id.as_deref())?;
     let branch = governance_branch(&state, &auth, req.branch.as_deref()).await?;
     if req.reason.chars().count() > DISABLE_REASON_MAX_CHARS {

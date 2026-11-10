@@ -296,6 +296,8 @@ async fn disabled_memory_survives_cleanup_and_preserves_subject_fence() {
     assert_eq!(response.status(), 200);
     let disabled: Value = response.json().await.unwrap();
     assert_eq!(disabled["is_active"], false);
+    assert_eq!(disabled["disabled_reason"], "operator rejection");
+    assert!(disabled["disabled_at"].as_str().is_some());
     assert!(disabled["extra_metadata"]
         .get("_memoria_disabled")
         .is_none());
@@ -421,6 +423,85 @@ async fn disabled_pagination_is_stable_and_rejects_malformed_cursors() {
             422
         );
     }
+}
+
+#[tokio::test]
+async fn disable_relation_failure_rolls_back_memory_graph_and_links() {
+    let server = server().await;
+    let owner = format!("disable_atomic_{}", uuid::Uuid::new_v4().simple());
+    let id = store(&server, &owner, "atomic-disable").await;
+    let sql = server.user_store(&owner).await;
+    let nodes = sql.t("memory_graph_nodes");
+    let links = sql.t("mem_memory_entity_links");
+    sqlx::query(&format!("INSERT INTO {nodes} (node_id,user_id,node_type,content,memory_id,created_at) VALUES ('fixture-node',?,'semantic','Synthetic graph fact',?,NOW())"))
+        .bind(&owner).bind(&id).execute(sql.pool()).await.unwrap();
+    sqlx::query(&format!(
+        "INSERT INTO {links} (memory_id,entity_id,user_id) VALUES (?,'fixture-entity',?)"
+    ))
+    .bind(&id)
+    .bind(&owner)
+    .execute(sql.pool())
+    .await
+    .unwrap();
+
+    let table = sql.t("mem_memories");
+    let mut stale = sql
+        .get_owned_from(&table, &id, &owner)
+        .await
+        .unwrap()
+        .unwrap();
+    stale.updated_at = stale
+        .updated_at
+        .map(|time| time - chrono::Duration::seconds(1));
+    assert_eq!(
+        sql.disable_in(&table, &stale, &Default::default())
+            .await
+            .unwrap(),
+        0
+    );
+
+    // Only this UUID-isolated fixture database is damaged. Fail the final
+    // relation statement after the graph UPDATE and first link DELETE ran.
+    sqlx::query(&format!("DROP TABLE {}", sql.t("mem_entity_links")))
+        .execute(sql.pool())
+        .await
+        .unwrap();
+    let response = request(
+        &server,
+        &owner,
+        Method::POST,
+        &format!("/v1/memories/{id}/disable"),
+    )
+    .json(&json!({"branch":"main","reason":"must roll back"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 500);
+    let preserved = sql
+        .get_owned_from(&table, &id, &owner)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(preserved.is_active);
+    assert!(!preserved
+        .extra_metadata
+        .unwrap_or_default()
+        .contains_key(memoria_core::DISABLED_FIELD));
+    let active: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM {nodes} WHERE memory_id = ? AND node_id = 'fixture-node' AND is_active = 1"
+    ))
+    .bind(&id)
+    .fetch_one(sql.pool())
+    .await
+    .unwrap();
+    let linked: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM {links} WHERE memory_id = ? AND entity_id = 'fixture-entity'"
+    ))
+    .bind(&id)
+    .fetch_one(sql.pool())
+    .await
+    .unwrap();
+    assert_eq!((active, linked), (1, 1));
 }
 
 #[tokio::test]
