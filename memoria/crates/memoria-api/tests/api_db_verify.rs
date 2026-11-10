@@ -897,12 +897,29 @@ async fn test_batch_store_verify_db() {
 /// silently dropping per-item observed_at / initial_confidence. The endpoint
 /// must reject such payloads instead of importing history as brand-new facts
 /// (fix #381). This HTTP-level regression covers that contract against the
-/// real router and verifies that a rejected batch leaves no rows behind.
+/// real router and verifies that a rejected batch writes no new rows.
 #[tokio::test]
 #[serial]
 async fn test_batch_store_rejects_silently_ignored_fields_verify_db() {
     let (base, client, server) = spawn_server().await;
     let uid = uid();
+
+    // Seed an accepted batch first (omitted and explicit-null fields remain
+    // accepted end-to-end). The user's mem_memories table is only created by
+    // the first accepted write, so counting a never-written store fails with
+    // a missing-table error; the seeded rows also give the rejected-batch
+    // assertion below a stable count to compare against.
+    let r = client.post(format!("{base}/v1/memories/batch"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"memories": [
+            {"content": "clean batch"},
+            {"content": "clean with nulls", "observed_at": null, "initial_confidence": null},
+        ]}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 201);
+    let body: Vec<Value> = r.json().await.unwrap();
+    assert_eq!(body.len(), 2);
+    assert_eq!(db_count_active(&server, &uid).await, 2);
 
     // explicit observed_at would be silently replaced by "now"
     let r = client.post(format!("{base}/v1/memories/batch"))
@@ -948,20 +965,7 @@ async fn test_batch_store_rejects_silently_ignored_fields_verify_db() {
         ]}))
         .send().await.unwrap();
     assert_eq!(r.status(), 422);
-    assert_eq!(db_count_active(&server, &uid).await, 0, "rejected batch must not write rows");
-
-    // omitted and explicit-null fields remain accepted end-to-end
-    let r = client.post(format!("{base}/v1/memories/batch"))
-        .header("X-User-Id", &uid)
-        .json(&json!({"memories": [
-            {"content": "clean batch"},
-            {"content": "clean with nulls", "observed_at": null, "initial_confidence": null},
-        ]}))
-        .send().await.unwrap();
-    assert_eq!(r.status(), 201);
-    let body: Vec<Value> = r.json().await.unwrap();
-    assert_eq!(body.len(), 2);
-    assert_eq!(db_count_active(&server, &uid).await, 2);
+    assert_eq!(db_count_active(&server, &uid).await, 2, "rejected batch must not write rows");
 
     println!("✅ batch store: ignored import fields rejected, no partial write, nulls accepted");
 }
