@@ -143,7 +143,7 @@ client.memories.restore("mem_id", subject_id="customer-a", branch="main")
 
 # Erase this branch row's content; idempotent rows retain a content-free receipt.
 # Not a graph/edit-log/history/backup purge; replaying the erased key returns 409.
-client.memories.erase("mem_id", subject_id="customer-a", branch="main")
+client.memories.erase_one("mem_id", subject_id="customer-a", branch="main")
 # Purge (choose one selector)
 result = client.memories.purge(memory_ids=["id1", "id2"], reason="cleanup")
 result = client.memories.purge(topic="debug session", reason="done")

@@ -695,7 +695,7 @@ class MemoriesResource:
         )
         return Memory.from_dict(data)
 
-    def erase(
+    def erase_one(
         self,
         id: str,
         *,
@@ -1102,7 +1102,7 @@ class AsyncMemoriesResource:
         )
         return Memory.from_dict(data)
 
-    async def erase(
+    async def erase_one(
         self,
         id: str,
         *,

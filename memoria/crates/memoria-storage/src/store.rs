@@ -7011,6 +7011,12 @@ impl SqlMemoryStore {
         expected: &Memory,
         replacement: &Memory,
     ) -> Result<(), MemoriaError> {
+        let _permit = self
+            .erase_barrier()
+            .try_enter(&expected.user_id)
+            .ok_or_else(|| {
+                MemoriaError::Blocked("memory erase is already running for this scope".into())
+            })?;
         if expected.user_id != replacement.user_id
             || expected.subject_id != replacement.subject_id
             || expected.memory_id == replacement.memory_id
@@ -8916,6 +8922,29 @@ mod tests {
     }
 
     static LOG_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[tokio::test]
+    async fn atomic_correction_rejects_sealed_scope_before_database_access() {
+        let pool = MySqlPoolOptions::new()
+            .connect_lazy("mysql://synthetic:synthetic@127.0.0.1:1/synthetic")
+            .unwrap();
+        let store = SqlMemoryStore::new(pool, 3, "synthetic-instance".into());
+        let original: Memory = serde_json::from_value(serde_json::json!({
+            "memory_id": "original", "user_id": "owner", "memory_type": "semantic",
+            "content": "Synthetic fact", "initial_confidence": 0.65,
+            "source_event_ids": [], "is_active": true, "access_count": 0,
+            "trust_tier": "T3"
+        }))
+        .unwrap();
+        let mut replacement = original.clone();
+        replacement.memory_id = "replacement".into();
+        store.erase_barrier().seal("owner").await;
+        let result = store
+            .replace_memory_atomically("mem_memories", &original, &replacement)
+            .await;
+        assert!(matches!(result, Err(memoria_core::MemoriaError::Blocked(_))));
+        store.erase_barrier().unseal("owner");
+    }
 
     #[test]
     fn fulltext_code_underline_does_not_poison_other_terms() {

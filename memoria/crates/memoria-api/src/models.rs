@@ -838,6 +838,47 @@ mod tests {
     use memoria_core::MemoryType;
 
     #[test]
+    fn disabled_response_exposes_reason_without_internal_metadata() {
+        let memory: memoria_core::Memory = serde_json::from_value(serde_json::json!({
+            "memory_id":"synthetic-memory", "user_id":"owner", "memory_type":"semantic",
+            "content":"Synthetic fact", "initial_confidence":0.65, "source_event_ids":[],
+            "is_active":false, "access_count":0, "trust_tier":"T3",
+            "extra_metadata":{
+                "scene":"support",
+                "_memoria_disabled":{"at":"2026-01-01T00:00:00Z","reason":"rejected"},
+                "_memoria_store_request_sha256":"internal-fingerprint"
+            }
+        }))
+        .unwrap();
+        let output = serde_json::to_value(super::DisabledMemoryResponse::from(memory)).unwrap();
+        assert_eq!(output["disabled_reason"], "rejected");
+        assert_eq!(output["disabled_at"], "2026-01-01T00:00:00Z");
+        assert_eq!(
+            output["extra_metadata"],
+            serde_json::json!({"scene":"support"})
+        );
+    }
+
+    #[test]
+    fn governance_conflicts_are_not_internal_server_errors() {
+        let (status, _) = crate::routes::memory::api_err_typed(
+            memoria_core::MemoriaError::Conflict("memory changed".into()),
+        );
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn callers_cannot_filter_on_governance_marker() {
+        assert!(
+            memoria_storage::validate_extra_metadata_filter(&std::collections::HashMap::from([(
+                "_memoria_disabled".into(),
+                serde_json::json!(true)
+            )]))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn memory_type_parser_deduplicates_before_sql_option_construction() {
         let raw = vec![
             "semantic".to_string(),

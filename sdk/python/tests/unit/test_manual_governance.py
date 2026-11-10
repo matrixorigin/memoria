@@ -17,7 +17,8 @@ def test_lifecycle_methods_keep_scope(
         status_code=204 if operation == "erase" else 200,
         json=None if operation == "erase" else MEMORY_STUB,
     )
-    getattr(sync_client.memories, operation)("mem_abc123", subject_id="subject-a", branch="review")
+    method = "erase_one" if operation == "erase" else operation
+    getattr(sync_client.memories, method)("mem_abc123", subject_id="subject-a", branch="review")
     request = httpx_mock.get_request()
     assert request is not None
     assert request.method == "POST"
@@ -51,7 +52,8 @@ async def test_async_lifecycle_methods_keep_scope(
         status_code=204 if operation == "erase" else 200,
         json=None if operation == "erase" else MEMORY_STUB,
     )
-    await getattr(async_client.memories, operation)(
+    method = "erase_one" if operation == "erase" else operation
+    await getattr(async_client.memories, method)(
         "mem_abc123", subject_id="subject-a", branch="review"
     )
     request = httpx_mock.get_request()
@@ -75,3 +77,21 @@ async def test_async_disabled_page(httpx_mock: HTTPXMock, async_client: AsyncMem
         "branch": "review",
         "cursor": "opaque",
     }
+
+
+@pytest.mark.asyncio
+async def test_async_scoped_erase_does_not_shadow_single_memory_erase(
+    httpx_mock: HTTPXMock, async_client: AsyncMemoriaClient
+) -> None:
+    httpx_mock.add_response(status_code=204)
+    httpx_mock.add_response(
+        json={"memories": 2, "snapshots_dropped": 0, "snapshots_retained": True}
+    )
+    await async_client.memories.erase_one("mem_abc123", subject_id="subject-a", branch="main")
+    result = await async_client.memories.erase(mode="subject", subject_id="subject-a")
+    assert result.memories == 2
+    assert result.snapshots_retained
+    requests = httpx_mock.get_requests()
+    assert requests[0].url.path == "/v1/memories/mem_abc123/erase"
+    assert requests[1].url.path == "/v1/memories/erase"
+    assert json.loads(requests[1].content) == {"mode": "subject", "subject_id": "subject-a"}
