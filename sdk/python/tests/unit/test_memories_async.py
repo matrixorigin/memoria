@@ -7,7 +7,7 @@ import json
 import pytest
 from pytest_httpx import HTTPXMock
 
-from memoria import AsyncMemoriaClient, MemoriaAuthError, MemoriaValidationError
+from memoria import AsyncMemoriaClient, MemoriaAuthError, MemoriaServerError, MemoriaValidationError
 from memoria.models import Memory, MemoryPage, PurgeResult, RetrieveResult
 from tests.conftest import API_KEY, BASE_URL, MEMORY_STUB
 
@@ -45,6 +45,7 @@ async def test_store_with_idempotency_key_retries_on_safe_endpoint(
         mem = await client.memories.store(
             content="test content",
             idempotency_key="session-1:turn-2",
+            branch="main",
         )
 
     assert mem.memory_id == "mem_abc123"
@@ -55,6 +56,25 @@ async def test_store_with_idempotency_key_retries_on_safe_endpoint(
         json.loads(request.content)["idempotency_key"] == "session-1:turn-2"
         for request in requests
     )
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("branch", [None, "", "   "])
+async def test_keyed_store_without_explicit_branch_is_not_replayed(
+    httpx_mock: HTTPXMock, monkeypatch: pytest.MonkeyPatch, branch: str | None
+) -> None:
+    # See the sync test: an implicit branch can change between attempts.
+    monkeypatch.setattr("memoria._http._backoff", lambda _: 0)
+    httpx_mock.add_response(status_code=503, text="temporarily unavailable")
+
+    async with AsyncMemoriaClient(base_url=BASE_URL, api_key=API_KEY, max_retries=1) as client:
+        with pytest.raises(MemoriaServerError):
+            await client.memories.store(
+                content="test content", idempotency_key="session-1:turn-2", branch=branch
+            )
+
+    requests = httpx_mock.get_requests()
+    assert len(requests) == 1
+    assert requests[0].url.path == "/v1/memories/idempotent"
 
 
 @pytest.mark.asyncio
