@@ -145,7 +145,7 @@ async fn cleanup(pool: &MySqlPool, user_id: &str, db_name: &str) {
         .await;
     let prefix = safety_snapshot_prefix(db_name);
     let rows: Vec<(String,)> =
-        sqlx::query_as("SELECT sname FROM mo_catalog.mo_snapshots WHERE prefix_eq(sname, ?)")
+        sqlx::query_as("SELECT sname FROM mo_catalog.mo_snapshots WHERE prefix_eq(sname, CAST(? AS VARCHAR))")
             .bind(prefix)
             .fetch_all(pool)
             .await

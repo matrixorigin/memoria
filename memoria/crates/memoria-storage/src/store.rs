@@ -3308,10 +3308,10 @@ impl SqlMemoryStore {
 
     /// Drop the N oldest `mem_snap_pre_` snapshots. Returns count dropped.
     async fn cleanup_oldest_safety_snapshots(&self, prefix: &str, n: usize) -> usize {
-        let rows: Vec<(String,)> = sqlx::query_as(
+        let rows: Vec<(String,)> = sqlx::query_as(&format!(
             "SELECT sname FROM mo_catalog.mo_snapshots \
-             WHERE prefix_eq(sname, ?) ORDER BY ts ASC",
-        )
+             WHERE {SNAPSHOT_NAME_PREFIX_MATCH} ORDER BY ts ASC",
+        ))
         .bind(prefix)
         .fetch_all(&self.pool)
         .await
@@ -5415,9 +5415,9 @@ impl SqlMemoryStore {
     }
 
     async fn safety_snapshots_with_prefix_exist(&self, prefix: String) -> Result<bool, MemoriaError> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT sname FROM mo_catalog.mo_snapshots WHERE prefix_eq(sname, ?) LIMIT 1",
-        )
+        let rows: Vec<(String,)> = sqlx::query_as(&format!(
+            "SELECT sname FROM mo_catalog.mo_snapshots WHERE {SNAPSHOT_NAME_PREFIX_MATCH} LIMIT 1",
+        ))
         .bind(prefix)
         .fetch_all(&self.pool)
         .await
@@ -5449,9 +5449,9 @@ impl SqlMemoryStore {
         .map_err(db_err)?;
         let mut dropped = 0u64;
         for prefix in &prefixes {
-            let rows: Vec<(String,)> = sqlx::query_as(
-                "SELECT sname FROM mo_catalog.mo_snapshots WHERE prefix_eq(sname, ?)",
-            )
+            let rows: Vec<(String,)> = sqlx::query_as(&format!(
+                "SELECT sname FROM mo_catalog.mo_snapshots WHERE {SNAPSHOT_NAME_PREFIX_MATCH}",
+            ))
             .bind(prefix)
             .fetch_all(&self.pool)
             .await
@@ -5470,9 +5470,9 @@ impl SqlMemoryStore {
             {
                 continue;
             }
-            let rows: Vec<(String,)> = sqlx::query_as(
-                "SELECT sname FROM mo_catalog.mo_snapshots WHERE prefix_eq(sname, ?)",
-            )
+            let rows: Vec<(String,)> = sqlx::query_as(&format!(
+                "SELECT sname FROM mo_catalog.mo_snapshots WHERE {SNAPSHOT_NAME_PREFIX_MATCH}",
+            ))
             .bind(prefix)
             .fetch_all(&self.pool)
             .await
@@ -7865,6 +7865,9 @@ fn compact_identifier_fragment(value: &str, max_len: usize) -> String {
         .collect();
     format!("{head}_{tail}")
 }
+
+/// MatrixOne `prefix_eq` accepts only VARCHAR. sqlx binds a Rust string as TEXT.
+const SNAPSHOT_NAME_PREFIX_MATCH: &str = "prefix_eq(sname, CAST(? AS VARCHAR))";
 
 fn safety_snapshot_scope(db_name: &str) -> String {
     compact_identifier_fragment(db_name, SAFETY_SNAPSHOT_SCOPE_MAX_LEN)
