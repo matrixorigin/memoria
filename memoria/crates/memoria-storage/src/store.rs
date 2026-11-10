@@ -8,6 +8,7 @@ use memoria_core::{
 use sqlx::{mysql::MySqlPool, Connection, MySql, QueryBuilder, Row};
 use std::borrow::Cow;
 use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -939,6 +940,7 @@ pub struct SqlMemoryStore {
     /// Optional: route log_edit through async buffer instead of direct INSERT.
     /// Shared across main store and background pool clones so a single clear drains all.
     edit_log_tx: Arc<std::sync::RwLock<Option<tokio::sync::mpsc::Sender<OwnedEditLogEntry>>>>,
+    erase_barrier: Arc<std::sync::RwLock<Arc<crate::erase_barrier::EraseBarrier>>>,
     db_router: Option<Arc<DbRouter>>,
     /// When Some, `t()` qualifies table names with this database prefix.
     /// Enables a single global pool to serve queries for different per-user databases.
@@ -1087,16 +1089,17 @@ fn memory_erase_predicate(
     Ok((predicate, binds))
 }
 
+/// One erase statement. Boxed so the step future stays `'static` on Rust 1.85.
+pub type EraseStepFuture = Pin<Box<dyn Future<Output = Result<u64, MemoriaError>> + Send>>;
+
 /// Holds this operation's lock row across one destructive statement.
 ///
-/// `run_step` may poll `action` only after this holder owns the lock, and it
-/// must keep that ownership until `action` returns. Dropping `action` without
-/// polling it means the statement was not sent.
+/// `run_step` may poll `action` only after this holder owns an unexpired lock
+/// and the operation is still current. It must keep that ownership until
+/// `action` returns. Dropping `action` without polling it means the statement
+/// was not sent.
 pub trait EraseStatementHold: Send + Sync {
-    fn run_step<F>(
-        &self,
-        action: F,
-    ) -> impl Future<Output = Result<u64, MemoriaError>> + Send
+    fn run_step<F>(&self, action: F) -> EraseStepFuture
     where
         F: Future<Output = Result<u64, MemoriaError>> + Send + 'static;
 }
@@ -1121,13 +1124,24 @@ pub async fn run_gated_erase_step<H: EraseStatementHold>(
     gate.hold.run_step(action).await
 }
 
+fn current_holder_for_update_sql(lock_table: &str) -> String {
+    format!(
+        "SELECT holder_id FROM {lock_table} \
+         WHERE lock_key = ? AND holder_id = ? AND expires_at >= NOW() FOR UPDATE"
+    )
+}
+
+fn refresh_holder_lock_sql(lock_table: &str) -> String {
+    format!("UPDATE {lock_table} SET expires_at = ? WHERE lock_key = ? AND holder_id = ?")
+}
+
 fn lock_acquire_blocked(error: &sqlx::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("lock wait") || message.contains("write conflict") || message.contains("write-write")
 }
 
-fn group_snapshots_retained(database_named: bool, account_snapshots_remain: bool) -> bool {
-    !database_named && account_snapshots_remain
+fn group_snapshots_retained(account_snapshots_remain: bool) -> bool {
+    account_snapshots_remain
 }
 
 fn unreferenced_entity_delete_sql(entities: &str, links: &str) -> String {
@@ -1216,16 +1230,18 @@ mod erase_scope_tests {
     }
 
     #[test]
-    fn unnamed_database_reports_account_snapshots_retained() {
-        assert!(group_snapshots_retained(false, true));
-        assert!(!group_snapshots_retained(false, false));
-        assert!(!group_snapshots_retained(true, true));
+    fn account_snapshots_are_reported_when_they_remain() {
+        assert!(group_snapshots_retained(true));
+        assert!(!group_snapshots_retained(false));
     }
 }
 
 #[cfg(test)]
 mod erase_gate_tests {
-    use super::{run_gated_erase_step, EraseStatementHold, EraseStepGate};
+    use super::{
+        current_holder_for_update_sql, refresh_holder_lock_sql, run_gated_erase_step,
+        EraseStatementHold, EraseStepFuture, EraseStepGate,
+    };
     use memoria_core::MemoriaError;
     use std::future::Future;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1238,15 +1254,12 @@ mod erase_gate_tests {
     struct Refuse;
 
     impl EraseStatementHold for Refuse {
-        fn run_step<F>(
-            &self,
-            action: F,
-        ) -> impl Future<Output = Result<u64, MemoriaError>> + Send
+        fn run_step<F>(&self, action: F) -> EraseStepFuture
         where
             F: Future<Output = Result<u64, MemoriaError>> + Send + 'static,
         {
             drop(action);
-            async { Err(lost()) }
+            Box::pin(async { Err(lost()) })
         }
     }
 
@@ -1255,22 +1268,29 @@ mod erase_gate_tests {
     }
 
     impl EraseStatementHold for Once {
-        fn run_step<F>(
-            &self,
-            action: F,
-        ) -> impl Future<Output = Result<u64, MemoriaError>> + Send
+        fn run_step<F>(&self, action: F) -> EraseStepFuture
         where
             F: Future<Output = Result<u64, MemoriaError>> + Send + 'static,
         {
             let calls = Arc::clone(&self.calls);
-            async move {
+            Box::pin(async move {
                 if calls.fetch_add(1, Ordering::SeqCst) > 0 {
                     drop(action);
                     return Err(lost());
                 }
                 action.await
-            }
+            })
         }
+    }
+
+    #[test]
+    fn new_statement_requires_an_unexpired_holder_lock() {
+        let sql = current_holder_for_update_sql("mem_distributed_locks");
+        assert!(sql.contains("holder_id = ?"));
+        assert!(sql.contains("expires_at >= NOW()"));
+        assert!(sql.contains("FOR UPDATE"));
+        let refresh = refresh_holder_lock_sql("mem_distributed_locks");
+        assert!(!refresh.contains("expires_at >= NOW()"));
     }
 
     #[tokio::test]
@@ -1315,6 +1335,56 @@ mod erase_gate_tests {
     }
 }
 
+pub struct EraseLockConnection {
+    store: SqlMemoryStore,
+    conn: tokio::sync::Mutex<sqlx::mysql::MySqlConnection>,
+}
+
+impl EraseLockConnection {
+    pub async fn connect(store: SqlMemoryStore) -> Result<Self, MemoriaError> {
+        let url = store.database_url.clone().ok_or_else(|| {
+            MemoriaError::Internal("erase lock connection requires database_url".into())
+        })?;
+        let conn = sqlx::mysql::MySqlConnection::connect(&url)
+            .await
+            .map_err(db_err)?;
+        Ok(Self {
+            store,
+            conn: tokio::sync::Mutex::new(conn),
+        })
+    }
+
+    pub fn store(&self) -> &SqlMemoryStore {
+        &self.store
+    }
+
+    pub async fn run_locked_statement<F>(
+        &self,
+        key: &str,
+        holder: &str,
+        ttl_secs: i64,
+        stop_steps: &AtomicBool,
+        lost: &AtomicBool,
+        action: F,
+    ) -> Result<u64, MemoriaError>
+    where
+        F: Future<Output = Result<u64, MemoriaError>> + Send,
+    {
+        let mut conn = self.conn.lock().await;
+        self.store
+            .run_with_holder_lock_on(
+                &mut *conn,
+                key,
+                holder,
+                ttl_secs,
+                stop_steps,
+                lost,
+                action,
+            )
+            .await
+    }
+}
+
 impl SqlMemoryStore {
     pub fn new(pool: MySqlPool, embedding_dim: usize, instance_id: String) -> Self {
         Self {
@@ -1344,6 +1414,9 @@ impl SqlMemoryStore {
                 .time_to_live(std::time::Duration::from_secs(120))
                 .build(),
             edit_log_tx: Arc::new(std::sync::RwLock::new(None)),
+            erase_barrier: Arc::new(std::sync::RwLock::new(Arc::new(
+                crate::erase_barrier::EraseBarrier::new(),
+            ))),
             db_router: None,
             db_name: None,
         }
@@ -1357,6 +1430,18 @@ impl SqlMemoryStore {
     /// Clear the edit-log sender (shutdown drain). After this, log_edit falls back to direct INSERT.
     pub fn clear_edit_log_tx(&self) {
         *self.edit_log_tx.write().unwrap() = None;
+    }
+
+    pub fn erase_barrier(&self) -> Arc<crate::erase_barrier::EraseBarrier> {
+        self.erase_barrier.read().expect("erase barrier").clone()
+    }
+
+    pub fn set_erase_barrier(&self, barrier: Arc<crate::erase_barrier::EraseBarrier>) {
+        *self.erase_barrier.write().expect("erase barrier") = barrier;
+    }
+
+    pub fn database_url(&self) -> Option<&str> {
+        self.database_url.as_deref()
     }
 
     pub fn pool(&self) -> &MySqlPool {
@@ -1657,6 +1742,7 @@ impl SqlMemoryStore {
                 }
                 // Share the same edit_log_tx Arc so clear_edit_log_tx drains all stores at once
                 s.edit_log_tx = self.edit_log_tx.clone();
+                s.erase_barrier = self.erase_barrier.clone();
                 s.db_router = self.db_router.clone();
                 Ok(std::sync::Arc::new(s))
             }
@@ -3057,6 +3143,12 @@ impl SqlMemoryStore {
         &self,
         operation: &str,
     ) -> (Option<String>, Option<String>) {
+        let Some(_permit) = self.erase_barrier().try_enter_snapshot() else {
+            return (
+                None,
+                Some("memory erase is already running for this scope".into()),
+            );
+        };
         let snapshot_prefix = safety_snapshot_prefix(self.database_name());
         let legacy_prefix = legacy_safety_snapshot_prefix(self.database_name());
         let name = build_safety_snapshot_name(self.database_name(), operation);
@@ -3139,6 +3231,9 @@ impl SqlMemoryStore {
         reason: &str,
         snapshot_before: Option<&str>,
     ) {
+        let Some(_permit) = self.erase_barrier().try_enter(user_id) else {
+            return;
+        };
         if let Some(tx) = self.edit_log_tx.read().unwrap().clone() {
             let entry = OwnedEditLogEntry {
                 edit_id: uuid7_id(),
@@ -3211,6 +3306,9 @@ impl SqlMemoryStore {
         reason: &str,
         snapshot_before: Option<&str>,
     ) -> Result<(), MemoriaError> {
+        let Some(_permit) = self.erase_barrier().try_enter(user_id) else {
+            return Ok(());
+        };
         let edit_log_table = self.t("mem_edit_log");
         let edit_id = uuid7_id();
         // MO workaround (revert when fixed): MatrixOne prepared-statement bind of
@@ -3252,10 +3350,22 @@ impl SqlMemoryStore {
         if entries.is_empty() {
             return Ok(());
         }
+        let barrier = self.erase_barrier();
+        let mut admitted = Vec::new();
+        let mut _permits = Vec::new();
+        for entry in entries {
+            if let Some(permit) = barrier.try_enter(&entry.user_id) {
+                admitted.push(entry.clone());
+                _permits.push(permit);
+            }
+        }
+        if admitted.is_empty() {
+            return Ok(());
+        }
         if let Some(router) = self.db_router.clone() {
             let mut by_user: std::collections::HashMap<&str, Vec<OwnedEditLogEntry>> =
                 std::collections::HashMap::new();
-            for entry in entries {
+            for entry in &admitted {
                 by_user
                     .entry(entry.user_id.as_str())
                     .or_default()
@@ -3302,7 +3412,7 @@ impl SqlMemoryStore {
             }
             return Ok(());
         }
-        self.flush_edit_log_batch_direct(entries).await
+        self.flush_edit_log_batch_direct(&admitted).await
     }
 
     async fn flush_edit_log_batch_direct(
@@ -3517,6 +3627,9 @@ impl SqlMemoryStore {
         name: &str,
         table_name: &str,
     ) -> Result<(), MemoriaError> {
+        let _permit = self.erase_barrier().try_enter(user_id).ok_or_else(|| {
+            MemoriaError::Blocked("memory erase is already running for this scope".into())
+        })?;
         let branches_table = self.t("mem_branches");
         let now = Utc::now().naive_utc();
         let id = uuid::Uuid::new_v4().simple().to_string();
@@ -4981,6 +5094,48 @@ impl SqlMemoryStore {
                 ));
             }
         }
+        let mut known = memory_tables;
+        for _ in 0..2 {
+            let current = self.erase_memory_tables(user_id).await?;
+            let extra: Vec<String> = current
+                .into_iter()
+                .filter(|table| !known.iter().any(|seen| seen == table))
+                .collect();
+            if extra.is_empty() {
+                break;
+            }
+            for table in extra {
+                let deleted = run_gated_erase_step(
+                    gate,
+                    self.owned_delete(
+                        format!("DELETE FROM {table} WHERE {predicate}"),
+                        binds.clone(),
+                    ),
+                )
+                .await?;
+                if table.ends_with("mem_memories") || table == "mem_memories" {
+                    report.memories += deleted;
+                } else {
+                    report.branch_memories += deleted;
+                }
+                let remaining = self.count_where(&table, &predicate, &binds).await?;
+                if remaining != 0 {
+                    return Err(MemoriaError::Internal(
+                        "physical erase left memory rows".into(),
+                    ));
+                }
+                known.push(table);
+            }
+        }
+        let final_tables = self.erase_memory_tables(user_id).await?;
+        if final_tables
+            .iter()
+            .any(|table| !known.iter().any(|seen| seen == table))
+        {
+            return Err(MemoriaError::Internal(
+                "physical erase left memory rows in a new branch".into(),
+            ));
+        }
         Ok(report)
     }
 
@@ -5183,11 +5338,11 @@ impl SqlMemoryStore {
         .await
         .map_err(db_err)?;
         let mut dropped = 0u64;
-        for prefix in prefixes {
+        for prefix in &prefixes {
             let rows: Vec<(String,)> = sqlx::query_as(
                 "SELECT sname FROM mo_catalog.mo_snapshots WHERE prefix_eq(sname, ?)",
             )
-            .bind(&prefix)
+            .bind(prefix)
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
@@ -5198,17 +5353,36 @@ impl SqlMemoryStore {
         for (name,) in registered {
             dropped += run_gated_erase_step(gate, self.owned_drop_snapshot(name)).await?;
         }
-        let database_named = self.database_name().is_some();
-        let account_snapshots_remain = if database_named {
-            false
-        } else {
-            self.safety_snapshots_with_prefix_exist(safety_snapshot_prefix(None))
+        for prefix in &prefixes {
+            if !self
+                .safety_snapshots_with_prefix_exist(prefix.clone())
                 .await?
-        };
-        Ok((
-            dropped,
-            group_snapshots_retained(database_named, account_snapshots_remain),
-        ))
+            {
+                continue;
+            }
+            let rows: Vec<(String,)> = sqlx::query_as(
+                "SELECT sname FROM mo_catalog.mo_snapshots WHERE prefix_eq(sname, ?)",
+            )
+            .bind(prefix)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+            for (name,) in rows {
+                dropped += run_gated_erase_step(gate, self.owned_drop_snapshot(name)).await?;
+            }
+            if self
+                .safety_snapshots_with_prefix_exist(prefix.clone())
+                .await?
+            {
+                return Err(MemoriaError::Internal(
+                    "physical erase left a snapshot copy".into(),
+                ));
+            }
+        }
+        let account_snapshots_remain = self
+            .safety_snapshots_with_prefix_exist(safety_snapshot_prefix(None))
+            .await?;
+        Ok((dropped, group_snapshots_retained(account_snapshots_remain)))
     }
 
     async fn drop_snapshot(&self, name: &str) -> Result<u64, MemoriaError> {
@@ -5270,15 +5444,18 @@ impl SqlMemoryStore {
 
     /// Run `action` while this holder keeps the lock row locked.
     ///
-    /// The statement is polled only after `FOR UPDATE` confirms ownership. The
-    /// row lock stays until `action` returns, so another acquire cannot commit
-    /// over an in-flight statement. The future is not polled when this holder
-    /// no longer owns the row.
+    /// The statement is polled only after `FOR UPDATE` confirms an unexpired
+    /// lease and the operation is still current. Cancellation or lock loss
+    /// during the connection and row-lock wait does not start `action`. The
+    /// row lock then stays until `action` returns, and only that started
+    /// statement refreshes the lease.
     pub async fn run_with_holder_lock<F>(
         &self,
         key: &str,
         holder: &str,
         ttl_secs: i64,
+        stop_steps: &AtomicBool,
+        lost: &AtomicBool,
         action: F,
     ) -> Result<u64, MemoriaError>
     where
@@ -5289,20 +5466,23 @@ impl SqlMemoryStore {
                 .await
                 .map_err(db_err)?;
             return self
-                .run_with_holder_lock_on(&mut conn, key, holder, ttl_secs, action)
+                .run_with_holder_lock_on(&mut conn, key, holder, ttl_secs, stop_steps, lost, action)
                 .await;
         }
         let mut conn = self.conn().await?;
-        self.run_with_holder_lock_on(&mut *conn, key, holder, ttl_secs, action)
+        self.run_with_holder_lock_on(&mut *conn, key, holder, ttl_secs, stop_steps, lost, action)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_with_holder_lock_on<C, F>(
         &self,
         conn: &mut C,
         key: &str,
         holder: &str,
         ttl_secs: i64,
+        stop_steps: &AtomicBool,
+        lost: &AtomicBool,
         action: F,
     ) -> Result<u64, MemoriaError>
     where
@@ -5311,15 +5491,14 @@ impl SqlMemoryStore {
     {
         let mut tx = conn.begin().await.map_err(db_err)?;
         let lock_table = self.t("mem_distributed_locks");
-        let owned = sqlx::query(&format!(
-            "SELECT holder_id FROM {lock_table} WHERE lock_key = ? AND holder_id = ? FOR UPDATE"
-        ))
-        .bind(key)
-        .bind(holder)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        if owned.is_none() {
+        let owned = sqlx::query(&current_holder_for_update_sql(&lock_table))
+            .bind(key)
+            .bind(holder)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        let stopped = stop_steps.load(Ordering::Relaxed) || lost.load(Ordering::Relaxed);
+        if owned.is_none() || stopped {
             let _ = tx.rollback().await;
             return Err(MemoriaError::Internal(
                 "memory erase lost its lock before completion".into(),
@@ -5328,14 +5507,14 @@ impl SqlMemoryStore {
         let result = action.await;
         let expires_at =
             chrono::Utc::now().naive_utc() + chrono::Duration::seconds(ttl_secs.max(1));
-        let extended = sqlx::query(&format!(
-            "UPDATE {lock_table} SET expires_at = ? WHERE lock_key = ? AND holder_id = ?"
-        ))
-        .bind(expires_at)
-        .bind(key)
-        .bind(holder)
-        .execute(&mut *tx)
-        .await;
+        // The statement was already polled, so refresh the lease even if its
+        // original expiry passed while the statement was running.
+        let extended = sqlx::query(&refresh_holder_lock_sql(&lock_table))
+            .bind(expires_at)
+            .bind(key)
+            .bind(holder)
+            .execute(&mut *tx)
+            .await;
         if let Err(error) = extended {
             let _ = tx.rollback().await;
             return match result {
@@ -6273,6 +6452,12 @@ impl SqlMemoryStore {
 
     #[tracing::instrument(skip(self, memory), fields(memory_id = %memory.memory_id))]
     pub async fn insert_into(&self, table: &str, memory: &Memory) -> Result<(), MemoriaError> {
+        let _permit = self
+            .erase_barrier()
+            .try_enter(&memory.user_id)
+            .ok_or_else(|| {
+                MemoriaError::Blocked("memory erase is already running for this scope".into())
+            })?;
         let now = Utc::now().naive_utc();
         let observed_at = memory.observed_at.map(|dt| dt.naive_utc()).unwrap_or(now);
         let created_at = memory.created_at.map(|dt| dt.naive_utc()).unwrap_or(now);
