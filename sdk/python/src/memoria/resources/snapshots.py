@@ -25,6 +25,13 @@ def _snapshot_path(name: str, suffix: str = "") -> str:
     return f"/v1/snapshots/{encoded}{suffix}"
 
 
+def _validate_delete_prefix(prefix: str | None) -> None:
+    # The API implements prefix deletion with starts_with(). An empty prefix
+    # therefore matches every visible snapshot instead of acting as a no-op.
+    if prefix is not None and not prefix.strip():
+        raise MemoriaValidationError("delete: prefix must not be empty")
+
+
 class SnapshotsResource:
     def __init__(self, client: _HttpTransport) -> None:
         self._client = client
@@ -64,6 +71,7 @@ class SnapshotsResource:
         Single form:  delete(name="snap1")
         Bulk form:    delete(names=["s1","s2"]) | delete(prefix="pre_") | delete(older_than="…")
         """
+        _validate_delete_prefix(prefix)
         selectors = sum(
             [
                 1 if name is not None else 0,
@@ -120,6 +128,7 @@ class AsyncSnapshotsResource:
         prefix: str | None = None,
         older_than: str | None = None,
     ) -> None:
+        _validate_delete_prefix(prefix)
         selectors = sum(
             [
                 1 if name is not None else 0,

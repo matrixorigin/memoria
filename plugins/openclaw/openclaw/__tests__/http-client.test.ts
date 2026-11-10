@@ -118,8 +118,10 @@ describe("Group 3: Cloud API Communication", () => {
       it(`${id} ${tool} → ${method} ${pathPattern.source}`, async () => {
         fetchMock.respondWith(200, tool === "memory_store"
           ? { memory_id: "new-id", content: args.content ?? "" }
-          : tool.includes("retrieve") || tool.includes("search") || tool === "memory_list"
-            ? { results: [] }
+          : tool === "memory_list"
+            ? { items: [] }
+            : tool.includes("retrieve") || tool.includes("search")
+              ? { results: [] }
             : tool === "memory_profile"
               ? { profile: "test" }
               : tool === "memory_purge"
@@ -198,6 +200,19 @@ describe("Group 3: Cloud API Communication", () => {
       expect(result.content[0].text).toBe("Stored memory m1: hello world");
     });
 
+    it.each([
+      ["empty object", {}],
+      ["null", null],
+      ["array", []],
+      ["numeric memory ID", { memory_id: 42 }],
+      ["blank memory ID", { memory_id: "   " }],
+      ["empty HTTP body", ""],
+    ])("3.34a memory_store rejects %s", async (_case, response) => {
+      fetchMock.respondWith(200, response);
+      await expect(transport.callTool("memory_store", { content: "fixture" }))
+        .rejects.toThrow(/invalid store response/i);
+    });
+
     it("3.35 memory_retrieve preserves structured records", async () => {
       fetchMock.respondWith(200, {
         results: [
@@ -217,6 +232,29 @@ describe("Group 3: Cloud API Communication", () => {
       const result = await transport.callTool("memory_retrieve", { query: "q" }) as any;
       expect(result.content[0].text).toBe("[]");
     });
+
+    it.each(["memory_retrieve", "memory_search"])(
+      "3.36a %s rejects malformed successful responses",
+      async (tool) => {
+        for (const response of [null, {}, { error: "upstream failed" }, { results: null }, "invalid", 42]) {
+          fetchMock.respondWith(200, response);
+          await expect(transport.callTool(tool, { query: "q" }))
+            .rejects.toThrow(/invalid memoria api memory list response/i);
+        }
+      },
+    );
+
+    it.each(["memory_retrieve", "memory_search"])(
+      "3.36b %s accepts every documented list envelope",
+      async (tool) => {
+        const item = { memory_id: "m1", content: "remember this" };
+        for (const response of [[item], { results: [item] }, { items: [item] }]) {
+          fetchMock.respondWith(200, response);
+          const result = await transport.callTool(tool, { query: "q" }) as any;
+          expect(JSON.parse(result.content[0].text)).toEqual([item]);
+        }
+      },
+    );
 
     it("3.38 memory_profile with profile → profile text", async () => {
       fetchMock.respondWith(200, { profile: "Likes TypeScript" });
@@ -283,6 +321,31 @@ describe("Group 3: Cloud API Communication", () => {
       fetchMock.respondWith(200, { branches: [] });
       const result = await transport.callTool("memory_branches", {}) as any;
       expect(result.content[0].text).toContain("main ← active");
+    });
+
+    it.each([
+      ["null body", null],
+      ["empty object", {}],
+      ["upstream error", { error: "service failed" }],
+      ["null branches", { branches: null }],
+      ["unexpected text", "not a branch list"],
+      ["number", 42],
+    ])("3.45a memory_branches rejects malformed %s", async (_name, response) => {
+      fetchMock.respondWith(200, response);
+      await expect(transport.callTool("memory_branches", {}))
+        .rejects.toThrow(/invalid memoria api branch list response/i);
+    });
+
+    it("3.45b memory_branches preserves items envelope", async () => {
+      fetchMock.respondWith(200, { items: [{ name: "testing", active: true }] });
+      const result = await transport.callTool("memory_branches", {}) as any;
+      expect(result.content[0].text).toContain("testing ← active");
+    });
+
+    it("3.45c memory_branches preserves legacy text envelope", async () => {
+      fetchMock.respondWith(200, { result: "Branches:\n  legacy ← active" });
+      const result = await transport.callTool("memory_branches", {}) as any;
+      expect(result.content[0].text).toBe("Branches:\n  legacy ← active");
     });
   });
 

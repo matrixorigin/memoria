@@ -1,4 +1,5 @@
 pub mod config;
+pub mod content_filter;
 pub mod distributed;
 pub mod governance;
 pub mod graph_domains;

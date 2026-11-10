@@ -339,6 +339,76 @@ async fn test_snapshots_pagination() {
     .await;
 }
 
+#[tokio::test]
+#[serial]
+async fn test_snapshot_delete_rejects_blank_prefix_without_deleting() {
+    let (svc, git, uid, db_name, _ctx) = setup().await;
+    let names = [snap("blank_a"), snap("blank_b")];
+    let outcome: anyhow::Result<()> = async {
+        for name in &names {
+            let created = memoria_mcp::git_tools::call(
+                "memory_snapshot",
+                json!({"name": name}),
+                &git,
+                &svc,
+                &uid,
+            )
+            .await?;
+            anyhow::ensure!(created["isError"] != true, "create failed: {created}");
+        }
+        for prefix in ["", "  "] {
+            let result = memoria_mcp::git_tools::call(
+                "memory_snapshot_delete",
+                json!({"prefix": prefix}),
+                &git,
+                &svc,
+                &uid,
+            )
+            .await?;
+            anyhow::ensure!(result["isError"] == true, "blank prefix accepted: {result}");
+            anyhow::ensure!(text(&result).contains("Snapshot prefix must not be blank"));
+            let snapshots = git_for_user(&svc, &uid).await.list_snapshots().await?;
+            for name in &names {
+                let internal = internal_snapshot_name(&db_name, name);
+                anyhow::ensure!(
+                    snapshots.iter().any(|s| s.snapshot_name == internal),
+                    "snapshot {name} was deleted"
+                );
+            }
+        }
+        Ok(())
+    }
+    .await;
+    let cleanup: anyhow::Result<()> = async {
+        let result = memoria_mcp::git_tools::call(
+            "memory_snapshot_delete",
+            json!({"names": names.join(",")}),
+            &git,
+            &svc,
+            &uid,
+        )
+        .await?;
+        anyhow::ensure!(result["isError"] != true, "cleanup rejected: {result}");
+        let sql = svc.user_sql_store(&uid).await?;
+        let user_git = GitForDataService::new(sql.pool().clone(), db_name.clone());
+        let snapshots = user_git.list_snapshots().await?;
+        for name in &names {
+            let internal = internal_snapshot_name(&db_name, name);
+            anyhow::ensure!(
+                !snapshots.iter().any(|s| s.snapshot_name == internal),
+                "cleanup left snapshot {name}"
+            );
+        }
+        Ok(())
+    }
+    .await;
+    assert!(
+        cleanup.is_ok(),
+        "cleanup failed: {cleanup:?}; test: {outcome:?}"
+    );
+    outcome.unwrap();
+}
+
 // ── 5. memory_snapshot_delete by prefix ──────────────────────────────────────
 
 #[tokio::test]

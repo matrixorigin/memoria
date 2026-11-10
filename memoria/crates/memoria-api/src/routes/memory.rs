@@ -625,11 +625,22 @@ pub async fn delete_memory(
         }
         auth.scope_id().to_string()
     };
-    let _ = state
-        .service
-        .purge_on_branch(&effective_user_id, branch_param(q.branch.as_deref()), &id)
-        .await
-        .map_err(api_err_typed)?;
+    if auth.is_master {
+        state
+            .service
+            .purge_batch_unscoped_on_branch(
+                &effective_user_id,
+                branch_param(q.branch.as_deref()),
+                &[&id],
+            )
+            .await
+    } else {
+        state
+            .service
+            .purge_on_branch(&effective_user_id, branch_param(q.branch.as_deref()), &id)
+            .await
+    }
+    .map_err(api_err_typed)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -660,11 +671,18 @@ pub async fn purge_memories(
                 }
             }
             let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
-            state
-                .service
-                .purge_batch_on_branch(auth.scope_id(), branch, &id_refs)
-                .await
-                .map_err(api_err)?
+            if auth.is_master {
+                state
+                    .service
+                    .purge_batch_unscoped_on_branch(auth.scope_id(), branch, &id_refs)
+                    .await
+            } else {
+                state
+                    .service
+                    .purge_batch_on_branch(auth.scope_id(), branch, &id_refs)
+                    .await
+            }
+            .map_err(api_err_typed)?
         }
         PurgeSelector::Topic(topic) => state
             .service

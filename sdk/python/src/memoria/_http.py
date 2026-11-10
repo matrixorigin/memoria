@@ -25,6 +25,7 @@ from .exceptions import (
     MemoriaNotFoundError,
     MemoriaServerError,
     MemoriaUnprocessableError,
+    MemoriaValidationError,
 )
 
 try:
@@ -95,7 +96,14 @@ def _should_retry_network_error(
     if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
         return True
     retryable = isinstance(
-        exc, (httpx.TimeoutException, httpx.NetworkError, httpx.ProtocolError, httpx.DecodingError)
+        exc,
+        (
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.ProtocolError,
+            httpx.ProxyError,
+            httpx.DecodingError,
+        ),
     )
     if _is_idempotent(method, idempotent):
         return retryable
@@ -164,6 +172,8 @@ class _HttpTransport:
         max_retries: int = _DEFAULT_MAX_RETRIES,
         retry_unsafe_writes: bool = False,
     ) -> None:
+        if type(max_retries) is not int or max_retries < 0:
+            raise MemoriaValidationError("max_retries must be a non-negative integer")
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._timeout = timeout

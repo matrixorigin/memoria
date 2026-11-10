@@ -461,6 +461,10 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            auth::owner_content_filter_layer,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             auth::actor_scope_layer,
         ))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB
