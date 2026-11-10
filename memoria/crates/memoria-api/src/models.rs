@@ -218,7 +218,8 @@ impl StructuredQueryRequest {
             return Err("structured query requires at least one filter selector".to_string());
         }
 
-        let cursor = normalized(self.cursor.as_deref());
+        // An explicitly blank cursor is invalid, not a request for page one.
+        let cursor = self.cursor.as_deref().map(str::trim).map(str::to_string);
         if let Some(cursor) = cursor.as_deref() {
             if cursor.len() != 32 || !cursor.chars().all(|ch| ch.is_ascii_hexdigit()) {
                 return Err("cursor must be a 32-character hexadecimal memory_id".to_string());
@@ -235,13 +236,6 @@ impl StructuredQueryRequest {
             extra_metadata_filter: self.extra_metadata_filter.clone(),
         })
     }
-}
-
-fn normalized(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
 }
 
 fn default_fulltext_search_limit() -> i64 {
@@ -671,6 +665,7 @@ pub fn parse_trust_tier(s: &str) -> Result<TrustTier, String> {
 mod tests {
     use super::{
         parse_fulltext_memory_types_opt, parse_memory_types_opt, PurgeRequest, PurgeSelector,
+        StructuredQueryRequest,
     };
     use memoria_core::MemoryType;
 
@@ -695,6 +690,45 @@ mod tests {
 
         let empty = vec![];
         assert_eq!(parse_fulltext_memory_types_opt(Some(&empty)).unwrap(), None);
+    }
+
+    #[test]
+    fn structured_query_rejects_blank_cursors() {
+        for cursor in [
+            "",
+            " ",
+            "\t\n",
+            "\u{2003}",
+            "not-a-cursor",
+            "g0123456789abcdefABCDEF012345678",
+        ] {
+            let request: StructuredQueryRequest = serde_json::from_value(serde_json::json!({
+                "subject_id": "subject-1",
+                "cursor": cursor
+            }))
+            .unwrap();
+            assert!(
+                request.structured_options().is_err(),
+                "invalid cursor {cursor:?} must not restart pagination"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_query_keeps_optional_and_valid_cursors() {
+        for cursor in [
+            None,
+            Some("0123456789abcdefABCDEF0123456789"),
+            Some("  0123456789abcdefABCDEF0123456789  "),
+        ] {
+            let request: StructuredQueryRequest = serde_json::from_value(serde_json::json!({
+                "subject_id": "subject-1",
+                "cursor": cursor
+            }))
+            .unwrap();
+            let options = request.structured_options().unwrap();
+            assert_eq!(options.cursor.as_deref(), cursor.map(str::trim));
+        }
     }
 
     #[test]
