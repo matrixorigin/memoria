@@ -2285,6 +2285,7 @@ impl MemoryService {
             let old = sql
                 .get_from(&table, memory_id)
                 .await?
+                .filter(|memory| memory.user_id == user_id)
                 .ok_or_else(|| MemoriaError::NotFound(memory_id.to_string()))?;
 
             let new_id = Uuid::now_v7().simple().to_string();
@@ -2351,6 +2352,7 @@ impl MemoryService {
                 .store
                 .get(memory_id)
                 .await?
+                .filter(|memory| memory.user_id == user_id)
                 .ok_or_else(|| MemoriaError::NotFound(memory_id.to_string()))?;
 
             let new_id = Uuid::now_v7().simple().to_string();
@@ -2398,9 +2400,10 @@ impl MemoryService {
     ) -> Result<PurgeResult, MemoriaError> {
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
+            let table = sql.table_for_branch(user_id, branch).await?;
+            Self::ensure_sql_memory_owner(&sql, &table, user_id, memory_id).await?;
             let (snap, warning) = sql.create_safety_snapshot("purge").await;
             self.send_edit_log(user_id, "purge", Some(memory_id), None, "", snap.as_deref());
-            let table = sql.table_for_branch(user_id, branch).await?;
             let deactivated = sql.soft_delete_from(&table, memory_id).await?;
             if deactivated > 0 {
                 self.report(StatsEvent::MemoryDeactivated {
@@ -2415,6 +2418,7 @@ impl MemoryService {
                 warning,
             })
         } else {
+            self.ensure_memory_owner(user_id, memory_id).await?;
             self.store.soft_delete(memory_id).await?;
             Ok(PurgeResult {
                 purged: 1,
@@ -2439,10 +2443,39 @@ impl MemoryService {
         branch: Option<&str>,
         ids: &[&str],
     ) -> Result<PurgeResult, MemoriaError> {
+        self.purge_batch_on_branch_impl(user_id, branch, ids, false)
+            .await
+    }
+
+    /// Purge IDs without checking their owner. The caller must independently
+    /// authorize administrative access; user-scoped callers must use
+    /// `purge_batch_on_branch` instead.
+    pub async fn purge_batch_unscoped_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        ids: &[&str],
+    ) -> Result<PurgeResult, MemoriaError> {
+        self.purge_batch_on_branch_impl(user_id, branch, ids, true)
+            .await
+    }
+
+    async fn purge_batch_on_branch_impl(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        ids: &[&str],
+        unscoped: bool,
+    ) -> Result<PurgeResult, MemoriaError> {
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
-            let (snap, warning) = sql.create_safety_snapshot("purge").await;
             let table = sql.table_for_branch(user_id, branch).await?;
+            if !unscoped {
+                for id in ids {
+                    Self::ensure_sql_memory_owner(&sql, &table, user_id, id).await?;
+                }
+            }
+            let (snap, warning) = sql.create_safety_snapshot("purge").await;
             for id in ids {
                 let deactivated = sql.soft_delete_from(&table, id).await?;
                 self.send_edit_log(user_id, "purge", Some(id), None, "", snap.as_deref());
@@ -2459,6 +2492,11 @@ impl MemoryService {
                 warning,
             })
         } else {
+            if !unscoped {
+                for id in ids {
+                    self.ensure_memory_owner(user_id, id).await?;
+                }
+            }
             for id in ids {
                 self.store.soft_delete(id).await?;
             }
@@ -2468,6 +2506,39 @@ impl MemoryService {
                 warning: None,
             })
         }
+    }
+
+    // Include inactive rows: repeated owner purges may still clean up graph data.
+    // Reject absent IDs too, since their global graph metadata may belong to a
+    // different scope or to a row that is absent from the selected branch.
+    async fn ensure_sql_memory_owner(
+        sql: &SqlMemoryStore,
+        table: &str,
+        user_id: &str,
+        memory_id: &str,
+    ) -> Result<(), MemoriaError> {
+        let query = format!("SELECT user_id FROM {} WHERE memory_id = ?", sql.t(table));
+        let owner: Option<String> = sqlx::query_scalar(&query)
+            .bind(memory_id)
+            .fetch_optional(sql.pool())
+            .await
+            .map_err(|e| MemoriaError::Database(e.to_string()))?;
+        if owner.as_deref() != Some(user_id) {
+            return Err(MemoriaError::NotFound(memory_id.to_string()));
+        }
+        Ok(())
+    }
+
+    async fn ensure_memory_owner(
+        &self,
+        user_id: &str,
+        memory_id: &str,
+    ) -> Result<(), MemoriaError> {
+        let memory = self.store.get_including_inactive(memory_id).await?;
+        if memory.is_none_or(|memory| memory.user_id != user_id) {
+            return Err(MemoriaError::NotFound(memory_id.to_string()));
+        }
+        Ok(())
     }
 
     /// Purge memories whose content contains `topic` (exact text match).
@@ -2635,12 +2706,14 @@ impl MemoryService {
         branch: Option<&str>,
         memory_id: &str,
     ) -> Result<Option<Memory>, MemoriaError> {
-        if self.sql_store.is_some() {
+        let memory = if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
             let table = sql.table_for_branch(user_id, branch).await?;
-            return sql.get_from(&table, memory_id).await;
-        }
-        self.store.get(memory_id).await
+            sql.get_from(&table, memory_id).await?
+        } else {
+            self.store.get(memory_id).await?
+        };
+        Ok(memory.filter(|memory| memory.user_id == user_id))
     }
 
     pub async fn list_active(

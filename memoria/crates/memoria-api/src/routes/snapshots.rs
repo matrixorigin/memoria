@@ -885,7 +885,9 @@ pub async fn delete_snapshot(
         &state,
         auth.scope_id(),
         "memory_snapshot_delete",
-        json!({ "names": name }),
+        // The path contains one name. The tool splits string selectors on
+        // commas, so pass an array to avoid treating one name as a list.
+        json!({ "names": [name] }),
     )
     .await?;
     Ok(StatusCode::NO_CONTENT)
