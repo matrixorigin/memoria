@@ -43,7 +43,7 @@ class BranchesResource:
             items = data.get("branches", [])
         else:
             items = data
-        return [Branch.from_dict(b) for b in items]
+        return [Branch.from_dict(b) for b in (items if items is not None else [])]
 
     def checkout(self, name: str) -> None:
         self._client._request("POST", _branch_path(name, "/checkout"), json={})
@@ -137,7 +137,7 @@ class AsyncBranchesResource:
             items = data.get("branches", [])
         else:
             items = data
-        return [Branch.from_dict(b) for b in items]
+        return [Branch.from_dict(b) for b in (items if items is not None else [])]
 
     async def checkout(self, name: str) -> None:
         await self._client._arequest("POST", _branch_path(name, "/checkout"), json={})
