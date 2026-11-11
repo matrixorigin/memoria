@@ -125,3 +125,35 @@ def test_plain_text_success_is_unchanged(invoke):
 
     assert send(handle) == "ready"
     assert delays == []
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    ["APPLICATION/JSON", "Application/JSON;Charset=utf-8", "Application/Problem+JSON"],
+)
+def test_json_media_type_is_case_insensitive(invoke, content_type):
+    send, delays = invoke
+
+    def handle(request):
+        return httpx.Response(
+            200, headers={"Content-Type": content_type}, content=b'{"items":[]}'
+        )
+
+    assert send(handle) == {"items": []}
+    assert delays == []
+
+
+@pytest.mark.parametrize(
+    "content_type", ["APPLICATION/JSON", "Application/JSON;Charset=utf-8"]
+)
+def test_malformed_mixed_case_json_maps_to_sdk_error(invoke, content_type):
+    send, delays = invoke
+
+    def handle(request):
+        return httpx.Response(
+            200, headers={"Content-Type": content_type}, content=b'{"partial":'
+        )
+
+    with pytest.raises(MemoriaConnectionError):
+        send(handle, method="POST")
+    assert delays == []
