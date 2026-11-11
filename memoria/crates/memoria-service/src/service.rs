@@ -1349,6 +1349,13 @@ impl MemoryService {
         mut extra_metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
         idempotency_key: Option<&str>,
     ) -> Result<Memory, MemoriaError> {
+        if let Some(confidence) = initial_confidence {
+            if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
+                return Err(MemoriaError::Validation(
+                    "initial_confidence must be a finite number between 0 and 1".into(),
+                ));
+            }
+        }
         let subject_id = normalize_opt_string(subject_id);
         if let Some(ref sid) = subject_id {
             if sid.len() > 128 {
