@@ -917,13 +917,35 @@ pub async fn user_branch_stats(
     })))
 }
 
-/// Redact password from database URL for safe display.
+/// Redact all database URL userinfo before displaying it.
 fn redact_url(url: &str) -> String {
-    // mysql://user:pass@host:port/db → mysql://user:***@host:port/db
-    if let Some(at) = url.find('@') {
-        if let Some(colon) = url[..at].rfind(':') {
-            return format!("{}:***{}", &url[..colon], &url[at..]);
-        }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, suffix) = rest.split_at(authority_end);
+    let Some(at) = authority.rfind('@') else {
+        return url.to_string();
+    };
+    format!("{scheme}://***{}{}", &authority[at..], suffix)
+}
+
+#[cfg(test)]
+mod redact_url_tests {
+    use super::redact_url;
+
+    #[test]
+    fn masks_passwords_containing_at_signs() {
+        assert_eq!(redact_url("mysql://user:p@ss@host:3306/db"), "mysql://***@host:3306/db");
+        assert_eq!(redact_url("mysql://user:p@@ss@host/db"), "mysql://***@host/db");
+        assert_eq!(redact_url("mysql://user:pass@host/db"), "mysql://***@host/db");
     }
-    url.to_string()
+
+    #[test]
+    fn does_not_treat_suffix_at_signs_as_userinfo() {
+        assert_eq!(redact_url("mysql://host/db?email=a@b"), "mysql://host/db?email=a@b");
+        assert_eq!(redact_url("mysql://host/a@b"), "mysql://host/a@b");
+        assert_eq!(redact_url("mysql://host/db#user@host"), "mysql://host/db#user@host");
+        assert_eq!(redact_url("mysql://host/db"), "mysql://host/db");
+    }
 }
