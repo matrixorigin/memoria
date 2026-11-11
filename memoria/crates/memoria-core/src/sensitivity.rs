@@ -153,6 +153,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ordinary_bearer_prose_is_not_an_access_token() {
+        for text in [
+            "the bearer of bad news arrived",
+            "Pay to the bearer on demand",
+            "She was a pallbearer at the funeral",
+            "ring bearer for the wedding",
+        ] {
+            let result = check_sensitivity(text);
+            assert!(!result.blocked, "ordinary bearer prose rejected: {text}");
+        }
+    }
+
+    #[test]
+    fn bearer_credentials_remain_blocked() {
+        for text in [
+            "Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456",
+            "Bearer synthetic-test-token",
+        ] {
+            let result = check_sensitivity(text);
+            assert!(result.blocked, "bearer credential allowed: {text}");
+            assert_eq!(result.matched_labels, vec!["bearer_token"]);
+        }
+    }
+
+    #[test]
     fn test_aws_key_blocked() {
         let r = check_sensitivity("my key is AKIAIOSFODNN7EXAMPLE");
         assert!(r.blocked);
