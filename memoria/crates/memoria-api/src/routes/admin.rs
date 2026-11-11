@@ -919,11 +919,54 @@ pub async fn user_branch_stats(
 
 /// Redact password from database URL for safe display.
 fn redact_url(url: &str) -> String {
-    // mysql://user:pass@host:port/db → mysql://user:***@host:port/db
-    if let Some(at) = url.find('@') {
-        if let Some(colon) = url[..at].rfind(':') {
-            return format!("{}:***{}", &url[..colon], &url[at..]);
+    // Only inspect the authority: '@' in a password is not the host separator,
+    // and '@' in a path, query, or fragment is never userinfo.
+    if let Some(scheme_end) = url.find("://") {
+        let authority_start = scheme_end + 3;
+        let authority_end = url[authority_start..]
+            .find(&['/', '?', '#'][..])
+            .map_or(url.len(), |offset| authority_start + offset);
+        let authority = &url[authority_start..authority_end];
+        if let Some(at) = authority.rfind('@') {
+            if let Some(colon) = authority[..at].find(':') {
+                let password_start = authority_start + colon;
+                let host_start = authority_start + at;
+                return format!("{}:***{}", &url[..password_start], &url[host_start..]);
+            }
         }
     }
     url.to_string()
+}
+
+#[cfg(test)]
+mod redact_url_tests {
+    use super::redact_url;
+
+    #[test]
+    fn redacts_entire_password_even_when_it_contains_at_signs() {
+        assert_eq!(
+            redact_url("mysql://user:p@ss@host:3306/db"),
+            "mysql://user:***@host:3306/db"
+        );
+        assert_eq!(
+            redact_url("mysql://user:p@ss@word@host/db?x=1"),
+            "mysql://user:***@host/db?x=1"
+        );
+        assert_eq!(
+            redact_url("mysql://user:pass@host/db"),
+            "mysql://user:***@host/db"
+        );
+    }
+
+    #[test]
+    fn does_not_confuse_path_query_or_fragment_with_userinfo() {
+        for url in [
+            "mysql://host/db@archive",
+            "mysql://host/db?contact=user@example.com",
+            "mysql://host/db#user:pass@comment",
+            "mysql://host/db",
+        ] {
+            assert_eq!(redact_url(url), url);
+        }
+    }
 }
