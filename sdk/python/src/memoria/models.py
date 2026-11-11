@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from .exceptions import MemoriaResponseError
+
 
 def _parse_dt(value: str | None) -> datetime | None:
     """Parse an ISO-8601 / RFC-3339 string to a timezone-aware datetime, or return None."""
@@ -75,7 +77,12 @@ class MemoryPage:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> MemoryPage:
-        items = [Memory.from_dict(m) for m in d.get("items", [])]
+        # Missing or non-array items must not look like the end of pagination.
+        if not isinstance(d, dict) or not isinstance(d.get("items"), list):
+            raise MemoriaResponseError(
+                "Invalid memory page: expected an object with an items array"
+            )
+        items = [Memory.from_dict(m) for m in d["items"]]
         return cls(items=items, next_cursor=d.get("next_cursor"))
 
 
