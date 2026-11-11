@@ -67,6 +67,19 @@ static PATTERNS: &[Pattern] = &[
         ),
         replacement: "",
     },
+    Pattern {
+        label: "api_token_assignment",
+        tier: SensitivityTier::High,
+        // Require an assignment delimiter; ordinary discussion of tokens is safe.
+        regex: r#"(?i)\b(?:[A-Za-z0-9_]*api[_-]?key|[A-Za-z0-9_]*[_-]token|access[_-]?token|auth[_-]?token)["']?\s*[:=]\s*["']?\S+"#,
+        replacement: "",
+    },
+    Pattern {
+        label: "github_pat",
+        tier: SensitivityTier::High,
+        regex: r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})",
+        replacement: "",
+    },
     // MEDIUM — redact
     Pattern {
         label: "email",
@@ -149,6 +162,23 @@ pub fn check_sensitivity(text: &str) -> SensitivityResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_token_assignments_and_github_pats_are_blocked() {
+        for sample in [
+            "OPENAI_API_KEY=synthetic-test-key-123456",
+            "api_key: synthetic-test-key-123456",
+            "GITHUB_TOKEN=synthetic-test-token-123456",
+            "access_token=synthetic-test-token-123456",
+            "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz",
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789AB",
+        ] {
+            assert!(check_sensitivity(sample).blocked, "credential accepted: {sample}");
+        }
+        for prose in ["The API key documentation is helpful.", "Token budgeting matters."] {
+            assert!(!check_sensitivity(prose).blocked, "ordinary prose blocked: {prose}");
+        }
+    }
 
     #[test]
     fn test_aws_key_blocked() {
