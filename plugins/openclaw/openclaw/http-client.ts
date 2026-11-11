@@ -306,7 +306,10 @@ export class MemoriaHttpTransport {
     if (args.description) body.description = args.description;
     const data = await this.post("/v1/snapshots", body);
     const rec = this.asRecord(data);
-    const name = rec?.name ?? args.name ?? "";
+    if (typeof rec?.name !== "string" || !rec.name.trim()) {
+      throw new Error("Invalid Memoria API snapshot creation response: missing name");
+    }
+    const name = rec.name;
     const ts = rec?.timestamp ?? rec?.created_at ?? "";
     return `Snapshot '${name}' created at ${ts}`;
   }
