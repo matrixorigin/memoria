@@ -235,7 +235,20 @@ class _HttpTransport:
                     return None
                 content_type = resp.headers.get("content-type", "")
                 if "json" in content_type:
-                    return resp.json()
+                    try:
+                        return resp.json()
+                    except ValueError as exc:
+                        # The response was received, so a write may already
+                        # have committed. Only safe requests or explicit
+                        # unsafe-write opt-in may replay it.
+                        if attempt < self._max_retries and (
+                            _is_idempotent(method, idempotent) or self._retry_unsafe_writes
+                        ):
+                            time.sleep(_backoff(attempt))
+                            continue
+                        raise MemoriaConnectionError(
+                            "Invalid JSON response from Memoria API"
+                        ) from exc
                 try:
                     return resp.json()
                 except Exception:
@@ -300,7 +313,20 @@ class _HttpTransport:
                     return None
                 content_type = resp.headers.get("content-type", "")
                 if "json" in content_type:
-                    return resp.json()
+                    try:
+                        return resp.json()
+                    except ValueError as exc:
+                        # The response was received, so a write may already
+                        # have committed. Only safe requests or explicit
+                        # unsafe-write opt-in may replay it.
+                        if attempt < self._max_retries and (
+                            _is_idempotent(method, idempotent) or self._retry_unsafe_writes
+                        ):
+                            await asyncio.sleep(_backoff(attempt))
+                            continue
+                        raise MemoriaConnectionError(
+                            "Invalid JSON response from Memoria API"
+                        ) from exc
                 try:
                     return resp.json()
                 except Exception:
