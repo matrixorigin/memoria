@@ -264,7 +264,7 @@ fn sse_router(
             // payloads still need an Invalid Request response, even without id.
             // Preserve the legacy endpoint's jsonrpc-field compatibility here;
             // tightening envelope validation is separate from notification handling.
-            if !req.is_object() || method.is_empty() {
+            if !req.is_object() || method.is_empty() || req.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
                 let response_id = req.get("id").filter(|id| id.is_string() || id.is_number()).cloned().unwrap_or(Value::Null);
                 let resp = serde_json::json!({"jsonrpc":"2.0","id":response_id,
                     "error":{"code":-32600,"message":"Invalid Request"}});
@@ -355,7 +355,7 @@ async fn run_io(
             .unwrap_or(Value::Null);
         let is_object = value.is_object();
         let req = match serde_json::from_value::<Request>(value) {
-            Ok(req) if is_object && !req.method.is_empty() => req,
+            Ok(req) if is_object && !req.method.is_empty() && req.jsonrpc == "2.0" => req,
             _ => {
                 let resp = json!({"jsonrpc":"2.0","id":response_id,
                     "error":{"code":-32600,"message":"Invalid Request"}});
@@ -549,6 +549,10 @@ mod tests {
             (json!({"jsonrpc":"2.0","id":8}), json!(8)),
             (json!({"jsonrpc":"2.0","id":9,"method":42}), json!(9)),
             (json!({"id":"missing"}), json!("missing")),
+            (json!({"jsonrpc":"1.0","id":"wrong","method":"ping"}), json!("wrong")),
+            (json!({"jsonrpc":null,"id":11,"method":"ping"}), json!(11)),
+            (json!({"jsonrpc":42,"id":12,"method":"ping"}), json!(12)),
+            (json!({"jsonrpc":"2.1","id":13,"method":"ping"}), json!(13)),
             (json!({"id":"empty","method":""}), json!("empty")),
             (json!({"method":null}), json!(null)),
             (json!({"id":true}), json!(null)),
