@@ -12,6 +12,7 @@ that call ``self._client._request(...)`` or ``await self._client._arequest(...)`
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 
@@ -139,6 +140,8 @@ def _map_error(resp: httpx.Response) -> MemoriaAPIError:
         detail = resp.json().get("detail") or resp.text
     except Exception:
         detail = resp.text
+    if not isinstance(detail, str):
+        detail = json.dumps(detail, ensure_ascii=False, separators=(",", ":"))
     if not detail:
         detail = _HTTP_STATUS_TEXTS.get(resp.status_code, f"HTTP {resp.status_code}")
     sc = resp.status_code
