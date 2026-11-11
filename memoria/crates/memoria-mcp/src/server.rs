@@ -264,7 +264,7 @@ fn sse_router(
             // payloads still need an Invalid Request response, even without id.
             // Preserve the legacy endpoint's jsonrpc-field compatibility here;
             // tightening envelope validation is separate from notification handling.
-            if !req.is_object() || method.is_empty() || req.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            if !req.is_object() || method.is_empty() || req.get("jsonrpc").and_then(Value::as_str) != Some("2.0") || req.get("id").is_some_and(|id| !(id.is_string() || id.is_number() || id.is_null())) {
                 let response_id = req.get("id").filter(|id| id.is_string() || id.is_number()).cloned().unwrap_or(Value::Null);
                 let resp = serde_json::json!({"jsonrpc":"2.0","id":response_id,
                     "error":{"code":-32600,"message":"Invalid Request"}});
@@ -354,8 +354,9 @@ async fn run_io(
             .cloned()
             .unwrap_or(Value::Null);
         let is_object = value.is_object();
+        let valid_id = value.get("id").is_none_or(|id| id.is_string() || id.is_number() || id.is_null());
         let req = match serde_json::from_value::<Request>(value) {
-            Ok(req) if is_object && !req.method.is_empty() && req.jsonrpc == "2.0" => req,
+            Ok(req) if is_object && valid_id && !req.method.is_empty() && req.jsonrpc == "2.0" => req,
             _ => {
                 let resp = json!({"jsonrpc":"2.0","id":response_id,
                     "error":{"code":-32600,"message":"Invalid Request"}});
