@@ -1,3 +1,12 @@
+fn validate_session_id_length(session_id: Option<&str>) -> Result<(), MemoriaError> {
+    if session_id.is_some_and(|id| id.chars().count() > 64) {
+        return Err(MemoriaError::Validation(
+            "session_id exceeds maximum length of 64 characters".into(),
+        ));
+    }
+    Ok(())
+}
+
 use crate::content_filter::check_content_sensitivity;
 use chrono::{DateTime, Utc};
 use memoria_core::{
@@ -1349,6 +1358,7 @@ impl MemoryService {
         mut extra_metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
         idempotency_key: Option<&str>,
     ) -> Result<Memory, MemoriaError> {
+        validate_session_id_length(session_id.as_deref())?;
         let subject_id = normalize_opt_string(subject_id);
         if let Some(ref sid) = subject_id {
             if sid.chars().count() > 128 {
@@ -3038,6 +3048,7 @@ impl MemoryService {
         let mut checked_items = Vec::with_capacity(items.len());
         for (content, mt, session_id, tier, subject_id, extra_metadata) in items {
             reject_reserved_metadata(extra_metadata.as_ref())?;
+            validate_session_id_length(session_id.as_deref())?;
             let subject_id = normalize_opt_string(subject_id);
             if let Some(ref sid) = subject_id {
                 if sid.chars().count() > 128 {
