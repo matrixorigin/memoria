@@ -48,7 +48,7 @@ static PATTERNS: &[Pattern] = &[
     Pattern {
         label: "bearer_token",
         tier: SensitivityTier::High,
-        regex: r"(?i)\bBearer\s+(?:[A-Za-z0-9\-._~+/]{20,}=*|synthetic-test-token\b)",
+        regex: r"(?i)\bBearer\s+[A-Za-z0-9\-._~+/]{20,}=*",
         replacement: "",
     },
     Pattern {
