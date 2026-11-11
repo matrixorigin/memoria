@@ -1,12 +1,3 @@
-fn validate_session_id_length(session_id: Option<&str>) -> Result<(), MemoriaError> {
-    if session_id.is_some_and(|id| id.chars().count() > 64) {
-        return Err(MemoriaError::Validation(
-            "session_id exceeds maximum length of 64 characters".into(),
-        ));
-    }
-    Ok(())
-}
-
 use crate::content_filter::check_content_sensitivity;
 use chrono::{DateTime, Utc};
 use memoria_core::{
@@ -99,6 +90,15 @@ impl std::str::FromStr for SessionScope {
 #[inline]
 fn normalize_opt_string(s: Option<String>) -> Option<String> {
     s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+fn validate_session_id_length(session_id: Option<&str>) -> Result<(), MemoriaError> {
+    if session_id.is_some_and(|id| id.chars().count() > 64) {
+        return Err(MemoriaError::Validation(
+            "session_id exceeds maximum length of 64 characters".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Extra retrieval controls that must be threaded through the full retrieval pipeline.
@@ -3876,5 +3876,24 @@ mod subject_id_character_limit_tests {
         assert!(exactly_128.chars().count() <= 128);
         assert!("é".repeat(129).chars().count() > 128);
         assert!("x".repeat(129).chars().count() > 128);
+    }
+}
+
+#[cfg(test)]
+mod session_id_length_tests {
+    use super::validate_session_id_length;
+
+    #[test]
+    fn accepts_up_to_64_unicode_characters() {
+        assert!(validate_session_id_length(None).is_ok());
+        assert!(validate_session_id_length(Some("")).is_ok());
+        assert!(validate_session_id_length(Some(&"x".repeat(64))).is_ok());
+        assert!(validate_session_id_length(Some(&"é".repeat(64))).is_ok());
+    }
+
+    #[test]
+    fn rejects_more_than_64_characters() {
+        assert!(validate_session_id_length(Some(&"x".repeat(65))).is_err());
+        assert!(validate_session_id_length(Some(&"é".repeat(65))).is_err());
     }
 }
