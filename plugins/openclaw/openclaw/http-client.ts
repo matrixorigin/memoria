@@ -201,7 +201,10 @@ export class MemoriaHttpTransport {
   private async profile() {
     const data = await this.get("/v1/profiles/me");
     const rec = this.asRecord(data);
-    if (rec?.profile && typeof rec.profile === "string") {
+    if (!rec || (rec.profile !== null && typeof rec.profile !== "string")) {
+      throw new Error("Invalid Memoria API profile response");
+    }
+    if (rec.profile && typeof rec.profile === "string") {
       return rec.profile;
     }
     return "No profile memories found.";
