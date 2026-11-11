@@ -134,18 +134,16 @@ pub async fn list_users(
     Query(params): Query<CursorParams>,
 ) -> Result<Json<UserListResponse>, (StatusCode, String)> {
     auth.require_master()?;
-    let limit = params.limit.unwrap_or(100);
+    let limit = validated_user_page_limit(params.limit)?;
     let mut users = list_known_users(&state).await?;
     if let Some(ref cursor) = params.cursor {
         users.retain(|user_id| user_id > cursor);
     }
-    let users: Vec<String> = users.into_iter().take(limit as usize).collect();
-
-    let next_cursor = if users.len() as i64 == limit {
-        users.last().cloned()
-    } else {
-        None
-    };
+    // Fetch one extra item to distinguish a full final page from a next page.
+    let users: Vec<String> = users.into_iter().take(limit + 1).collect();
+    let has_more = users.len() > limit;
+    let users: Vec<String> = users.into_iter().take(limit).collect();
+    let next_cursor = if has_more { users.last().cloned() } else { None };
 
     Ok(Json(UserListResponse {
         users: users
@@ -926,4 +924,28 @@ fn redact_url(url: &str) -> String {
         }
     }
     url.to_string()
+}
+
+fn validated_user_page_limit(limit: Option<i64>) -> Result<usize, (StatusCode, String)> {
+    let limit = limit.unwrap_or(100);
+    if !(1..=1000).contains(&limit) {
+        return Err((StatusCode::BAD_REQUEST, "limit must be between 1 and 1000".into()));
+    }
+    Ok(limit as usize)
+}
+
+#[cfg(test)]
+mod admin_user_pagination_tests {
+    use super::validated_user_page_limit;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn rejects_invalid_limits_and_defaults_safely() {
+        assert_eq!(validated_user_page_limit(None).unwrap(), 100);
+        assert_eq!(validated_user_page_limit(Some(1)).unwrap(), 1);
+        assert_eq!(validated_user_page_limit(Some(1000)).unwrap(), 1000);
+        for limit in [i64::MIN, -1, 0, 1001, i64::MAX] {
+            assert_eq!(validated_user_page_limit(Some(limit)).unwrap_err().0, StatusCode::BAD_REQUEST);
+        }
+    }
 }
