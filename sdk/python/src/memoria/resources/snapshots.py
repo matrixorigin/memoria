@@ -70,6 +70,9 @@ class SnapshotsResource:
 
         Single form:  delete(name="snap1")
         Bulk form:    delete(names=["s1","s2"]) | delete(prefix="pre_") | delete(older_than="…")
+
+        Ambiguous failures are not retried by default: a snapshot can be
+        recreated with the same name before the client retries.
         """
         _validate_delete_prefix(prefix)
         selectors = sum(
@@ -89,7 +92,8 @@ class SnapshotsResource:
                 "delete: name, names, prefix, older_than are mutually exclusive"
             )
         if name is not None:
-            self._client._request("DELETE", _snapshot_path(name))
+            # A retry after a lost response could delete a replacement snapshot.
+            self._client._request("DELETE", _snapshot_path(name), idempotent=False)
         else:
             body = _strip_none({"names": names, "prefix": prefix, "older_than": older_than})
             self._client._request("POST", "/v1/snapshots/delete", json=body)
@@ -128,6 +132,7 @@ class AsyncSnapshotsResource:
         prefix: str | None = None,
         older_than: str | None = None,
     ) -> None:
+        """Delete snapshots; ambiguous failures are not retried by default."""
         _validate_delete_prefix(prefix)
         selectors = sum(
             [
@@ -146,7 +151,8 @@ class AsyncSnapshotsResource:
                 "delete: name, names, prefix, older_than are mutually exclusive"
             )
         if name is not None:
-            await self._client._arequest("DELETE", _snapshot_path(name))
+            # A retry after a lost response could delete a replacement snapshot.
+            await self._client._arequest("DELETE", _snapshot_path(name), idempotent=False)
         else:
             body = _strip_none({"names": names, "prefix": prefix, "older_than": older_than})
             await self._client._arequest("POST", "/v1/snapshots/delete", json=body)

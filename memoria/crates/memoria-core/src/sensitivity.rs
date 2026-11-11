@@ -71,7 +71,7 @@ static PATTERNS: &[Pattern] = &[
     Pattern {
         label: "email",
         tier: SensitivityTier::Medium,
-        regex: r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}",
+        regex: r"[a-zA-Z0-9_.+-]+@(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}",
         replacement: "[email]",
     },
     Pattern {
@@ -463,6 +463,25 @@ mod tests {
             Some("contact me at [email] please")
         );
         assert!(r.matched_labels.contains(&"email"));
+    }
+
+    #[test]
+    fn email_redaction_covers_entire_multilabel_domain() {
+        for (address, expected) in [
+            ("bob@mail.example.com", "mail [email] now"),
+            ("bob@example.co.uk", "mail [email] now"),
+            ("alice@example.com", "mail [email] now"),
+        ] {
+            let input = format!("mail {address} now");
+            let result = check_sensitivity(&input);
+            assert!(!result.blocked, "email unexpectedly blocked: {address}");
+            assert_eq!(
+                result.redacted_content.as_deref(),
+                Some(expected),
+                "email domain tail survived redaction: {address}"
+            );
+            assert_eq!(result.matched_labels, vec!["email"]);
+        }
     }
 
     #[test]

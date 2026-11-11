@@ -168,8 +168,15 @@ export class MemoriaHttpTransport {
         : `limit=${pageSize}`;
       const data = await this.get(`/v1/memories?${query}${typeFilter}`);
       const rec = this.asRecord(data);
-      const pageItems = Array.isArray(rec?.items) ? rec!.items : Array.isArray(data) ? data : [];
-      const next = typeof rec?.next_cursor === "string" && rec.next_cursor ? rec.next_cursor : null;
+      const pageItems = Array.isArray(rec?.items) ? rec!.items : Array.isArray(data) ? data : null;
+      if (pageItems === null) {
+        throw new Error("Invalid Memoria API list page: expected an items array");
+      }
+      const rawCursor = rec?.next_cursor;
+      if (rawCursor !== null && rawCursor !== undefined && typeof rawCursor !== "string") {
+        throw new Error("Invalid Memoria API list page: next_cursor must be a string or null");
+      }
+      const next = typeof rawCursor === "string" && rawCursor ? rawCursor : null;
       // A cursor that does not advance means the server repeated a page: drop it
       // so rows are not counted twice, and stop so a misbehaving server cannot
       // loop us. The leftover cursor still marks the result as incomplete.
@@ -209,7 +216,10 @@ export class MemoriaHttpTransport {
       if (args.reason) body.reason = args.reason;
       const data = await this.put(this.memoryPath(args.memory_id, "/correct"), body);
       const rec = this.asRecord(data);
-      return `Corrected memory ${rec?.memory_id ?? args.memory_id}: ${rec?.content ?? args.new_content}`;
+      if (typeof rec?.memory_id !== "string" || !rec.memory_id.trim()) {
+        throw new Error("Memoria API returned invalid correction response: missing memory_id");
+      }
+      return `Corrected memory ${rec.memory_id}: ${rec.content ?? args.new_content}`;
     }
     // Correct by query
     const body: Record<string, unknown> = {
@@ -219,7 +229,10 @@ export class MemoriaHttpTransport {
     if (args.reason) body.reason = args.reason;
     const data = await this.post("/v1/memories/correct", body);
     const rec = this.asRecord(data);
-    return `Corrected memory ${rec?.memory_id ?? ""}: ${rec?.content ?? args.new_content}`;
+    if (typeof rec?.memory_id !== "string" || !rec.memory_id.trim()) {
+      throw new Error("Memoria API returned invalid correction response: missing memory_id");
+    }
+    return `Corrected memory ${rec.memory_id}: ${rec.content ?? args.new_content}`;
   }
 
   private async purge(args: Record<string, unknown>) {
@@ -312,6 +325,11 @@ export class MemoriaHttpTransport {
         // Preserve older unpaginated response formats on the first request.
         if (page === 0) return this.formatSnapshotList(data);
         throw new Error("Memoria snapshot listing returned a malformed page");
+      }
+      // Missing metadata is supported for legacy unpaginated responses, but
+      // invalid metadata must not turn a truncated scan into a complete list.
+      if (rec.has_more !== undefined && typeof rec.has_more !== "boolean") {
+        throw new Error("Memoria snapshot listing returned invalid has_more");
       }
       const items = rec.snapshots;
       snapshots.push(...items);
@@ -483,18 +501,18 @@ export class MemoriaHttpTransport {
   private formatSnapshotList(data: unknown): string {
     // Produce text matching Rust MCP format: "Snapshots (N):\n  name (timestamp)\n  ..."
     const rec = this.asRecord(data);
-    const items = rec?.result ? this.asRecord(rec.result) : rec;
-    // The API may return an array or an object with items/snapshots
-    let snapshots: unknown[] = [];
+    // Accept the documented API envelopes and legacy unpaginated formats.
+    let snapshots: unknown[];
     if (Array.isArray(data)) {
       snapshots = data;
-    } else if (items && Array.isArray(items)) {
-      snapshots = items;
-    } else if (rec) {
-      // Try common response shapes
-      if (Array.isArray(rec.snapshots)) snapshots = rec.snapshots;
-      else if (Array.isArray(rec.items)) snapshots = rec.items;
-      else if (typeof rec.result === "string") return rec.result as string;
+    } else if (Array.isArray(rec?.snapshots)) {
+      snapshots = rec.snapshots;
+    } else if (Array.isArray(rec?.items)) {
+      snapshots = rec.items;
+    } else if (typeof rec?.result === "string") {
+      return rec.result;
+    } else {
+      throw new Error("Memoria snapshot listing returned a malformed page");
     }
     if (snapshots.length === 0) {
       return "Snapshots (0):";
@@ -520,6 +538,9 @@ export class MemoriaHttpTransport {
       if (Array.isArray(rec.branches)) branches = rec.branches;
       else if (Array.isArray(rec.items)) branches = rec.items;
       else if (typeof rec.result === "string") return rec.result as string;
+      else throw new Error("Invalid Memoria API branch list response: expected branches/items array");
+    } else {
+      throw new Error("Invalid Memoria API branch list response: expected branches/items array");
     }
     if (branches.length === 0) {
       return "Branches:\n  main ← active";

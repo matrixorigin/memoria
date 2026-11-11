@@ -118,8 +118,10 @@ describe("Group 3: Cloud API Communication", () => {
       it(`${id} ${tool} → ${method} ${pathPattern.source}`, async () => {
         fetchMock.respondWith(200, tool === "memory_store"
           ? { memory_id: "new-id", content: args.content ?? "" }
-          : tool.includes("retrieve") || tool.includes("search") || tool === "memory_list"
-            ? { results: [] }
+          : tool === "memory_list"
+            ? { items: [] }
+            : tool.includes("retrieve") || tool.includes("search")
+              ? { results: [] }
             : tool === "memory_profile"
               ? { profile: "test" }
               : tool === "memory_purge"
@@ -274,6 +276,32 @@ describe("Group 3: Cloud API Communication", () => {
       expect(result.content[0].text).toBe("Corrected memory m1: updated");
     });
 
+    it.each([{ memory_id: "old-id" }, { query: "old memory" }])(
+      "rejects invalid correction receipts without replay for %j",
+      async (selector) => {
+        for (const response of [null, {}, { error: "private upstream detail" },
+          { memory_id: "" }, { memory_id: "  " }, { memory_id: 42 }, [], "invalid"]) {
+          fetchMock.respondWith(200, response);
+          const before = fetchMock.calls.length;
+          await expect(transport.callTool("memory_correct", {
+            ...selector, new_content: "replacement",
+          })).rejects.toThrow("Memoria API returned invalid correction response: missing memory_id");
+          expect(fetchMock.calls).toHaveLength(before + 1);
+        }
+      },
+    );
+
+    it.each([{ memory_id: "old-id" }, { query: "old memory" }])(
+      "reports the authoritative replacement ID for %j",
+      async (selector) => {
+        fetchMock.respondWith(200, { memory_id: "replacement-id", content: "server content" });
+        const result = await transport.callTool("memory_correct", {
+          ...selector, new_content: "requested content",
+        }) as any;
+        expect(result.content[0].text).toBe("Corrected memory replacement-id: server content");
+      },
+    );
+
     it("3.41 memory_purge → 'Purged N memory(ies).'", async () => {
       fetchMock.respondWith(200, { purged: 3 });
       const result = await transport.callTool("memory_purge", { topic: "old" }) as any;
@@ -319,6 +347,31 @@ describe("Group 3: Cloud API Communication", () => {
       fetchMock.respondWith(200, { branches: [] });
       const result = await transport.callTool("memory_branches", {}) as any;
       expect(result.content[0].text).toContain("main ← active");
+    });
+
+    it.each([
+      ["null body", null],
+      ["empty object", {}],
+      ["upstream error", { error: "service failed" }],
+      ["null branches", { branches: null }],
+      ["unexpected text", "not a branch list"],
+      ["number", 42],
+    ])("3.45a memory_branches rejects malformed %s", async (_name, response) => {
+      fetchMock.respondWith(200, response);
+      await expect(transport.callTool("memory_branches", {}))
+        .rejects.toThrow(/invalid memoria api branch list response/i);
+    });
+
+    it("3.45b memory_branches preserves items envelope", async () => {
+      fetchMock.respondWith(200, { items: [{ name: "testing", active: true }] });
+      const result = await transport.callTool("memory_branches", {}) as any;
+      expect(result.content[0].text).toContain("testing ← active");
+    });
+
+    it("3.45c memory_branches preserves legacy text envelope", async () => {
+      fetchMock.respondWith(200, { result: "Branches:\n  legacy ← active" });
+      const result = await transport.callTool("memory_branches", {}) as any;
+      expect(result.content[0].text).toBe("Branches:\n  legacy ← active");
     });
   });
 
