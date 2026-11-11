@@ -92,6 +92,16 @@ fn normalize_opt_string(s: Option<String>) -> Option<String> {
     s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
+fn validate_observed_at(observed_at: Option<DateTime<Utc>>) -> Result<(), MemoriaError> {
+    // A future observation can produce negative age and unbounded recency scores.
+    if observed_at.is_some_and(|at| at > Utc::now()) {
+        return Err(MemoriaError::Validation(
+            "observed_at must not be in the future".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Extra retrieval controls that must be threaded through the full retrieval pipeline.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetrieveOptions {
@@ -1349,6 +1359,7 @@ impl MemoryService {
         mut extra_metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
         idempotency_key: Option<&str>,
     ) -> Result<Memory, MemoriaError> {
+        validate_observed_at(observed_at)?;
         let subject_id = normalize_opt_string(subject_id);
         if let Some(ref sid) = subject_id {
             if sid.len() > 128 {
@@ -3852,5 +3863,18 @@ mod idempotency_tests {
             assert!(idempotent_memory_id("owner-a", None, key).is_err());
         }
         assert!(idempotent_memory_id("owner-a", None, &"x".repeat(129)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod observed_at_validation_tests {
+    use super::validate_observed_at;
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn future_observations_are_rejected() {
+        assert!(validate_observed_at(None).is_ok());
+        assert!(validate_observed_at(Some(Utc::now() - Duration::days(1))).is_ok());
+        assert!(validate_observed_at(Some(Utc::now() + Duration::days(1))).is_err());
     }
 }
