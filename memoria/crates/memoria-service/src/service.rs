@@ -575,7 +575,10 @@ pub type BatchStoreItem = (
 );
 
 /// Metadata-aware item for batch memory storage.
-/// Tuple fields: `(content, memory_type, session_id, trust_tier, subject_id, extra_metadata)`.
+/// Tuple fields: `(content, memory_type, session_id, trust_tier, subject_id, extra_metadata, initial_confidence)`.
+/// `initial_confidence` is an optional source-support score. `None`, or a value
+/// that is not a finite number in `0..=1`, keeps the tier default. One illegal
+/// score does not reject the rest of the batch.
 pub type MetadataBatchStoreItem = (
     String,
     MemoryType,
@@ -583,7 +586,15 @@ pub type MetadataBatchStoreItem = (
     Option<TrustTier>,
     Option<String>,
     Option<std::collections::HashMap<String, serde_json::Value>>,
+    Option<f64>,
 );
+
+fn resolved_batch_confidence(requested: Option<f64>, tier: &TrustTier) -> f64 {
+    match requested {
+        Some(value) if value.is_finite() && (0.0..=1.0).contains(&value) => value,
+        _ => tier.initial_confidence(),
+    }
+}
 
 pub struct MemoryService {
     /// Trait-based store for generic ops (used by tests with MockStore)
@@ -3593,7 +3604,7 @@ impl MemoryService {
             items
                 .into_iter()
                 .map(|(content, mt, session_id, tier, subject_id)| {
-                    (content, mt, session_id, tier, subject_id, None)
+                    (content, mt, session_id, tier, subject_id, None, None)
                 })
                 .collect(),
             author_id,
@@ -3617,7 +3628,8 @@ impl MemoryService {
         // Sensitivity check + collect contents
         let mut contents = Vec::with_capacity(items.len());
         let mut checked_items = Vec::with_capacity(items.len());
-        for (content, mt, session_id, tier, subject_id, extra_metadata) in items {
+        for (content, mt, session_id, tier, subject_id, extra_metadata, initial_confidence) in items
+        {
             reject_reserved_metadata(extra_metadata.as_ref())?;
             validate_session_id_length(session_id.as_deref())?;
             let subject_id = normalize_opt_string(subject_id);
@@ -3654,6 +3666,7 @@ impl MemoryService {
                 tier,
                 subject_id,
                 extra_metadata,
+                initial_confidence,
             ));
         }
 
@@ -3661,7 +3674,7 @@ impl MemoryService {
         let embeddings = self.embed_batch(&contents).await?;
 
         let mut results = Vec::with_capacity(checked_items.len());
-        for (i, (content, mt, session_id, tier, subject_id, extra_metadata)) in
+        for (i, (content, mt, session_id, tier, subject_id, extra_metadata, initial_confidence)) in
             checked_items.into_iter().enumerate()
         {
             let effective_tier = tier.unwrap_or(TrustTier::T1Verified);
@@ -3673,7 +3686,7 @@ impl MemoryService {
                 subject_id,
                 memory_type: mt,
                 content,
-                initial_confidence: effective_tier.initial_confidence(),
+                initial_confidence: resolved_batch_confidence(initial_confidence, &effective_tier),
                 embedding,
                 source_event_ids: vec![],
                 superseded_by: None,
@@ -4360,6 +4373,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        None,
                     )],
                     None,
                 )
@@ -4728,5 +4742,25 @@ mod observe_identifier_length_tests {
                 "{field}: {error:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod batch_confidence_tests {
+    use super::resolved_batch_confidence;
+    use memoria_core::TrustTier;
+
+    #[test]
+    fn legal_score_is_kept_and_illegal_score_uses_the_tier_default() {
+        let tier = TrustTier::T1Verified;
+        let default = tier.initial_confidence();
+        assert_eq!(resolved_batch_confidence(Some(0.25), &tier), 0.25);
+        assert_eq!(resolved_batch_confidence(Some(0.0), &tier), 0.0);
+        assert_eq!(resolved_batch_confidence(Some(1.0), &tier), 1.0);
+        assert_eq!(resolved_batch_confidence(None, &tier), default);
+        assert_eq!(resolved_batch_confidence(Some(1.1), &tier), default);
+        assert_eq!(resolved_batch_confidence(Some(-0.01), &tier), default);
+        assert_eq!(resolved_batch_confidence(Some(f64::NAN), &tier), default);
+        assert_eq!(resolved_batch_confidence(Some(f64::INFINITY), &tier), default);
     }
 }

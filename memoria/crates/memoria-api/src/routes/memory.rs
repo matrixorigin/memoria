@@ -381,13 +381,24 @@ pub async fn batch_store(
                 top_branch.clone(),
                 subject_id,
                 r.extra_metadata,
+                r.initial_confidence,
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
     // Validate all types upfront
     let mut validated = Vec::with_capacity(items.len());
-    for (content, mt_result, tier_result, session_id, branch, subject_id, extra_metadata) in items {
+    for (
+        content,
+        mt_result,
+        tier_result,
+        session_id,
+        branch,
+        subject_id,
+        extra_metadata,
+        initial_confidence,
+    ) in items
+    {
         let mt = mt_result?;
         let tier = tier_result?;
         validated.push((
@@ -398,6 +409,7 @@ pub async fn batch_store(
             branch,
             subject_id,
             extra_metadata,
+            initial_confidence,
         ));
     }
 
@@ -409,8 +421,25 @@ pub async fn batch_store(
     let batch_items = validated
         .into_iter()
         .map(
-            |(content, mt, session_id, tier, _branch, subject_id, extra_metadata)| {
-                (content, mt, session_id, tier, subject_id, extra_metadata)
+            |(
+                content,
+                mt,
+                session_id,
+                tier,
+                _branch,
+                subject_id,
+                extra_metadata,
+                initial_confidence,
+            )| {
+                (
+                    content,
+                    mt,
+                    session_id,
+                    tier,
+                    subject_id,
+                    extra_metadata,
+                    initial_confidence,
+                )
             },
         )
         .collect();
