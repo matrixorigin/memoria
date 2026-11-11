@@ -204,13 +204,24 @@ pub async fn delete_user(
     auth.require_master()?;
     let user_store = get_user_store(&state, &user_id).await?;
     let memories_table = user_store.t("mem_memories");
-    sqlx::query(&format!(
-        "UPDATE {memories_table} SET is_active = 0 WHERE user_id = ?"
-    ))
-    .bind(&user_id)
-    .execute(user_store.pool())
-    .await
-    .map_err(db_err)?;
+    // Group memories belong to members, not the group id. The group has its
+    // own isolated database, so filtering by group id would delete nothing.
+    if user_id.starts_with("grp_") {
+        sqlx::query(&format!(
+            "UPDATE {memories_table} SET is_active = 0 WHERE is_active > 0"
+        ))
+        .execute(user_store.pool())
+        .await
+        .map_err(db_err)?;
+    } else {
+        sqlx::query(&format!(
+            "UPDATE {memories_table} SET is_active = 0 WHERE user_id = ? AND is_active > 0"
+        ))
+        .bind(&user_id)
+        .execute(user_store.pool())
+        .await
+        .map_err(db_err)?;
+    }
     if let Err(e) = state
         .mark_metrics_dirty(&user_id, crate::metrics_summary::DirtyMask::FULL)
         .await
