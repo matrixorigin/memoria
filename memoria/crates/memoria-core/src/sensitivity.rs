@@ -67,6 +67,14 @@ static PATTERNS: &[Pattern] = &[
         ),
         replacement: "",
     },
+    Pattern {
+        label: "dsn_password",
+        tier: SensitivityTier::High,
+        // Require a URI authority with non-empty userinfo password; no plain
+        // connection URL or username-only URL should trigger HIGH sensitivity.
+        regex: r"(?i)\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss)://[^\s/@:]+:[^\s/@]+@[^\s/]+",
+        replacement: "",
+    },
     // MEDIUM — redact
     Pattern {
         label: "email",
@@ -149,6 +157,23 @@ pub fn check_sensitivity(text: &str) -> SensitivityResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_uri_passwords_are_blocked_without_blocking_public_uris() {
+        for value in [
+            "DATABASE_URL=postgres://admin:synthetic-pass@db.example:5432/app",
+            "mysql://admin:synthetic-pass@localhost/db",
+            "redis://default:synthetic-pass@localhost:6379/0",
+        ] {
+            assert!(check_sensitivity(value).blocked, "credential URL accepted");
+        }
+        for value in [
+            "postgres://db.example:5432/app",
+            "mysql://admin@localhost/db",
+        ] {
+            assert!(!check_sensitivity(value).blocked, "safe URI rejected");
+        }
+    }
 
     #[test]
     fn test_aws_key_blocked() {
