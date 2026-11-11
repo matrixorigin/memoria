@@ -114,7 +114,7 @@ static PATTERNS: &[Pattern] = &[
         tier: SensitivityTier::Medium,
         // Require at least one separator so opaque 10-11 digit identifiers
         // (for example GitHub comment IDs) are not mistaken for phone numbers.
-        regex: r"\b(?:\d{3}[-.]\d{3,4}[-.]?\d{4}|\d{3}[-.]?\d{3,4}[-.]\d{4})\b",
+        regex: r"(?:\+1[ -]?(?:\(\d{3}\)|\d{3})[ .-]\d{3}[ .-]\d{4}|\(\d{3}\)[ .-]\d{3}[ .-]\d{4}|\b(?:\d{3}[-.]\d{3,4}[-.]?\d{4}|\d{3}[-.]?\d{3,4}[-.]\d{4}|\d{3} \d{3} \d{4}))\b",
         replacement: "[phone]",
     },
     Pattern {
@@ -668,6 +668,21 @@ mod tests {
                 result.redacted_content.as_deref(),
                 Some("call [phone] anytime")
             );
+            assert_eq!(result.matched_labels, vec!["phone"]);
+        }
+    }
+
+    #[test]
+    fn phone_redaction_covers_parentheses_country_code_and_spaces() {
+        for phone in [
+            "(555) 867-5309",
+            "+1 (555) 867-5309",
+            "+1 555 867 5309",
+            "555 867 5309",
+        ] {
+            let result = check_sensitivity(&format!("call {phone} anytime"));
+            assert!(!result.blocked);
+            assert_eq!(result.redacted_content.as_deref(), Some("call [phone] anytime"));
             assert_eq!(result.matched_labels, vec!["phone"]);
         }
     }
