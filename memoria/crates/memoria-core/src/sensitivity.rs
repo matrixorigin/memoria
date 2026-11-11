@@ -67,6 +67,14 @@ static PATTERNS: &[Pattern] = &[
         ),
         replacement: "",
     },
+    Pattern {
+        label: "basic_auth",
+        tier: SensitivityTier::High,
+        // Basic credentials are base64-encoded user:password; require the
+        // Authorization header so arbitrary base64 text is not blocked.
+        regex: r"(?i)\bAuthorization\s*:\s*Basic\s+[A-Za-z0-9+/]{12,}={0,2}\b",
+        replacement: "",
+    },
     // MEDIUM — redact
     Pattern {
         label: "email",
@@ -149,6 +157,14 @@ pub fn check_sensitivity(text: &str) -> SensitivityResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_basic_authorization_header_is_blocked() {
+        let encoded = format!("{}{}", "dXNlcjpz", "M2NyZXRQYXNzd29yZA==");
+        let header = format!("Authorization: Basic {encoded}");
+        assert!(check_sensitivity(&header).blocked);
+        assert!(!check_sensitivity("Basic authentication is supported.").blocked);
+    }
 
     #[test]
     fn test_aws_key_blocked() {
