@@ -67,6 +67,12 @@ static PATTERNS: &[Pattern] = &[
         ),
         replacement: "",
     },
+    Pattern {
+        label: "provider_api_key",
+        tier: SensitivityTier::High,
+        regex: r"\b(?:sk-(?:proj-|ant-[A-Za-z0-9_-]*-)?[A-Za-z0-9_-]{20,}|xox[bp]-[A-Za-z0-9-]{20,}|glpat-[A-Za-z0-9_-]{20,})",
+        replacement: "",
+    },
     // MEDIUM — redact
     Pattern {
         label: "email",
@@ -149,6 +155,19 @@ pub fn check_sensitivity(text: &str) -> SensitivityResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_prefixed_api_keys_are_blocked() {
+        for secret in [
+            format!("sk-proj-{}", "A".repeat(32)),
+            format!("sk-ant-api03-{}", "B".repeat(32)),
+            format!("xoxb-{}", "1".repeat(32)),
+            format!("glpat-{}", "C".repeat(32)),
+        ] {
+            assert!(check_sensitivity(&secret).blocked, "provider key allowed");
+        }
+        assert!(!check_sensitivity("We use sk-proj- as a placeholder prefix.").blocked);
+    }
 
     #[test]
     fn test_aws_key_blocked() {
