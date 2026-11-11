@@ -233,7 +233,7 @@ class _HttpTransport:
             if resp.is_success:
                 if resp.status_code == 204 or not resp.content:
                     return None
-                content_type = resp.headers.get("content-type", "")
+                content_type = resp.headers.get("content-type", "").lower()
                 if "json" in content_type:
                     try:
                         return resp.json()
@@ -311,7 +311,7 @@ class _HttpTransport:
             if resp.is_success:
                 if resp.status_code == 204 or not resp.content:
                     return None
-                content_type = resp.headers.get("content-type", "")
+                content_type = resp.headers.get("content-type", "").lower()
                 if "json" in content_type:
                     try:
                         return resp.json()
