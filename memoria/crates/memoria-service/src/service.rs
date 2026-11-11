@@ -1351,7 +1351,7 @@ impl MemoryService {
     ) -> Result<Memory, MemoriaError> {
         let subject_id = normalize_opt_string(subject_id);
         if let Some(ref sid) = subject_id {
-            if sid.len() > 128 {
+            if sid.chars().count() > 128 {
                 return Err(MemoriaError::Validation(
                     "subject_id exceeds maximum length of 128 characters".into(),
                 ));
@@ -3040,7 +3040,7 @@ impl MemoryService {
             reject_reserved_metadata(extra_metadata.as_ref())?;
             let subject_id = normalize_opt_string(subject_id);
             if let Some(ref sid) = subject_id {
-                if sid.len() > 128 {
+                if sid.chars().count() > 128 {
                     return Err(MemoriaError::Validation(
                         "subject_id exceeds maximum length of 128 characters".into(),
                     ));
@@ -3852,5 +3852,18 @@ mod idempotency_tests {
             assert!(idempotent_memory_id("owner-a", None, key).is_err());
         }
         assert!(idempotent_memory_id("owner-a", None, &"x".repeat(129)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod subject_id_character_limit_tests {
+    #[test]
+    fn unicode_subject_id_limit_counts_characters_not_utf8_bytes() {
+        let exactly_128 = "é".repeat(128);
+        assert_eq!(exactly_128.chars().count(), 128);
+        assert!(exactly_128.len() > 128);
+        assert!(exactly_128.chars().count() <= 128);
+        assert!("é".repeat(129).chars().count() > 128);
+        assert!("x".repeat(129).chars().count() > 128);
     }
 }
