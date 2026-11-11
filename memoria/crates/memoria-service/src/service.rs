@@ -101,6 +101,16 @@ fn validate_session_id_length(session_id: Option<&str>) -> Result<(), MemoriaErr
     Ok(())
 }
 
+fn validate_observed_at(observed_at: Option<DateTime<Utc>>) -> Result<(), MemoriaError> {
+    // A future observation can produce negative age and unbounded recency scores.
+    if observed_at.is_some_and(|at| at > Utc::now()) {
+        return Err(MemoriaError::Validation(
+            "observed_at must not be in the future".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Extra retrieval controls that must be threaded through the full retrieval pipeline.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetrieveOptions {
@@ -1366,6 +1376,7 @@ impl MemoryService {
                 ));
             }
         }
+        validate_observed_at(observed_at)?;
         let subject_id = normalize_opt_string(subject_id);
         if let Some(ref sid) = subject_id {
             if sid.chars().count() > 128 {
@@ -3902,5 +3913,18 @@ mod session_id_length_tests {
     fn rejects_more_than_64_characters() {
         assert!(validate_session_id_length(Some(&"x".repeat(65))).is_err());
         assert!(validate_session_id_length(Some(&"é".repeat(65))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod observed_at_validation_tests {
+    use super::validate_observed_at;
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn future_observations_are_rejected() {
+        assert!(validate_observed_at(None).is_ok());
+        assert!(validate_observed_at(Some(Utc::now() - Duration::days(1))).is_ok());
+        assert!(validate_observed_at(Some(Utc::now() + Duration::days(1))).is_err());
     }
 }
