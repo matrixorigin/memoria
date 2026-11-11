@@ -919,11 +919,54 @@ pub async fn user_branch_stats(
 
 /// Redact password from database URL for safe display.
 fn redact_url(url: &str) -> String {
-    // mysql://user:pass@host:port/db → mysql://user:***@host:port/db
-    if let Some(at) = url.find('@') {
-        if let Some(colon) = url[..at].rfind(':') {
-            return format!("{}:***{}", &url[..colon], &url[at..]);
-        }
+    // Restrict credential parsing to the authority, not the path/query/fragment.
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let authority_end = url[authority_start..]
+        .find(['/', '?', '#'])
+        .map(|offset| authority_start + offset)
+        .unwrap_or(url.len());
+    let authority = &url[authority_start..authority_end];
+    let Some(at) = authority.rfind('@') else {
+        return url.to_string();
+    };
+    let Some(colon) = authority[..at].find(':') else {
+        return url.to_string();
+    };
+    let username_end = authority_start + colon;
+    let host_start = authority_start + at;
+    format!("{}:***{}", &url[..username_end], &url[host_start..])
+}
+
+#[cfg(test)]
+mod admin_url_redaction_tests {
+    use super::redact_url;
+
+    #[test]
+    fn redacts_entire_password_even_with_at_signs() {
+        assert_eq!(
+            redact_url("mysql://user:p@ss@host:3306/db"),
+            "mysql://user:***@host:3306/db"
+        );
+        assert_eq!(
+            redact_url("mysql://user:a@b@c@host/db"),
+            "mysql://user:***@host/db"
+        );
+        assert_eq!(
+            redact_url("mysql://user:pass@host/db"),
+            "mysql://user:***@host/db"
+        );
     }
-    url.to_string()
+
+    #[test]
+    fn ignores_at_signs_outside_authority() {
+        assert_eq!(
+            redact_url("mysql://host/db?email=a@b.test"),
+            "mysql://host/db?email=a@b.test"
+        );
+        assert_eq!(redact_url("mysql://host/a@b"), "mysql://host/a@b");
+        assert_eq!(redact_url("mysql://host/#a@b"), "mysql://host/#a@b");
+    }
 }
