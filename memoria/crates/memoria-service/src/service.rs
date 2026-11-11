@@ -1349,6 +1349,13 @@ impl MemoryService {
         mut extra_metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
         idempotency_key: Option<&str>,
     ) -> Result<Memory, MemoriaError> {
+        if let Some(ref sid) = session_id {
+            if sid.chars().count() > 64 {
+                return Err(MemoriaError::Validation(
+                    "session_id exceeds maximum length of 64 characters".into(),
+                ));
+            }
+        }
         let subject_id = normalize_opt_string(subject_id);
         if let Some(ref sid) = subject_id {
             if sid.len() > 128 {
