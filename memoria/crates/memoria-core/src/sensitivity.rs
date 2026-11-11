@@ -664,6 +664,28 @@ mod tests {
     }
 
     #[test]
+    fn credit_card_redaction_bounds_candidates_at_separators() {
+        let cases = [
+            (
+                "cards 4111-1111-1111-1111 4111 1111 1111 1111 end",
+                "cards [card] [card] end",
+            ),
+            (
+                "ref 1730284800123 card 4111-1111-1111-1111 end",
+                "ref 1730284800123 card [card] end",
+            ),
+        ];
+        for (input, expected) in cases {
+            let result = check_sensitivity(input);
+            assert_eq!(
+                result.redacted_content.as_deref().unwrap_or(input),
+                expected,
+                "unexpected redaction for: {input}"
+            );
+        }
+    }
+
+    #[test]
     fn credit_card_redaction_preserves_grouped_19_digit_cards() {
         let result = check_sensitivity("card 4000 0000 0000 0000 006 on file");
         assert_eq!(
