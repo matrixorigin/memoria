@@ -16,21 +16,31 @@ pip install -e "./sdk/python[dev]"
 ```
 
 The package version is declared in `sdk/python/pyproject.toml` (currently `0.0.1`).
-Wheels published under the `python-sdk-v*` release tags are versioned by the release
-workflow rather than by `pyproject.toml`, so a released wheel can report a different
-version (`1.0.0`) than a source build from the same revision (#415).
+That file is also the version source used by the current release workflow
+([`.github/workflows/sdk-python-release.yml`](https://github.com/matrixorigin/Memoria/blob/main/.github/workflows/sdk-python-release.yml)):
+the workflow is manually dispatched, runs `python -m build` in `sdk/python`, and
+publishes the built artifacts to PyPI — it does not override the version from release
+tags and creates no GitHub Release assets, so any wheel built from a given revision
+reports that revision's `pyproject.toml` version (#415).
 
-**GitHub Release wheel** — requires the `python-sdk-v1.0.0` release asset to exist:
+**Published package (PyPI)** — available once the release workflow has been dispatched:
 
 ```bash
-pip install https://github.com/matrixorigin/Memoria/releases/download/python-sdk-v1.0.0/memoria_client-1.0.0-py3-none-any.whl
+pip install memoria-client
 ```
+
+**Hypothetical GitHub Release wheel** — this is not a distribution path the repository
+currently provides: the release workflow publishes to PyPI only, and the
+`python-sdk-v1.0.0` release referenced by older install snippets does not exist
+(HTTP 404) (#415).
 
 **Offline / air-gapped:**
 
 ```bash
-# Build the wheel on a connected host, copy it over, then:
-pip install ./memoria_client-1.0.0-py3-none-any.whl
+# Build the wheel on a connected host (run `python -m build` in `sdk/python`),
+# copy it over, then install the artifact that build produces for the current
+# `pyproject.toml` version:
+pip install ./memoria_client-0.0.1-py3-none-any.whl
 ```
 
 ## Quick Start
