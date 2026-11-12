@@ -12,6 +12,7 @@ that call ``self._client._request(...)`` or ``await self._client._arequest(...)`
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Any
 
@@ -172,6 +173,14 @@ class _HttpTransport:
         max_retries: int = _DEFAULT_MAX_RETRIES,
         retry_unsafe_writes: bool = False,
     ) -> None:
+        try:
+            valid_timeout = (
+                type(timeout) in (int, float) and timeout > 0 and math.isfinite(timeout)
+            )
+        except OverflowError:
+            valid_timeout = False
+        if not valid_timeout:
+            raise MemoriaValidationError("timeout must be a positive finite number")
         if type(max_retries) is not int or max_retries < 0:
             raise MemoriaValidationError("max_retries must be a non-negative integer")
         self._base_url = base_url.rstrip("/")
