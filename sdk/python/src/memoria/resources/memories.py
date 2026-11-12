@@ -313,6 +313,19 @@ def _validate_fulltext_search(
     return _normalize_fulltext_memory_types(memory_types)
 
 
+def _replay_safe_store(idempotency_key: str | None, branch: str | None) -> bool | None:
+    """Return ``True`` only when a keyed store may be replayed automatically.
+
+    The idempotent receipt is scoped to the resolved branch. An omitted or
+    blank branch resolves to the caller's active branch per request, which can
+    change between attempts, so only an explicit non-blank branch makes the
+    replay identity stable. ``None`` keeps the client's default write policy.
+    """
+    if idempotency_key is None or branch is None or not branch.strip():
+        return None
+    return True
+
+
 class MemoriesResource:
     def __init__(self, client: _HttpTransport) -> None:
         self._client = client
@@ -325,7 +338,22 @@ class MemoriesResource:
         session_id: str | None = None,
         trust_tier: str | None = None,
         branch: str | None = None,
+        idempotency_key: str | None = None,
     ) -> Memory:
+        """Store one memory, optionally with retry-safe write identity.
+
+        When ``idempotency_key`` is provided, the request uses the server's
+        atomic idempotent-store endpoint. Reusing a key with a different
+        payload is rejected by the server.
+
+        The server scopes the receipt identity to the owner and the resolved
+        branch. Ambiguous failures are therefore replayed automatically only
+        when ``branch`` is an explicit, non-blank name: with an omitted or
+        blank branch the server resolves the caller's *current* active branch
+        on every attempt, so a checkout between attempts would create a
+        second memory. Without an explicit branch a keyed store follows the
+        normal (non-replaying) write policy.
+        """
         body = _strip_none(
             {
                 "content": content,
@@ -333,9 +361,13 @@ class MemoriesResource:
                 "session_id": session_id,
                 "trust_tier": trust_tier,
                 "branch": branch,
+                "idempotency_key": idempotency_key,
             }
         )
-        data = self._client._request("POST", "/v1/memories", json=body)
+        path = "/v1/memories/idempotent" if idempotency_key is not None else "/v1/memories"
+        data = self._client._request(
+            "POST", path, json=body, idempotent=_replay_safe_store(idempotency_key, branch)
+        )
         return Memory.from_dict(data)
 
     def store_batch(
@@ -625,7 +657,14 @@ class AsyncMemoriesResource:
         session_id: str | None = None,
         trust_tier: str | None = None,
         branch: str | None = None,
+        idempotency_key: str | None = None,
     ) -> Memory:
+        """Store one memory, optionally with retry-safe write identity.
+
+        See :meth:`MemoriesResource.store` for the retry and replay contract;
+        automatic replay requires both ``idempotency_key`` and an explicit,
+        non-blank ``branch``.
+        """
         body = _strip_none(
             {
                 "content": content,
@@ -633,9 +672,13 @@ class AsyncMemoriesResource:
                 "session_id": session_id,
                 "trust_tier": trust_tier,
                 "branch": branch,
+                "idempotency_key": idempotency_key,
             }
         )
-        data = await self._client._arequest("POST", "/v1/memories", json=body)
+        path = "/v1/memories/idempotent" if idempotency_key is not None else "/v1/memories"
+        data = await self._client._arequest(
+            "POST", path, json=body, idempotent=_replay_safe_store(idempotency_key, branch)
+        )
         return Memory.from_dict(data)
 
     async def store_batch(

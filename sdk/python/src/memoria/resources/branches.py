@@ -70,7 +70,12 @@ class BranchesResource:
         self._client._request("POST", _branch_path(name, "/merge"), json={"strategy": strategy})
 
     def delete(self, name: str) -> None:
-        self._client._request("DELETE", _branch_path(name))
+        """Delete a branch; ambiguous failures are not retried by default.
+
+        A later branch may reuse the name, so retrying could delete it instead.
+        """
+        # A different branch may be created with the same name after deletion.
+        self._client._request("DELETE", _branch_path(name), idempotent=False)
 
     def apply(
         self,
@@ -161,7 +166,9 @@ class AsyncBranchesResource:
         )
 
     async def delete(self, name: str) -> None:
-        await self._client._arequest("DELETE", _branch_path(name))
+        """Delete a branch; ambiguous failures are not retried by default."""
+        # A retry after a lost response could delete a replacement branch.
+        await self._client._arequest("DELETE", _branch_path(name), idempotent=False)
 
     async def apply(
         self,

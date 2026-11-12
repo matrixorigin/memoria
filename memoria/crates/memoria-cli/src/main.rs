@@ -624,7 +624,11 @@ fn redact_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_string();
     };
-    let Some((userinfo, host)) = rest.split_once('@') else {
+    // Userinfo ends at the last @ in the authority, not at an @ in
+    // the password, path, query, or fragment.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, suffix) = rest.split_at(authority_end);
+    let Some((userinfo, host)) = authority.rsplit_once('@') else {
         return url.to_string();
     };
     if userinfo.is_empty() {
@@ -635,7 +639,7 @@ fn redact_url(url: &str) -> String {
     } else {
         "***"
     };
-    format!("{scheme}://{redacted_userinfo}@{host}")
+    format!("{scheme}://{redacted_userinfo}@{host}{suffix}")
 }
 
 fn normalize_tool_name(tool: Option<String>) -> Option<String> {
@@ -2154,8 +2158,11 @@ fn load_existing_config(project_dir: &Path) -> ExistingConfig {
 }
 
 fn mask_key(key: &str) -> String {
-    if key.len() <= 9 {
-        return "*".repeat(key.len());
+    let char_count = key.chars().count();
+    // Byte offsets are only character boundaries for ASCII tokens.
+    // Fully mask malformed/non-ASCII pasted keys instead of panicking.
+    if char_count <= 9 || !key.is_ascii() {
+        return "*".repeat(char_count);
     }
     format!("{}...{}", &key[..6], &key[key.len() - 3..])
 }
@@ -3593,7 +3600,7 @@ mod tests {
         LEGACY_MIGRATION_MAX_CONCURRENCY_ENV,
     };
     use super::{
-        enable_runtime_multi_db, normalize_tool_name, redact_url, run_with_edit_log_drain,
+        enable_runtime_multi_db, mask_key, normalize_tool_name, redact_url, run_with_edit_log_drain,
         validate_embedding_config, Cli, Commands, MigrationCommands,
     };
     use async_trait::async_trait;
@@ -3883,6 +3890,39 @@ mod tests {
             redact_url("mysql://localhost:6001/memoria"),
             "mysql://localhost:6001/memoria"
         );
+        assert_eq!(
+            redact_url("mysql://localhost:6001/memoria?note=a@b#c@d"),
+            "mysql://localhost:6001/memoria?note=a@b#c@d"
+        );
+    }
+
+    #[test]
+    fn redact_url_masks_entire_password_with_at_sign() {
+        assert_eq!(
+            redact_url("mysql://root:p@ss@db.example.com:6001/memoria"),
+            "mysql://***:***@db.example.com:6001/memoria"
+        );
+        assert_eq!(
+            redact_url("mysql://root:s3cr3t@x@localhost:6001/memoria?mode=read"),
+            "mysql://***:***@localhost:6001/memoria?mode=read"
+        );
+        assert_eq!(
+            redact_url("mysql://user@localhost:6001/memoria"),
+            "mysql://***@localhost:6001/memoria"
+        );
+    }
+
+    #[test]
+    fn mask_key_handles_non_ascii_without_panicking() {
+        let key = "sk-a密钥bcdefgh";
+        assert_eq!(mask_key(key), "*".repeat(key.chars().count()));
+        assert_eq!(mask_key("密钥"), "**");
+    }
+
+    #[test]
+    fn mask_key_preserves_ascii_masking() {
+        assert_eq!(mask_key("short"), "*****");
+        assert_eq!(mask_key("sk-test-token123"), "sk-tes...123");
     }
 
     #[test]
