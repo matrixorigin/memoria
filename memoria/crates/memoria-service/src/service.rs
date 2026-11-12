@@ -1357,6 +1357,11 @@ impl MemoryService {
                 ));
             }
         }
+        if content.trim().is_empty() {
+            return Err(MemoriaError::Validation(
+                "content must not be empty".into(),
+            ));
+        }
         if content.len() > MAX_MEMORY_CONTENT_BYTES {
             return Err(MemoriaError::Validation(
                 "content exceeds 32 KiB limit".into(),
@@ -3041,6 +3046,11 @@ impl MemoryService {
                     ));
                 }
             }
+            if content.trim().is_empty() {
+                return Err(MemoriaError::Validation(
+                    "content must not be empty".into(),
+                ));
+            }
             if content.len() > MAX_MEMORY_CONTENT_BYTES {
                 return Err(MemoriaError::Validation(
                     "content exceeds 32 KiB limit".into(),
@@ -3612,6 +3622,60 @@ mod tests {
 
         assert!(service.entity_tx.is_none());
         assert!(service.vector_monitor.is_none());
+    }
+
+    #[tokio::test]
+    async fn store_entrypoints_reject_blank_content_before_database_or_embedding() {
+        // The lazy store is intentionally not connected: invalid payloads must
+        // fail validation before either the database or embedder is accessed.
+        let pool = MySqlPoolOptions::new()
+            .connect_lazy("mysql://root:root@localhost:3306/memoria")
+            .expect("lazy mysql pool");
+        let store = Arc::new(SqlMemoryStore::new(pool, 1024, "blank-validation".to_string()));
+        let service = MemoryService::new_sql_with_llm(store, None, None).await;
+
+        for content in ["", "  ", "\t\n", "\u{2003}"] {
+            let single = service
+                .store_memory_with_metadata_and_key_on_branch(
+                    "user",
+                    None,
+                    content,
+                    MemoryType::Semantic,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(single, Err(MemoriaError::Validation(message)) if message == "content must not be empty"),
+                "single store accepted blank input: {content:?}"
+            );
+
+            let batch = service
+                .store_batch_with_metadata_on_branch(
+                    "user",
+                    None,
+                    vec![(
+                        content.to_string(),
+                        MemoryType::Semantic,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )],
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(batch, Err(MemoriaError::Validation(message)) if message == "content must not be empty"),
+                "batch store accepted blank input: {content:?}"
+            );
+        }
     }
 }
 
