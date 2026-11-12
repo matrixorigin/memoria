@@ -6,6 +6,7 @@ import builtins
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import quote
 
+from ..exceptions import MemoriaConnectionError
 from ..models import ApplyResult, Branch
 
 if TYPE_CHECKING:
@@ -25,16 +26,24 @@ def _branch_path(name: str, suffix: str = "") -> str:
     return f"/v1/branches/{encoded}{suffix}"
 
 
+def _branch_creation_response(data: Any, name: str) -> Branch:
+    """Reject malformed success responses rather than reporting a phantom branch."""
+    if isinstance(data, dict) and "error" not in data:
+        if "name" in data:
+            if data["name"] == name and "result" not in data:
+                return Branch.from_dict(data)
+        elif data.get("result") == f"Created branch '{name}'":
+            return Branch(name=name)
+    raise MemoriaConnectionError("Invalid branch creation response")
+
+
 class BranchesResource:
     def __init__(self, client: _HttpTransport) -> None:
         self._client = client
 
     def create(self, name: str) -> Branch:
         data = self._client._request("POST", "/v1/branches", json={"name": name})
-        # Server may return {"result": "Created branch 'name'"} instead of a Branch object
-        if isinstance(data, dict) and "name" not in data:
-            return Branch(name=name)
-        return Branch.from_dict(data)
+        return _branch_creation_response(data, name)
 
     def list(self) -> list[Branch]:
         data = self._client._request("GET", "/v1/branches")
@@ -126,9 +135,7 @@ class AsyncBranchesResource:
 
     async def create(self, name: str) -> Branch:
         data = await self._client._arequest("POST", "/v1/branches", json={"name": name})
-        if isinstance(data, dict) and "name" not in data:
-            return Branch(name=name)
-        return Branch.from_dict(data)
+        return _branch_creation_response(data, name)
 
     async def list(self) -> list[Branch]:
         data = await self._client._arequest("GET", "/v1/branches")
