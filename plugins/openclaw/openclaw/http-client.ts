@@ -348,7 +348,7 @@ export class MemoriaHttpTransport {
   }
 
   private async rollbackSnapshot(args: Record<string, unknown>) {
-    return this.post(`/v1/snapshots/${encodeURIComponent(String(args.name))}/rollback`, {});
+    return this.post(this.resourcePath("snapshots", String(args.name), "/rollback"), {});
   }
 
   // ── Branches ──────────────────────────────────────────────────
@@ -365,22 +365,22 @@ export class MemoriaHttpTransport {
   }
 
   private async branchCheckout(args: Record<string, unknown>) {
-    return this.post(`/v1/branches/${encodeURIComponent(String(args.name))}/checkout`, {});
+    return this.post(this.resourcePath("branches", String(args.name), "/checkout"), {});
   }
 
   private async branchDelete(args: Record<string, unknown>) {
-    return this.delete(`/v1/branches/${encodeURIComponent(String(args.name))}`);
+    return this.delete(this.resourcePath("branches", String(args.name)));
   }
 
   private async branchMerge(args: Record<string, unknown>) {
     const body: Record<string, unknown> = {};
     if (args.strategy) body.strategy = args.strategy;
-    return this.post(`/v1/branches/${encodeURIComponent(String(args.source))}/merge`, body);
+    return this.post(this.resourcePath("branches", String(args.source), "/merge"), body);
   }
 
   private async branchDiff(args: Record<string, unknown>) {
     const limit = typeof args.limit === "number" ? args.limit : 50;
-    return this.get(`/v1/branches/${encodeURIComponent(String(args.source))}/diff?limit=${limit}`);
+    return this.get(this.resourcePath("branches", String(args.source), `/diff?limit=${limit}`));
   }
 
   // ── Health ──────────────────────────────────────────────────────
@@ -402,11 +402,16 @@ export class MemoriaHttpTransport {
   // ── HTTP primitives ───────────────────────────────────────────
 
   private memoryPath(id: string, suffix = ""): string {
+    return this.resourcePath("memories", id, suffix);
+  }
+
+  private resourcePath(collection: "memories" | "branches" | "snapshots", id: string, suffix = ""): string {
     // WHATWG URLs normalize even percent-encoded dot-only segments as navigation.
     if (id === "." || id === "..") {
-      throw new Error("memory_id must not be a dot-only path segment");
+      const selector = collection === "memories" ? "memory_id" : "name";
+      throw new Error(`${selector} must not be a dot-only path segment`);
     }
-    return `/v1/memories/${encodeURIComponent(id)}${suffix}`;
+    return `/v1/${collection}/${encodeURIComponent(id)}${suffix}`;
   }
 
   private headers(): Record<string, string> {
