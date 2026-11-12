@@ -92,6 +92,11 @@ pub(crate) fn db_err(e: sqlx::Error) -> MemoriaError {
 /// internal error 20101. The code is shared by many internal errors, so retain
 /// the specific message check in one place until MatrixOne exposes a dedicated
 /// error code. See MatrixOne `pkg/fulltext/fulltext.go`.
+fn is_recoverable_fulltext_error_code(number: u16, message: &str) -> bool {
+    (number == 20101 && message.contains("empty pattern"))
+        || (number == 20301 && message.contains("column word does not exist"))
+}
+
 fn is_empty_fulltext_pattern_error(error: &sqlx::Error) -> bool {
     use sqlx::mysql::MySqlDatabaseError;
 
@@ -103,8 +108,7 @@ fn is_empty_fulltext_pattern_error(error: &sqlx::Error) -> bool {
                 .downcast_ref::<MySqlDatabaseError>()
         })
         .is_some_and(|mysql_error| {
-            mysql_error.number() == 20101
-                && mysql_error.message().contains("empty pattern")
+            is_recoverable_fulltext_error_code(mysql_error.number(), mysql_error.message())
         })
 }
 
@@ -6707,6 +6711,16 @@ mod tests {
     use sqlx::mysql::MySqlPoolOptions;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex, OnceLock};
+
+    #[test]
+    fn broken_fulltext_index_degrades_but_other_sql_errors_propagate() {
+        let recoverable = super::is_recoverable_fulltext_error_code;
+        assert!(recoverable(20101, "empty pattern"));
+        assert!(recoverable(20301, "invalid input: column word does not exist"));
+        assert!(!recoverable(20301, "invalid input: unrelated failure"));
+        assert!(!recoverable(20101, "unexpected internal error"));
+        assert!(!recoverable(1064, "column word does not exist"));
+    }
 
     #[test]
     fn sanitize_like_pattern_escapes_wildcards_for_literal_topic_match() {
