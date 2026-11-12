@@ -172,6 +172,23 @@ class _HttpTransport:
         max_retries: int = _DEFAULT_MAX_RETRIES,
         retry_unsafe_writes: bool = False,
     ) -> None:
+        try:
+            parsed_base_url = httpx.URL(base_url) if type(base_url) is str else None
+        except (httpx.InvalidURL, UnicodeError):
+            parsed_base_url = None
+        parsed_port = parsed_base_url.port if parsed_base_url is not None else None
+        if (
+            parsed_base_url is None
+            or parsed_base_url.scheme not in ("http", "https")
+            or not parsed_base_url.host
+            or not parsed_base_url.is_absolute_url
+            or "?" in base_url
+            or "#" in base_url
+            or (parsed_port is not None and not 1 <= parsed_port <= 65535)
+        ):
+            raise MemoriaValidationError(
+                "base_url must be an absolute HTTP URL with a valid port and no query or fragment"
+            )
         if type(max_retries) is not int or max_retries < 0:
             raise MemoriaValidationError("max_retries must be a non-negative integer")
         self._base_url = base_url.rstrip("/")
