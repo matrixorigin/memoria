@@ -1,5 +1,6 @@
-"""Retry budgets are configuration, not a source of phantom connection failures."""
+"""Transport configuration must fail before allocating an HTTP client."""
 
+import math
 from unittest.mock import AsyncMock, Mock
 
 import httpx
@@ -9,6 +10,37 @@ from pytest_httpx import HTTPXMock
 from memoria import AsyncMemoriaClient, MemoriaClient, MemoriaServerError
 from memoria.exceptions import MemoriaValidationError
 from tests.conftest import API_KEY, BASE_URL
+
+
+@pytest.mark.parametrize("client_type", [MemoriaClient, AsyncMemoriaClient])
+@pytest.mark.parametrize(
+    "timeout", [-1, 0, True, False, math.nan, math.inf, -math.inf, 10**400, "30", None]
+)
+def test_invalid_timeout_fails_before_allocating_http_client(
+    monkeypatch: pytest.MonkeyPatch, client_type: type, timeout: object
+) -> None:
+    sync_factory = Mock()
+    async_factory = Mock()
+    monkeypatch.setattr(httpx, "Client", sync_factory)
+    monkeypatch.setattr(httpx, "AsyncClient", async_factory)
+    with pytest.raises(MemoriaValidationError, match="timeout.*positive finite number"):
+        client_type(base_url=BASE_URL, api_key=API_KEY, timeout=timeout)
+    sync_factory.assert_not_called()
+    async_factory.assert_not_called()
+
+
+@pytest.mark.parametrize("client_type", [MemoriaClient, AsyncMemoriaClient])
+@pytest.mark.parametrize("timeout", [0.001, 1, 30.0])
+def test_valid_timeout_reaches_http_client_factory(
+    monkeypatch: pytest.MonkeyPatch, client_type: type, timeout: float
+) -> None:
+    sync_factory = Mock()
+    async_factory = Mock()
+    monkeypatch.setattr(httpx, "Client", sync_factory)
+    monkeypatch.setattr(httpx, "AsyncClient", async_factory)
+    client_type(base_url=BASE_URL, api_key=API_KEY, timeout=timeout)
+    expected_factory = async_factory if client_type is AsyncMemoriaClient else sync_factory
+    expected_factory.assert_called_once()
 
 
 @pytest.mark.parametrize("client_type", [MemoriaClient, AsyncMemoriaClient])
