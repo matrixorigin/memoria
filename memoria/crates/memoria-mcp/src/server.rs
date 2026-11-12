@@ -569,7 +569,7 @@ mod tests {
             input.push_str(&request.to_string());
             input.push('\n');
         }
-        input.push_str("{\"method\":\"ping\"}\n{\"id\":\"after\",\"method\":\"ping\"}\n");
+        input.push_str("{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":\"after\",\"method\":\"ping\"}\n");
         let mut output = Vec::new();
         super::run_io(input.as_bytes(), &mut output, mode, "test".into())
             .await
@@ -844,7 +844,7 @@ mod tests {
             .contains("-32600"));
         for (request, code) in [
             (json!({"id":7,"method":42}), Some(-32600)),
-            (json!({"id":"legacy","method":"tools/list"}), None),
+            (json!({"jsonrpc":"2.0","id":"legacy","method":"tools/list"}), None),
             (
                 json!({"jsonrpc":"2.0","id":9,"method":"notifications/cancelled"}),
                 Some(-32601),
