@@ -12,6 +12,54 @@ from tests.conftest import API_KEY, BASE_URL
 
 
 @pytest.mark.parametrize("client_type", [MemoriaClient, AsyncMemoriaClient])
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "",
+        "   ",
+        "localhost:8100",
+        "/relative",
+        "ftp://memoria.test",
+        "http://",
+        "https://memoria.test?tenant=one",
+        "https://memoria.test?",
+        "https://memoria.test#fragment",
+        "https://memoria.test#",
+        "http://memoria.test:0",
+        "http://memoria.test:65536",
+        "http://memoria.test:99999",
+        None,
+        8100,
+    ],
+)
+def test_invalid_base_url_fails_before_allocating_http_client(
+    monkeypatch: pytest.MonkeyPatch, client_type: type, base_url: object
+) -> None:
+    sync_factory = Mock()
+    async_factory = Mock()
+    monkeypatch.setattr(httpx, "Client", sync_factory)
+    monkeypatch.setattr(httpx, "AsyncClient", async_factory)
+    with pytest.raises(MemoriaValidationError, match="base_url.*absolute HTTP URL"):
+        client_type(base_url=base_url, api_key=API_KEY)  # type: ignore[arg-type]
+    sync_factory.assert_not_called()
+    async_factory.assert_not_called()
+
+
+@pytest.mark.parametrize("client_type", [MemoriaClient, AsyncMemoriaClient])
+@pytest.mark.parametrize("base_url", ["http://localhost:8100", "https://memoria.test/prefix/"])
+def test_valid_base_url_reaches_http_client_factory(
+    monkeypatch: pytest.MonkeyPatch, client_type: type, base_url: str
+) -> None:
+    sync_factory = Mock()
+    async_factory = Mock()
+    monkeypatch.setattr(httpx, "Client", sync_factory)
+    monkeypatch.setattr(httpx, "AsyncClient", async_factory)
+    client_type(base_url=base_url, api_key=API_KEY)
+    expected_factory = async_factory if client_type is AsyncMemoriaClient else sync_factory
+    expected_factory.assert_called_once()
+
+
+@pytest.mark.parametrize("client_type", [MemoriaClient, AsyncMemoriaClient])
 @pytest.mark.parametrize("budget", [-1, -100, True, False, 1.5, "2", None])
 def test_invalid_retry_budget_fails_before_allocating_http_client(
     monkeypatch: pytest.MonkeyPatch, client_type: type, budget: object
