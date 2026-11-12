@@ -67,6 +67,41 @@ static PATTERNS: &[Pattern] = &[
         ),
         replacement: "",
     },
+    Pattern {
+        label: "api_token_assignment",
+        tier: SensitivityTier::High,
+        // Require an assignment delimiter; ordinary discussion of tokens is safe.
+        regex: r#"(?i)\b(?:[A-Za-z0-9_]*api[_-]?key|[A-Za-z0-9_]*[_-]token|access[_-]?token|auth[_-]?token)["']?\s*[:=]\s*["']?\S+"#,
+        replacement: "",
+    },
+    Pattern {
+        label: "github_pat",
+        tier: SensitivityTier::High,
+        regex: r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})",
+        replacement: "",
+    },
+    Pattern {
+        label: "provider_api_key",
+        tier: SensitivityTier::High,
+        regex: r"\b(?:sk-(?:proj-|ant-[A-Za-z0-9_-]*-)?[A-Za-z0-9_-]{20,}|xox[bp]-[A-Za-z0-9-]{20,}|glpat-[A-Za-z0-9_-]{20,})",
+        replacement: "",
+    },
+    Pattern {
+        label: "dsn_password",
+        tier: SensitivityTier::High,
+        // Require a URI authority with non-empty userinfo password; no plain
+        // connection URL or username-only URL should trigger HIGH sensitivity.
+        regex: r"(?i)\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss)://[^\s/@:]+:[^\s/@]+@[^\s/]+",
+        replacement: "",
+    },
+    Pattern {
+        label: "basic_auth",
+        tier: SensitivityTier::High,
+        // Basic credentials are base64-encoded user:password; require the
+        // Authorization header so arbitrary base64 text is not blocked.
+        regex: r"(?i)\bAuthorization\s*:\s*Basic\s+[A-Za-z0-9+/]{12,}={0,2}\b",
+        replacement: "",
+    },
     // MEDIUM — redact
     Pattern {
         label: "email",
@@ -289,6 +324,58 @@ mod tests {
             }
         }
         unreachable!("a Luhn check digit exists for every card length")
+    }
+
+    #[test]
+    fn api_token_assignments_and_github_pats_are_blocked() {
+        for sample in [
+            "OPENAI_API_KEY=synthetic-test-key-123456",
+            "api_key: synthetic-test-key-123456",
+            "GITHUB_TOKEN=synthetic-test-token-123456",
+            "access_token=synthetic-test-token-123456",
+            "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz",
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789AB",
+        ] {
+            assert!(check_sensitivity(sample).blocked, "credential accepted: {sample}");
+        }
+        for prose in ["The API key documentation is helpful.", "Token budgeting matters."] {
+            assert!(!check_sensitivity(prose).blocked, "ordinary prose blocked: {prose}");
+        }
+    }
+
+    #[test]
+    fn provider_prefixed_api_keys_are_blocked() {
+        for secret in [
+            format!("sk-proj-{}", "A".repeat(32)),
+            format!("sk-ant-api03-{}", "B".repeat(32)),
+            format!("xoxb-{}", "1".repeat(32)),
+            format!("glpat-{}", "C".repeat(32)),
+        ] {
+            assert!(check_sensitivity(&secret).blocked, "provider key allowed");
+        }
+        assert!(!check_sensitivity("We use sk-proj- as a placeholder prefix.").blocked);
+    }
+
+    #[test]
+    fn connection_uri_passwords_are_blocked_without_blocking_public_uris() {
+        for value in [
+            "DATABASE_URL=postgres://admin:synthetic-pass@db.example:5432/app",
+            "mysql://admin:synthetic-pass@localhost/db",
+            "redis://default:synthetic-pass@localhost:6379/0",
+        ] {
+            assert!(check_sensitivity(value).blocked, "credential URL accepted");
+        }
+        for value in ["postgres://db.example:5432/app", "mysql://admin@localhost/db"] {
+            assert!(!check_sensitivity(value).blocked, "safe URI rejected");
+        }
+    }
+
+    #[test]
+    fn http_basic_authorization_header_is_blocked() {
+        let encoded = format!("{}{}", "dXNlcjpz", "M2NyZXRQYXNzd29yZA==");
+        let header = format!("Authorization: Basic {encoded}");
+        assert!(check_sensitivity(&header).blocked);
+        assert!(!check_sensitivity("Basic authentication is supported.").blocked);
     }
 
     #[test]
