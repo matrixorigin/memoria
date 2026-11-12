@@ -82,3 +82,18 @@ jobs:
         run: cd memoria && cargo test -p memoria-storage --lib materialized_probe_cleanup_preserves_unrelated_tables -- --ignored --nocapture
       - name: Offline restore cleanup regressions
         run: cd memoria && cargo test -p memoria-git --example restore_cleanup -- --include-ignored --nocapture
+
+  python-sdk:
+    name: Python SDK Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python SDK test dependencies
+        working-directory: sdk/python
+        run: python -m pip install -e ".[dev]"
+      - name: Run Python SDK unit suite
+        working-directory: sdk/python
+        run: python -m pytest tests/unit/ -q
