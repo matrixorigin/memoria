@@ -337,6 +337,8 @@ class MemoriesResource:
         memory_type: str = "semantic",
         session_id: str | None = None,
         trust_tier: str | None = None,
+        observed_at: str | None = None,
+        initial_confidence: float | None = None,
         branch: str | None = None,
         idempotency_key: str | None = None,
     ) -> Memory:
@@ -360,6 +362,8 @@ class MemoriesResource:
                 "memory_type": memory_type,
                 "session_id": session_id,
                 "trust_tier": trust_tier,
+                "observed_at": observed_at,
+                "initial_confidence": initial_confidence,
                 "branch": branch,
                 "idempotency_key": idempotency_key,
             }
@@ -656,6 +660,8 @@ class AsyncMemoriesResource:
         memory_type: str = "semantic",
         session_id: str | None = None,
         trust_tier: str | None = None,
+        observed_at: str | None = None,
+        initial_confidence: float | None = None,
         branch: str | None = None,
         idempotency_key: str | None = None,
     ) -> Memory:
@@ -671,6 +677,8 @@ class AsyncMemoriesResource:
                 "memory_type": memory_type,
                 "session_id": session_id,
                 "trust_tier": trust_tier,
+                "observed_at": observed_at,
+                "initial_confidence": initial_confidence,
                 "branch": branch,
                 "idempotency_key": idempotency_key,
             }
