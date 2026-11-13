@@ -567,6 +567,8 @@ class MemoriesResource:
         reason: str | None = None,
         session_id: str | None = None,
         session_scope: str | None = None,
+        subject_id: str | None = None,
+        memory_types: builtins.list[str] | None = None,
         branch: str | None = None,
     ) -> Memory:
         if session_scope is not None and session_id is None:
@@ -578,6 +580,8 @@ class MemoriesResource:
                 "reason": reason,
                 "session_id": session_id,
                 "session_scope": session_scope,
+                "subject_id": subject_id,
+                "memory_types": memory_types,
                 "branch": branch,
             }
         )
@@ -877,6 +881,8 @@ class AsyncMemoriesResource:
         reason: str | None = None,
         session_id: str | None = None,
         session_scope: str | None = None,
+        subject_id: str | None = None,
+        memory_types: builtins.list[str] | None = None,
         branch: str | None = None,
     ) -> Memory:
         if session_scope is not None and session_id is None:
@@ -888,6 +894,8 @@ class AsyncMemoriesResource:
                 "reason": reason,
                 "session_id": session_id,
                 "session_scope": session_scope,
+                "subject_id": subject_id,
+                "memory_types": memory_types,
                 "branch": branch,
             }
         )
