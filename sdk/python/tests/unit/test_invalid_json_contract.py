@@ -47,19 +47,17 @@ def invoke(request, monkeypatch):
     return call, delays
 
 
-def invalid_json_response():
+def invalid_json_response(content_type="application/json"):
     # A node behind the LB emits an HTML page with a 200 status and a JSON
     # content type. The transport reads the body fine; only the parse fails.
     return httpx.Response(
         200,
-        headers={"content-type": "application/json"},
+        headers={"content-type": content_type},
         content=b"<html>synthetic error page</html>",
     )
 
 
-@pytest.mark.parametrize(
-    "operation,unsafe", [("list", False), ("store", True), ("correct", True)]
-)
+@pytest.mark.parametrize("operation,unsafe", [("list", False), ("store", True), ("correct", True)])
 def test_invalid_json_recovers_only_when_replay_is_allowed(invoke, operation, unsafe):
     call, delays = invoke
     requests = []
@@ -102,3 +100,18 @@ def test_invalid_json_preserves_error_cause_budget_and_write_safety(
     assert str(caught.value) == str(caught.value.__cause__)
     assert len(requests) == attempts
     assert delays == [0.5, 1.0][: attempts - 1]
+
+
+def test_invalid_json_content_type_matching_is_case_insensitive(invoke):
+    call, delays = invoke
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        return invalid_json_response("Application/JSON; Charset=UTF-8")
+
+    with pytest.raises(MemoriaConnectionError) as caught:
+        call(handle, retries=0)
+    assert isinstance(caught.value.__cause__, json.JSONDecodeError)
+    assert len(requests) == 1
+    assert delays == []

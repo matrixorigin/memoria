@@ -241,7 +241,7 @@ class _HttpTransport:
                     # request may have committed, so reuse the idempotency /
                     # unsafe-write replay boundary; never leak decoder
                     # exceptions past the MemoriaError hierarchy.
-                    if "json" not in resp.headers.get("content-type", ""):
+                    if "json" not in resp.headers.get("content-type", "").lower():
                         return resp.text
                     if attempt < self._max_retries and (
                         _is_idempotent(method, idempotent) or self._retry_unsafe_writes
@@ -315,7 +315,7 @@ class _HttpTransport:
                     # request may have committed, so reuse the idempotency /
                     # unsafe-write replay boundary; never leak decoder
                     # exceptions past the MemoriaError hierarchy.
-                    if "json" not in resp.headers.get("content-type", ""):
+                    if "json" not in resp.headers.get("content-type", "").lower():
                         return resp.text
                     if attempt < self._max_retries and (
                         _is_idempotent(method, idempotent) or self._retry_unsafe_writes
