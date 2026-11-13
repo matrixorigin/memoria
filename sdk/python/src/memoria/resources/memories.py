@@ -487,6 +487,7 @@ class MemoriesResource:
         cursor: str | None = None,
         memory_type: str | None = None,
         session_id: str | None = None,
+        subject_id: str | None = None,
         trust_tier: str | None = None,
         branch: str | None = None,
     ) -> MemoryPage:
@@ -497,6 +498,7 @@ class MemoriesResource:
                 "cursor": cursor,
                 "memory_type": memory_type,
                 "session_id": session_id,
+                "subject_id": subject_id,
                 "trust_tier": trust_tier,
                 "branch": branch,
             }
@@ -798,6 +800,7 @@ class AsyncMemoriesResource:
         cursor: str | None = None,
         memory_type: str | None = None,
         session_id: str | None = None,
+        subject_id: str | None = None,
         trust_tier: str | None = None,
         branch: str | None = None,
     ) -> MemoryPage:
@@ -808,6 +811,7 @@ class AsyncMemoriesResource:
                 "cursor": cursor,
                 "memory_type": memory_type,
                 "session_id": session_id,
+                "subject_id": subject_id,
                 "trust_tier": trust_tier,
                 "branch": branch,
             }
