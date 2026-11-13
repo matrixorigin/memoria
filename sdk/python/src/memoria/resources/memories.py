@@ -337,6 +337,7 @@ class MemoriesResource:
         memory_type: str = "semantic",
         session_id: str | None = None,
         trust_tier: str | None = None,
+        extra_metadata: dict[str, Any] | None = None,
         branch: str | None = None,
         idempotency_key: str | None = None,
     ) -> Memory:
@@ -360,6 +361,7 @@ class MemoriesResource:
                 "memory_type": memory_type,
                 "session_id": session_id,
                 "trust_tier": trust_tier,
+                "extra_metadata": extra_metadata,
                 "branch": branch,
                 "idempotency_key": idempotency_key,
             }
@@ -656,6 +658,7 @@ class AsyncMemoriesResource:
         memory_type: str = "semantic",
         session_id: str | None = None,
         trust_tier: str | None = None,
+        extra_metadata: dict[str, Any] | None = None,
         branch: str | None = None,
         idempotency_key: str | None = None,
     ) -> Memory:
@@ -671,6 +674,7 @@ class AsyncMemoriesResource:
                 "memory_type": memory_type,
                 "session_id": session_id,
                 "trust_tier": trust_tier,
+                "extra_metadata": extra_metadata,
                 "branch": branch,
                 "idempotency_key": idempotency_key,
             }
