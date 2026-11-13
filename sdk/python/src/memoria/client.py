@@ -113,9 +113,18 @@ class MemoriaClient(_HttpTransport):
         messages: list[dict[str, str]],
         *,
         session_id: str | None = None,
+        subject_id: str | None = None,
+        branch: str | None = None,
     ) -> ObserveResult:
         """Submit a conversation turn for automatic memory extraction."""
-        body = _strip_none({"messages": messages, "session_id": session_id})
+        body = _strip_none(
+            {
+                "messages": messages,
+                "session_id": session_id,
+                "subject_id": subject_id,
+                "branch": branch,
+            }
+        )
         data = self._request("POST", "/v1/observe", json=body)
         return ObserveResult.from_dict(data or {})
 
@@ -199,8 +208,17 @@ class AsyncMemoriaClient(_HttpTransport):
         messages: list[dict[str, str]],
         *,
         session_id: str | None = None,
+        subject_id: str | None = None,
+        branch: str | None = None,
     ) -> ObserveResult:
         """Submit a conversation turn for automatic memory extraction."""
-        body = _strip_none({"messages": messages, "session_id": session_id})
+        body = _strip_none(
+            {
+                "messages": messages,
+                "session_id": session_id,
+                "subject_id": subject_id,
+                "branch": branch,
+            }
+        )
         data = await self._arequest("POST", "/v1/observe", json=body)
         return ObserveResult.from_dict(data or {})
