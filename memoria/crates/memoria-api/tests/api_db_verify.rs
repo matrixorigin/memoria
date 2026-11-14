@@ -855,7 +855,7 @@ async fn test_batch_store_verify_db() {
         .json(&json!({"memories": [
             {"content": "batch A", "memory_type": "semantic", "session_id": "s1"},
             {"content": "batch B", "memory_type": "profile"},
-            {"content": "batch C", "memory_type": "procedural", "trust_tier": "T3", "initial_confidence": 0.7},
+            {"content": "batch C", "memory_type": "procedural", "trust_tier": "T3"},
         ]}))
         .send().await.unwrap();
     assert_eq!(r.status(), 201);
@@ -891,6 +891,83 @@ async fn test_batch_store_verify_db() {
     assert_eq!(db_count_active(&server, &uid).await, 3);
 
     println!("✅ batch store: 3 rows verified in DB with correct types/tiers/sessions");
+}
+
+/// Batch writes convert every item through the single-memory creation path,
+/// silently dropping per-item observed_at / initial_confidence. The endpoint
+/// must reject such payloads instead of importing history as brand-new facts
+/// (fix #381). This HTTP-level regression covers that contract against the
+/// real router and verifies that a rejected batch writes no new rows.
+#[tokio::test]
+#[serial]
+async fn test_batch_store_rejects_silently_ignored_fields_verify_db() {
+    let (base, client, server) = spawn_server().await;
+    let uid = uid();
+
+    // Seed an accepted batch first (omitted and explicit-null fields remain
+    // accepted end-to-end). The user's mem_memories table is only created by
+    // the first accepted write, so counting a never-written store fails with
+    // a missing-table error; the seeded rows also give the rejected-batch
+    // assertion below a stable count to compare against.
+    let r = client.post(format!("{base}/v1/memories/batch"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"memories": [
+            {"content": "clean batch"},
+            {"content": "clean with nulls", "observed_at": null, "initial_confidence": null},
+        ]}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 201);
+    let body: Vec<Value> = r.json().await.unwrap();
+    assert_eq!(body.len(), 2);
+    assert_eq!(db_count_active(&server, &uid).await, 2);
+
+    // explicit observed_at would be silently replaced by "now"
+    let r = client.post(format!("{base}/v1/memories/batch"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"memories": [
+            {"content": "legacy fact", "observed_at": "2020-05-01T00:00:00Z"},
+        ]}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 422);
+    let err = r.text().await.unwrap();
+    assert!(err.contains("observed_at"), "expected observed_at error, got: {err}");
+
+    // explicit initial_confidence, including an explicit 0.0, is equally unsupported
+    for confidence in [0.7, 0.0] {
+        let r = client.post(format!("{base}/v1/memories/batch"))
+            .header("X-User-Id", &uid)
+            .json(&json!({"memories": [
+                {"content": "imported fact", "initial_confidence": confidence},
+            ]}))
+            .send().await.unwrap();
+        assert_eq!(r.status(), 422);
+        let err = r.text().await.unwrap();
+        assert!(err.contains("initial_confidence"), "expected initial_confidence error, got: {err}");
+    }
+
+    // existing idempotency_key guard still holds at the HTTP level
+    let r = client.post(format!("{base}/v1/memories/batch"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"memories": [
+            {"content": "retry fact", "idempotency_key": "dbv-idem-1"},
+        ]}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 422);
+    let err = r.text().await.unwrap();
+    assert!(err.contains("idempotency_key"), "expected idempotency_key error, got: {err}");
+
+    // one unsupported item rejects the ENTIRE batch: the valid head must not be written
+    let r = client.post(format!("{base}/v1/memories/batch"))
+        .header("X-User-Id", &uid)
+        .json(&json!({"memories": [
+            {"content": "valid head"},
+            {"content": "stale tail", "observed_at": "2020-05-01T00:00:00Z"},
+        ]}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 422);
+    assert_eq!(db_count_active(&server, &uid).await, 2, "rejected batch must not write rows");
+
+    println!("✅ batch store: ignored import fields rejected, no partial write, nulls accepted");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
