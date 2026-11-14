@@ -616,8 +616,10 @@ class MemoriesResource:
         reason: str | None = None,
         branch: str | None = None,
     ) -> None:
+        # A retry may follow an active-branch change or delete a restored memory.
+        # Only pre-send failures are safe to retry without explicit opt-in.
         params = _strip_none({"reason": reason, "branch": branch})
-        self._client._request("DELETE", _memory_path(id), params=params)
+        self._client._request("DELETE", _memory_path(id), params=params, idempotent=False)
 
     def purge(
         self,
@@ -951,8 +953,12 @@ class AsyncMemoriesResource:
         reason: str | None = None,
         branch: str | None = None,
     ) -> None:
+        # A retry may follow an active-branch change or delete a restored memory.
+        # Only pre-send failures are safe to retry without explicit opt-in.
         params = _strip_none({"reason": reason, "branch": branch})
-        await self._client._arequest("DELETE", _memory_path(id), params=params)
+        await self._client._arequest(
+            "DELETE", _memory_path(id), params=params, idempotent=False
+        )
 
     async def purge(
         self,
