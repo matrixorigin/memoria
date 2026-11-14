@@ -12,6 +12,72 @@ from memoria.exceptions import MemoriaValidationError
 from tests.conftest import API_KEY, BASE_URL
 
 
+class _ApiKey(str):
+    """A string subtype accepted anywhere a plain API key string is accepted."""
+
+
+@pytest.mark.parametrize("client_type", [MemoriaClient, AsyncMemoriaClient])
+@pytest.mark.parametrize("api_key", ["", None, 0, False, [], {}])
+def test_invalid_api_key_fails_before_allocating_http_client(
+    monkeypatch: pytest.MonkeyPatch, client_type: type, api_key: object
+) -> None:
+    sync_factory = Mock()
+    async_factory = Mock()
+    monkeypatch.setattr(httpx, "Client", sync_factory)
+    monkeypatch.setattr(httpx, "AsyncClient", async_factory)
+    with pytest.raises(MemoriaValidationError, match="api_key.*non-empty string"):
+        client_type(base_url=BASE_URL, api_key=api_key)  # type: ignore[arg-type]
+    sync_factory.assert_not_called()
+    async_factory.assert_not_called()
+
+
+@pytest.mark.parametrize("client_type", [MemoriaClient, AsyncMemoriaClient])
+@pytest.mark.parametrize("api_key", [API_KEY, _ApiKey(API_KEY)])
+def test_string_api_key_reaches_http_client_factory(
+    monkeypatch: pytest.MonkeyPatch, client_type: type, api_key: str
+) -> None:
+    sync_factory = Mock()
+    async_factory = Mock()
+    monkeypatch.setattr(httpx, "Client", sync_factory)
+    monkeypatch.setattr(httpx, "AsyncClient", async_factory)
+    client_type(base_url=BASE_URL, api_key=api_key)
+    expected_factory = async_factory if client_type is AsyncMemoriaClient else sync_factory
+    expected_factory.assert_called_once()
+
+
+@pytest.mark.parametrize("client_type", [MemoriaClient, AsyncMemoriaClient])
+@pytest.mark.parametrize("flag", [None, 0, 1, "false", [], {}])
+def test_invalid_unsafe_retry_flag_fails_before_allocating_http_client(
+    monkeypatch: pytest.MonkeyPatch, client_type: type, flag: object
+) -> None:
+    sync_factory = Mock()
+    async_factory = Mock()
+    monkeypatch.setattr(httpx, "Client", sync_factory)
+    monkeypatch.setattr(httpx, "AsyncClient", async_factory)
+    with pytest.raises(MemoriaValidationError, match="retry_unsafe_writes.*boolean"):
+        client_type(  # type: ignore[arg-type]
+            base_url=BASE_URL,
+            api_key=API_KEY,
+            retry_unsafe_writes=flag,
+        )
+    sync_factory.assert_not_called()
+    async_factory.assert_not_called()
+
+
+@pytest.mark.parametrize("client_type", [MemoriaClient, AsyncMemoriaClient])
+@pytest.mark.parametrize("flag", [False, True])
+def test_boolean_unsafe_retry_flag_reaches_http_client_factory(
+    monkeypatch: pytest.MonkeyPatch, client_type: type, flag: bool
+) -> None:
+    sync_factory = Mock()
+    async_factory = Mock()
+    monkeypatch.setattr(httpx, "Client", sync_factory)
+    monkeypatch.setattr(httpx, "AsyncClient", async_factory)
+    client_type(base_url=BASE_URL, api_key=API_KEY, retry_unsafe_writes=flag)
+    expected_factory = async_factory if client_type is AsyncMemoriaClient else sync_factory
+    expected_factory.assert_called_once()
+
+
 @pytest.mark.parametrize("client_type", [MemoriaClient, AsyncMemoriaClient])
 @pytest.mark.parametrize(
     "timeout", [-1, 0, True, False, math.nan, math.inf, -math.inf, 10**400, "30", None]
