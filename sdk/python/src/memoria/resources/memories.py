@@ -52,12 +52,18 @@ def _validate_list_page(limit: int, cursor: str | None) -> None:
         raise MemoriaValidationError("list: limit must be an integer")
     if limit < 1 or limit > 500:
         raise MemoriaValidationError("list: limit must be between 1 and 500")
+    _validate_memory_cursor(cursor, "list")
+
+
+def _validate_memory_cursor(cursor: str | None, operation: str) -> None:
     if cursor is not None and (
         not isinstance(cursor, str)
         or len(cursor) != 32
         or any(char not in _MEMORY_CURSOR_HEX_DIGITS for char in cursor)
     ):
-        raise MemoriaValidationError("list: cursor must be a 32-character hexadecimal memory_id")
+        raise MemoriaValidationError(
+            f"{operation}: cursor must be a 32-character hexadecimal memory_id"
+        )
 
 
 def _normalize_query_memory_types(
@@ -526,6 +532,7 @@ class MemoriesResource:
             branch=branch,
             limit=limit,
         )
+        _validate_memory_cursor(cursor, "query")
         body = _strip_none(
             {
                 "extra_metadata_filter": extra_metadata_filter,
@@ -837,6 +844,7 @@ class AsyncMemoriesResource:
             branch=branch,
             limit=limit,
         )
+        _validate_memory_cursor(cursor, "query")
         body = _strip_none(
             {
                 "extra_metadata_filter": extra_metadata_filter,
