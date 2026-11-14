@@ -161,6 +161,7 @@ export class MemoriaHttpTransport {
     const typeFilter = typeof args.memory_type === "string"
       ? `&memory_type=${encodeURIComponent(args.memory_type)}` : "";
     let cursor: string | null = null;
+    const seenCursors = new Set<string>();
     for (let page = 0; page < this.maxListPages && items.length < limit; page++) {
       const pageSize = Math.min(limit - items.length, API_LIST_PAGE_MAX);
       const query = cursor
@@ -177,12 +178,13 @@ export class MemoriaHttpTransport {
         throw new Error("Invalid Memoria API list page: next_cursor must be a string or null");
       }
       const next = typeof rawCursor === "string" && rawCursor ? rawCursor : null;
-      // A cursor that does not advance means the server repeated a page: drop it
+      // A cursor seen before means the server repeated a page: drop it
       // so rows are not counted twice, and stop so a misbehaving server cannot
       // loop us. The leftover cursor still marks the result as incomplete.
-      if (next !== null && next === cursor) {
+      if (next !== null && seenCursors.has(next)) {
         break;
       }
+      if (next !== null) seenCursors.add(next);
       items.push(...pageItems);
       cursor = next;
       if (!next || pageItems.length === 0) {
