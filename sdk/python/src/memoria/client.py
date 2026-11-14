@@ -128,6 +128,28 @@ class MemoriaClient(_HttpTransport):
         data = self._request("POST", "/v1/observe", json=body)
         return ObserveResult.from_dict(data or {})
 
+    def observe_deduplicated(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        exclude_memory_ids: list[str],
+        session_id: str | None = None,
+        subject_id: str | None = None,
+        branch: str | None = None,
+    ) -> ObserveResult:
+        """Observe a turn while excluding memories already stored explicitly."""
+        body = _strip_none(
+            {
+                "messages": messages,
+                "exclude_memory_ids": exclude_memory_ids,
+                "session_id": session_id,
+                "subject_id": subject_id,
+                "branch": branch,
+            }
+        )
+        data = self._request("POST", "/v1/observe/deduplicated", json=body)
+        return ObserveResult.from_dict(data or {})
+
 
 # ---------------------------------------------------------------------------
 # Async client
@@ -221,4 +243,26 @@ class AsyncMemoriaClient(_HttpTransport):
             }
         )
         data = await self._arequest("POST", "/v1/observe", json=body)
+        return ObserveResult.from_dict(data or {})
+
+    async def observe_deduplicated(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        exclude_memory_ids: list[str],
+        session_id: str | None = None,
+        subject_id: str | None = None,
+        branch: str | None = None,
+    ) -> ObserveResult:
+        """Observe a turn while excluding memories already stored explicitly."""
+        body = _strip_none(
+            {
+                "messages": messages,
+                "exclude_memory_ids": exclude_memory_ids,
+                "session_id": session_id,
+                "subject_id": subject_id,
+                "branch": branch,
+            }
+        )
+        data = await self._arequest("POST", "/v1/observe/deduplicated", json=body)
         return ObserveResult.from_dict(data or {})
