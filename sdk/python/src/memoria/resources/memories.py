@@ -383,6 +383,7 @@ class MemoriesResource:
         items: list[dict[str, Any]],
         *,
         branch: str | None = None,
+        subject_id: str | None = None,
     ) -> list[Memory]:
         if len(items) > 100:
             raise MemoriaValidationError("store_batch: items must not exceed 100")
@@ -390,6 +391,8 @@ class MemoriesResource:
         body: dict[str, Any] = {"memories": items}
         if branch is not None:
             body["branch"] = branch
+        if subject_id is not None:
+            body["subject_id"] = subject_id
         data = self._client._request("POST", "/v1/memories/batch", json=body)
         return [Memory.from_dict(m) for m in data]
 
@@ -716,6 +719,7 @@ class AsyncMemoriesResource:
         items: list[dict[str, Any]],
         *,
         branch: str | None = None,
+        subject_id: str | None = None,
     ) -> list[Memory]:
         if len(items) > 100:
             raise MemoriaValidationError("store_batch: items must not exceed 100")
@@ -723,6 +727,8 @@ class AsyncMemoriesResource:
         body: dict[str, Any] = {"memories": items}
         if branch is not None:
             body["branch"] = branch
+        if subject_id is not None:
+            body["subject_id"] = subject_id
         data = await self._client._arequest("POST", "/v1/memories/batch", json=body)
         return [Memory.from_dict(m) for m in data]
 
