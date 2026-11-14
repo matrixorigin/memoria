@@ -42,13 +42,15 @@ static PATTERNS: &[Pattern] = &[
     Pattern {
         label: "private_key",
         tier: SensitivityTier::High,
-        regex: r"-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----",
+        regex: r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----",
         replacement: "",
     },
     Pattern {
         label: "bearer_token",
         tier: SensitivityTier::High,
-        regex: r"(?i)Bearer\s+[A-Za-z0-9\-._~+/]+=*",
+        // An explicit Authorization header carries a credential of any length
+        // (RFC 6750 §2.1); standalone "bearer" prose needs a token-like value.
+        regex: r"(?i)\bAuthorization\s*:\s*Bearer\s+[A-Za-z0-9\-._~+/]+=*|\bBearer\s+[A-Za-z0-9\-._~+/]{20,}=*",
         replacement: "",
     },
     Pattern {
@@ -67,6 +69,43 @@ static PATTERNS: &[Pattern] = &[
         ),
         replacement: "",
     },
+    Pattern {
+        label: "api_token_assignment",
+        tier: SensitivityTier::High,
+        // Require an assignment delimiter; ordinary discussion of tokens is safe.
+        regex: r#"(?i)\b(?:[A-Za-z0-9_]*api[_-]?key|[A-Za-z0-9_]*[_-]token|access[_-]?token|auth[_-]?token)["']?\s*[:=]\s*["']?\S+"#,
+        replacement: "",
+    },
+    Pattern {
+        label: "github_pat",
+        tier: SensitivityTier::High,
+        regex: r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})",
+        replacement: "",
+    },
+    Pattern {
+        label: "provider_api_key",
+        tier: SensitivityTier::High,
+        regex: r"\b(?:sk-(?:proj-|ant-[A-Za-z0-9_-]*-)?[A-Za-z0-9_-]{20,}|xox[bp]-[A-Za-z0-9-]{20,}|glpat-[A-Za-z0-9_-]{20,})",
+        replacement: "",
+    },
+    Pattern {
+        label: "dsn_password",
+        tier: SensitivityTier::High,
+        // Require a URI authority with non-empty userinfo password; no plain
+        // connection URL or username-only URL should trigger HIGH sensitivity.
+        // Redis also accepts a password with an empty username (`redis://:pw@`).
+        regex: r"(?i)\b(?:(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?)://[^\s/@:]+|rediss?://[^\s/@:]*):[^\s/@]+@[^\s/]+",
+        replacement: "",
+    },
+    Pattern {
+        label: "basic_auth",
+        tier: SensitivityTier::High,
+        // Basic credentials are base64-encoded user:password; require the
+        // Authorization header so arbitrary base64 text is not blocked, and a
+        // well-formed base64 value of any length (RFC 7617 §2, e.g. `u:p`).
+        regex: r"(?i)\bAuthorization\s*:\s*Basic\s+(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{4}|[A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{2}==)(?:[^A-Za-z0-9+/=]|$)",
+        replacement: "",
+    },
     // MEDIUM — redact
     Pattern {
         label: "email",
@@ -79,7 +118,7 @@ static PATTERNS: &[Pattern] = &[
         tier: SensitivityTier::Medium,
         // Require at least one separator so opaque 10-11 digit identifiers
         // (for example GitHub comment IDs) are not mistaken for phone numbers.
-        regex: r"\b(?:\d{3}[-.]\d{3,4}[-.]?\d{4}|\d{3}[-.]?\d{3,4}[-.]\d{4})\b",
+        regex: r"(?:\+1[ -]?(?:\(\d{3}\)|\d{3})[ .-]\d{3}[ .-]\d{4}|\(\d{3}\)[ .-]\d{3}[ .-]\d{4}|\b(?:\d{3}[-.]\d{3,4}[-.]?\d{4}|\d{3}[-.]?\d{3,4}[-.]\d{4}|\d{3} \d{3} \d{4}))\b",
         replacement: "[phone]",
     },
     Pattern {
@@ -292,6 +331,99 @@ mod tests {
     }
 
     #[test]
+    fn api_token_assignments_and_github_pats_are_blocked() {
+        for sample in [
+            "OPENAI_API_KEY=synthetic-test-key-123456",
+            "api_key: synthetic-test-key-123456",
+            "GITHUB_TOKEN=synthetic-test-token-123456",
+            "access_token=synthetic-test-token-123456",
+            "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz",
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789AB",
+        ] {
+            assert!(check_sensitivity(sample).blocked, "credential accepted: {sample}");
+        }
+        for prose in ["The API key documentation is helpful.", "Token budgeting matters."] {
+            assert!(!check_sensitivity(prose).blocked, "ordinary prose blocked: {prose}");
+        }
+    }
+
+    #[test]
+    fn provider_prefixed_api_keys_are_blocked() {
+        for secret in [
+            format!("sk-proj-{}", "A".repeat(32)),
+            format!("sk-ant-api03-{}", "B".repeat(32)),
+            format!("xoxb-{}", "1".repeat(32)),
+            format!("glpat-{}", "C".repeat(32)),
+        ] {
+            assert!(check_sensitivity(&secret).blocked, "provider key allowed");
+        }
+        assert!(!check_sensitivity("We use sk-proj- as a placeholder prefix.").blocked);
+    }
+
+    #[test]
+    fn connection_uri_passwords_are_blocked_without_blocking_public_uris() {
+        for value in [
+            "DATABASE_URL=postgres://admin:synthetic-pass@db.example:5432/app",
+            "mysql://admin:synthetic-pass@localhost/db",
+            "redis://default:synthetic-pass@localhost:6379/0",
+            "redis://:synthetic-pass@localhost:6379/0",
+            "rediss://:synthetic-pass@cache.example:6380",
+        ] {
+            assert!(check_sensitivity(value).blocked, "credential URL accepted");
+        }
+        for value in [
+            "postgres://db.example:5432/app",
+            "mysql://admin@localhost/db",
+            "redis://localhost:6379/0",
+            "redis://default@localhost:6379/0",
+            "redis://:@localhost:6379/0",
+        ] {
+            assert!(!check_sensitivity(value).blocked, "safe URI rejected");
+        }
+    }
+
+    #[test]
+    fn http_basic_authorization_header_is_blocked() {
+        let encoded = format!("{}{}", "dXNlcjpz", "M2NyZXRQYXNzd29yZA==");
+        let header = format!("Authorization: Basic {encoded}");
+        assert!(check_sensitivity(&header).blocked);
+        // Synthetic short credential `u:p` is still a valid Basic credential.
+        for short in ["Authorization: Basic dTpw", "authorization: basic YTo=, next"] {
+            assert!(check_sensitivity(short).blocked, "{short}");
+        }
+        assert!(!check_sensitivity("Basic authentication is supported.").blocked);
+        assert!(!check_sensitivity("Authorization: Basic realm").blocked);
+    }
+
+    #[test]
+    fn ordinary_bearer_prose_is_not_an_access_token() {
+        for text in [
+            "the bearer of bad news arrived",
+            "Pay to the bearer on demand",
+            "She was a pallbearer at the funeral",
+            "ring bearer for the wedding",
+        ] {
+            let result = check_sensitivity(text);
+            assert!(!result.blocked, "ordinary bearer prose rejected: {text}");
+        }
+    }
+
+    #[test]
+    fn bearer_credentials_remain_blocked() {
+        for text in [
+            "Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456",
+            "Bearer synthetic-test-token",
+            // Short tokens are still credentials inside an explicit header.
+            "Authorization: Bearer synthetic123",
+            "curl -H 'Authorization: BEARER token123'",
+        ] {
+            let result = check_sensitivity(text);
+            assert!(result.blocked, "bearer credential allowed: {text}");
+            assert_eq!(result.matched_labels, vec!["bearer_token"]);
+        }
+    }
+
+    #[test]
     fn test_aws_key_blocked() {
         let r = check_sensitivity("my key is AKIAIOSFODNN7EXAMPLE");
         assert!(r.blocked);
@@ -302,6 +434,39 @@ mod tests {
     fn test_private_key_blocked() {
         let r = check_sensitivity("-----BEGIN RSA PRIVATE KEY-----\nMIIE...");
         assert!(r.blocked);
+    }
+
+    #[test]
+    fn modern_private_key_armor_is_blocked() {
+        for header in [
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "-----BEGIN EC PRIVATE KEY-----",
+            "-----BEGIN DSA PRIVATE KEY-----",
+            "-----BEGIN PRIVATE KEY-----",
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----",
+        ] {
+            let result = check_sensitivity(&format!("{header}\nsynthetic-test-payload"));
+            assert!(result.blocked, "private key not blocked: {header}");
+            assert_eq!(result.matched_labels, vec!["private_key"]);
+            assert!(result.redacted_content.is_none());
+        }
+    }
+
+    #[test]
+    fn non_private_key_armor_is_not_blocked() {
+        for text in [
+            "-----BEGIN PUBLIC KEY-----",
+            "-----BEGIN PGP PUBLIC KEY BLOCK-----",
+            "-----BEGIN CERTIFICATE-----",
+            "-----BEGIN PGP MESSAGE-----",
+            "Ordinary prose about private keys",
+        ] {
+            let result = check_sensitivity(text);
+            assert!(!result.blocked, "safe text blocked: {text}");
+            assert!(result.redacted_content.is_none());
+        }
     }
 
     #[test]
@@ -523,6 +688,21 @@ mod tests {
                 result.redacted_content.as_deref(),
                 Some("call [phone] anytime")
             );
+            assert_eq!(result.matched_labels, vec!["phone"]);
+        }
+    }
+
+    #[test]
+    fn phone_redaction_covers_parentheses_country_code_and_spaces() {
+        for phone in [
+            "(555) 867-5309",
+            "+1 (555) 867-5309",
+            "+1 555 867 5309",
+            "555 867 5309",
+        ] {
+            let result = check_sensitivity(&format!("call {phone} anytime"));
+            assert!(!result.blocked);
+            assert_eq!(result.redacted_content.as_deref(), Some("call [phone] anytime"));
             assert_eq!(result.matched_labels, vec!["phone"]);
         }
     }

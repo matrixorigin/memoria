@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 const MASTER: &str = "synthetic-owner-policy-test-master";
 const OWNER: &str = "synthetic-owner";
-const TEXT: &str = "The standard bearer carried the flag. Contact person@example.com.";
+const TEXT: &str = "Authorization: Bearer synthetic_access_token_123456789. Contact person@example.com.";
 
 async fn probe(auth: AuthUser, State(_state): State<AppState>) -> Json<Value> {
     let result = check_content_sensitivity(auth.scope_id(), TEXT);

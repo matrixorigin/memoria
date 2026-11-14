@@ -51,8 +51,8 @@ pub fn check_content_sensitivity(owner: &str, content: &str) -> SensitivityResul
 mod tests {
     use super::*;
 
-    // An ordinary sentence currently matches the built-in Bearer pattern.
-    const TEXT: &str = "The standard bearer carried the flag.";
+    // Use a synthetic credential to verify the owner-scoped override.
+    const TEXT: &str = "Authorization: Bearer synthetic_access_token_123456789";
 
     #[tokio::test]
     async fn override_skips_both_blocking_and_redaction_for_all_builtin_rules() {
@@ -60,7 +60,7 @@ mod tests {
         let cases = [
             (format!("AKIA{}", "0".repeat(16)), true),
             ("-----BEGIN PRIVATE KEY-----".into(), true),
-            ("Bearer SYNTHETIC_EXAMPLE".into(), true),
+            ("Bearer SYNTHETIC_EXAMPLE_TOKEN_123456789".into(), true),
             ("password=synthetic-example".into(), true),
             ("person@example.com".into(), false),
             ("555-123-4567".into(), false),

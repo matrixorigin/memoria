@@ -728,7 +728,7 @@ async fn test_flush_edit_log_drains_in_memory_buffer() {
 async fn content_filter_override_preserves_store_correct_batch_and_observe_content() {
     use memoria_service::content_filter::with_content_filter_scope;
     let svc = make_service();
-    let text = "The standard bearer carried the flag. Contact person@example.com.";
+    let text = "Authorization: Bearer synthetic_access_token_123456789. Contact person@example.com.";
     let blocked = svc
         .store_memory(
             "owner-a",
@@ -764,7 +764,7 @@ async fn content_filter_override_preserves_store_correct_batch_and_observe_conte
             svc.get(&stored.memory_id).await.unwrap().unwrap().content,
             text
         );
-        let corrected_text = "The standard bearer returned. Contact updated@example.com.";
+        let corrected_text = "Authorization: Bearer synthetic_access_token_123456789. Contact updated@example.com.";
         let corrected = svc
             .correct("owner-a", &stored.memory_id, corrected_text)
             .await
@@ -854,7 +854,7 @@ async fn content_filter_override_preserves_store_correct_batch_and_observe_conte
 #[tokio::test]
 async fn content_filter_override_applies_to_llm_candidates_and_pipeline() {
     use memoria_service::{content_filter::with_content_filter_scope, MemoryPipeline};
-    let text = "The standard bearer carried the flag. Contact person@example.com.";
+    let text = "Authorization: Bearer synthetic_access_token_123456789. Contact person@example.com.";
     let (llm, _shutdown) = memoria_test_utils::spawn_fake_llm(vec![(
         "Remember the project contact.",
         serde_json::json!([{"type":"semantic", "content":text, "confidence":0.8}]),
