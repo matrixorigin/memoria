@@ -392,6 +392,8 @@ class MemoriesResource:
         top_k: int = 5,
         session_id: str | None = None,
         session_scope: str | None = None,
+        subject_id: str | None = None,
+        memory_types: list[str] | None = None,
         explain: bool | str = False,
         branch: str | None = None,
     ) -> RetrieveResult:
@@ -403,6 +405,8 @@ class MemoriesResource:
                 "top_k": top_k,
                 "session_id": session_id,
                 "session_scope": session_scope,
+                "subject_id": subject_id,
+                "memory_types": memory_types,
                 "explain": explain if explain is not False else None,
                 "branch": branch,
             }
@@ -417,6 +421,8 @@ class MemoriesResource:
         top_k: int = 10,
         session_id: str | None = None,
         session_scope: str | None = None,
+        subject_id: str | None = None,
+        memory_types: list[str] | None = None,
         explain: bool | str = False,
         branch: str | None = None,
     ) -> RetrieveResult:
@@ -428,6 +434,8 @@ class MemoriesResource:
                 "top_k": top_k,
                 "session_id": session_id,
                 "session_scope": session_scope,
+                "subject_id": subject_id,
+                "memory_types": memory_types,
                 "explain": explain if explain is not False else None,
                 "branch": branch,
             }
@@ -705,6 +713,8 @@ class AsyncMemoriesResource:
         top_k: int = 5,
         session_id: str | None = None,
         session_scope: str | None = None,
+        subject_id: str | None = None,
+        memory_types: list[str] | None = None,
         explain: bool | str = False,
         branch: str | None = None,
     ) -> RetrieveResult:
@@ -716,6 +726,8 @@ class AsyncMemoriesResource:
                 "top_k": top_k,
                 "session_id": session_id,
                 "session_scope": session_scope,
+                "subject_id": subject_id,
+                "memory_types": memory_types,
                 "explain": explain if explain is not False else None,
                 "branch": branch,
             }
@@ -730,6 +742,8 @@ class AsyncMemoriesResource:
         top_k: int = 10,
         session_id: str | None = None,
         session_scope: str | None = None,
+        subject_id: str | None = None,
+        memory_types: list[str] | None = None,
         explain: bool | str = False,
         branch: str | None = None,
     ) -> RetrieveResult:
@@ -741,6 +755,8 @@ class AsyncMemoriesResource:
                 "top_k": top_k,
                 "session_id": session_id,
                 "session_scope": session_scope,
+                "subject_id": subject_id,
+                "memory_types": memory_types,
                 "explain": explain if explain is not False else None,
                 "branch": branch,
             }
