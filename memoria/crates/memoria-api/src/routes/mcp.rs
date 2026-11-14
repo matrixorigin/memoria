@@ -260,6 +260,16 @@ pub async fn mcp_handler(
         );
     }
 
+    // Reject non-conforming IDs before ping, notification, or tool dispatch.
+    if req.get("id").is_some_and(|id| !(id.is_string() || id.is_number() || id.is_null())) {
+        validation_err!(
+            "/mcp/_invalid_request",
+            -32600,
+            json!({"jsonrpc": "2.0", "id": null,
+                   "error": {"code": -32600, "message": "Invalid Request: id must be string, number or null"}})
+        );
+    }
+
     // "jsonrpc" MUST equal exactly "2.0".
     if req.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
         let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);

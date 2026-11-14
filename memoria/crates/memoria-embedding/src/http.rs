@@ -190,6 +190,15 @@ impl HttpEmbedder {
                 "invalid embedding response dimension".into(),
             ));
         }
+        if response
+            .data
+            .iter()
+            .any(|item| item.embedding.iter().any(|value| !value.is_finite()))
+        {
+            return Err(MemoriaError::Embedding(
+                "invalid embedding response: non-finite vector value".into(),
+            ));
+        }
         if response.data.iter().any(|item| item.index.is_some()) {
             response.data.sort_by_key(|item| item.index);
             if response
@@ -256,6 +265,30 @@ mod tests {
 
     const VECTOR: &str = r#"{"data":[{"embedding":[0.1,0.2,0.3]}]}"#;
     const BATCH: &str = r#"{"data":[{"embedding":[0.1,0.2,0.3]},{"embedding":[0.4,0.5,0.6]}]}"#;
+
+    #[tokio::test]
+    async fn float32_overflow_is_rejected_before_vectors_reach_storage() {
+        for body in [
+            r#"{"data":[{"embedding":[1e39,0.2,0.3]}]}"#,
+            r#"{"data":[{"embedding":[-1e39,0.2,0.3]}]}"#,
+        ] {
+            let server = Server::start(vec![Reply::ok(body)]).await;
+            let error = server.embedder().embed("original fact").await.unwrap_err();
+            assert!(error.to_string().contains("non-finite"));
+            assert_eq!(server.requests(), 1);
+        }
+        let server = Server::start(vec![Reply::ok(
+            r#"{"data":[{"embedding":[0.1,0.2,0.3]},{"embedding":[0.4,1e39,0.6]}]}"#,
+        )])
+        .await;
+        let error = server
+            .embedder()
+            .embed_batch(&["first".into(), "second".into()])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("non-finite"));
+        assert_eq!(server.requests(), 1);
+    }
 
     #[derive(Clone, Copy)]
     enum Framing {

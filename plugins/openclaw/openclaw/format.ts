@@ -35,7 +35,7 @@ function renderMemoryBadge(memory: MemoriaMemoryRecord): string {
 
 export function formatRelevantMemoriesContext(memories: MemoriaMemoryRecord[]): string {
   const lines = memories.map((memory, index) => {
-    return `${index + 1}. ${renderMemoryBadge(memory)} ${escapePromptText(memory.content)}`;
+    return `${index + 1}. ${escapePromptText(renderMemoryBadge(memory))} ${escapePromptText(memory.content)}`;
   });
   return [
     "<relevant-memories>",
