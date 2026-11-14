@@ -45,7 +45,7 @@ def invoke(request, monkeypatch):
     return call, delays
 
 
-@pytest.mark.parametrize("resource", ["branches", "snapshots"])
+@pytest.mark.parametrize("resource", ["branches", "snapshots", "memories"])
 @pytest.mark.parametrize(
     "failure,error_type",
     [
@@ -91,7 +91,7 @@ def test_recreated_resource_survives_ambiguous_delete(invoke, resource, failure,
     assert delays == []
 
 
-@pytest.mark.parametrize("resource", ["branches", "snapshots"])
+@pytest.mark.parametrize("resource", ["branches", "snapshots", "memories"])
 @pytest.mark.parametrize(
     "error_type", [httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout]
 )
@@ -111,7 +111,7 @@ def test_named_delete_retries_before_sending(invoke, resource, error_type):
     assert delays == [0.5]
 
 
-@pytest.mark.parametrize("resource", ["branches", "snapshots"])
+@pytest.mark.parametrize("resource", ["branches", "snapshots", "memories"])
 def test_named_delete_can_retry_ambiguous_failure_when_opted_in(invoke, resource):
     call, delays = invoke
     requests = []
@@ -126,3 +126,32 @@ def test_named_delete_can_retry_ambiguous_failure_when_opted_in(invoke, resource
     assert len(requests) == 2
     assert requests[0].url == requests[1].url
     assert delays == [0.5]
+
+
+@pytest.mark.parametrize("failure", ["gateway", "timeout"])
+def test_memory_delete_does_not_follow_active_branch_change(invoke, failure):
+    call, delays = invoke
+    active_branch = "main"
+    memories = {"main": True, "experiment": True}
+    requests = []
+
+    def handler(request):
+        nonlocal active_branch
+        requests.append(request)
+        assert request.method == "DELETE"
+        assert "branch" not in request.url.params
+        memories[active_branch] = False
+        if len(requests) == 1:
+            # Both branches contain the same inherited ID. Another client
+            # checks out experiment after deletion, before the response arrives.
+            active_branch = "experiment"
+            if failure == "gateway":
+                return httpx.Response(503, json={"detail": "response lost"})
+            raise httpx.ReadTimeout("response lost", request=request)
+        return httpx.Response(204)
+
+    with pytest.raises((MemoriaServerError, MemoriaConnectionError)):
+        call(handler, "memories")
+    assert memories == {"main": False, "experiment": True}
+    assert len(requests) == 1
+    assert delays == []

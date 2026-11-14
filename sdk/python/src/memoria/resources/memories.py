@@ -342,7 +342,11 @@ class MemoriesResource:
         *,
         memory_type: str = "semantic",
         session_id: str | None = None,
+        subject_id: str | None = None,
         trust_tier: str | None = None,
+        extra_metadata: dict[str, Any] | None = None,
+        observed_at: str | None = None,
+        initial_confidence: float | None = None,
         branch: str | None = None,
         idempotency_key: str | None = None,
     ) -> Memory:
@@ -365,7 +369,11 @@ class MemoriesResource:
                 "content": content,
                 "memory_type": memory_type,
                 "session_id": session_id,
+                "subject_id": subject_id,
                 "trust_tier": trust_tier,
+                "extra_metadata": extra_metadata,
+                "observed_at": observed_at,
+                "initial_confidence": initial_confidence,
                 "branch": branch,
                 "idempotency_key": idempotency_key,
             }
@@ -381,6 +389,7 @@ class MemoriesResource:
         items: list[dict[str, Any]],
         *,
         branch: str | None = None,
+        subject_id: str | None = None,
     ) -> list[Memory]:
         if len(items) > 100:
             raise MemoriaValidationError("store_batch: items must not exceed 100")
@@ -388,6 +397,8 @@ class MemoriesResource:
         body: dict[str, Any] = {"memories": items}
         if branch is not None:
             body["branch"] = branch
+        if subject_id is not None:
+            body["subject_id"] = subject_id
         data = self._client._request("POST", "/v1/memories/batch", json=body)
         return [Memory.from_dict(m) for m in data]
 
@@ -398,6 +409,8 @@ class MemoriesResource:
         top_k: int = 5,
         session_id: str | None = None,
         session_scope: str | None = None,
+        subject_id: str | None = None,
+        memory_types: list[str] | None = None,
         explain: bool | str = False,
         branch: str | None = None,
     ) -> RetrieveResult:
@@ -409,6 +422,8 @@ class MemoriesResource:
                 "top_k": top_k,
                 "session_id": session_id,
                 "session_scope": session_scope,
+                "subject_id": subject_id,
+                "memory_types": memory_types,
                 "explain": explain if explain is not False else None,
                 "branch": branch,
             }
@@ -423,6 +438,8 @@ class MemoriesResource:
         top_k: int = 10,
         session_id: str | None = None,
         session_scope: str | None = None,
+        subject_id: str | None = None,
+        memory_types: list[str] | None = None,
         explain: bool | str = False,
         branch: str | None = None,
     ) -> RetrieveResult:
@@ -434,6 +451,8 @@ class MemoriesResource:
                 "top_k": top_k,
                 "session_id": session_id,
                 "session_scope": session_scope,
+                "subject_id": subject_id,
+                "memory_types": memory_types,
                 "explain": explain if explain is not False else None,
                 "branch": branch,
             }
@@ -493,6 +512,7 @@ class MemoriesResource:
         cursor: str | None = None,
         memory_type: str | None = None,
         session_id: str | None = None,
+        subject_id: str | None = None,
         trust_tier: str | None = None,
         branch: str | None = None,
     ) -> MemoryPage:
@@ -503,6 +523,7 @@ class MemoriesResource:
                 "cursor": cursor,
                 "memory_type": memory_type,
                 "session_id": session_id,
+                "subject_id": subject_id,
                 "trust_tier": trust_tier,
                 "branch": branch,
             }
@@ -574,6 +595,8 @@ class MemoriesResource:
         reason: str | None = None,
         session_id: str | None = None,
         session_scope: str | None = None,
+        subject_id: str | None = None,
+        memory_types: builtins.list[str] | None = None,
         branch: str | None = None,
     ) -> Memory:
         if session_scope is not None and session_id is None:
@@ -585,6 +608,8 @@ class MemoriesResource:
                 "reason": reason,
                 "session_id": session_id,
                 "session_scope": session_scope,
+                "subject_id": subject_id,
+                "memory_types": memory_types,
                 "branch": branch,
             }
         )
@@ -598,8 +623,10 @@ class MemoriesResource:
         reason: str | None = None,
         branch: str | None = None,
     ) -> None:
+        # A retry may follow an active-branch change or delete a restored memory.
+        # Only pre-send failures are safe to retry without explicit opt-in.
         params = _strip_none({"reason": reason, "branch": branch})
-        self._client._request("DELETE", _memory_path(id), params=params)
+        self._client._request("DELETE", _memory_path(id), params=params, idempotent=False)
 
     def purge(
         self,
@@ -662,7 +689,11 @@ class AsyncMemoriesResource:
         *,
         memory_type: str = "semantic",
         session_id: str | None = None,
+        subject_id: str | None = None,
         trust_tier: str | None = None,
+        extra_metadata: dict[str, Any] | None = None,
+        observed_at: str | None = None,
+        initial_confidence: float | None = None,
         branch: str | None = None,
         idempotency_key: str | None = None,
     ) -> Memory:
@@ -677,7 +708,11 @@ class AsyncMemoriesResource:
                 "content": content,
                 "memory_type": memory_type,
                 "session_id": session_id,
+                "subject_id": subject_id,
                 "trust_tier": trust_tier,
+                "extra_metadata": extra_metadata,
+                "observed_at": observed_at,
+                "initial_confidence": initial_confidence,
                 "branch": branch,
                 "idempotency_key": idempotency_key,
             }
@@ -693,6 +728,7 @@ class AsyncMemoriesResource:
         items: list[dict[str, Any]],
         *,
         branch: str | None = None,
+        subject_id: str | None = None,
     ) -> list[Memory]:
         if len(items) > 100:
             raise MemoriaValidationError("store_batch: items must not exceed 100")
@@ -700,6 +736,8 @@ class AsyncMemoriesResource:
         body: dict[str, Any] = {"memories": items}
         if branch is not None:
             body["branch"] = branch
+        if subject_id is not None:
+            body["subject_id"] = subject_id
         data = await self._client._arequest("POST", "/v1/memories/batch", json=body)
         return [Memory.from_dict(m) for m in data]
 
@@ -710,6 +748,8 @@ class AsyncMemoriesResource:
         top_k: int = 5,
         session_id: str | None = None,
         session_scope: str | None = None,
+        subject_id: str | None = None,
+        memory_types: list[str] | None = None,
         explain: bool | str = False,
         branch: str | None = None,
     ) -> RetrieveResult:
@@ -721,6 +761,8 @@ class AsyncMemoriesResource:
                 "top_k": top_k,
                 "session_id": session_id,
                 "session_scope": session_scope,
+                "subject_id": subject_id,
+                "memory_types": memory_types,
                 "explain": explain if explain is not False else None,
                 "branch": branch,
             }
@@ -735,6 +777,8 @@ class AsyncMemoriesResource:
         top_k: int = 10,
         session_id: str | None = None,
         session_scope: str | None = None,
+        subject_id: str | None = None,
+        memory_types: list[str] | None = None,
         explain: bool | str = False,
         branch: str | None = None,
     ) -> RetrieveResult:
@@ -746,6 +790,8 @@ class AsyncMemoriesResource:
                 "top_k": top_k,
                 "session_id": session_id,
                 "session_scope": session_scope,
+                "subject_id": subject_id,
+                "memory_types": memory_types,
                 "explain": explain if explain is not False else None,
                 "branch": branch,
             }
@@ -805,6 +851,7 @@ class AsyncMemoriesResource:
         cursor: str | None = None,
         memory_type: str | None = None,
         session_id: str | None = None,
+        subject_id: str | None = None,
         trust_tier: str | None = None,
         branch: str | None = None,
     ) -> MemoryPage:
@@ -815,6 +862,7 @@ class AsyncMemoriesResource:
                 "cursor": cursor,
                 "memory_type": memory_type,
                 "session_id": session_id,
+                "subject_id": subject_id,
                 "trust_tier": trust_tier,
                 "branch": branch,
             }
@@ -885,6 +933,8 @@ class AsyncMemoriesResource:
         reason: str | None = None,
         session_id: str | None = None,
         session_scope: str | None = None,
+        subject_id: str | None = None,
+        memory_types: builtins.list[str] | None = None,
         branch: str | None = None,
     ) -> Memory:
         if session_scope is not None and session_id is None:
@@ -896,6 +946,8 @@ class AsyncMemoriesResource:
                 "reason": reason,
                 "session_id": session_id,
                 "session_scope": session_scope,
+                "subject_id": subject_id,
+                "memory_types": memory_types,
                 "branch": branch,
             }
         )
@@ -909,8 +961,12 @@ class AsyncMemoriesResource:
         reason: str | None = None,
         branch: str | None = None,
     ) -> None:
+        # A retry may follow an active-branch change or delete a restored memory.
+        # Only pre-send failures are safe to retry without explicit opt-in.
         params = _strip_none({"reason": reason, "branch": branch})
-        await self._client._arequest("DELETE", _memory_path(id), params=params)
+        await self._client._arequest(
+            "DELETE", _memory_path(id), params=params, idempotent=False
+        )
 
     async def purge(
         self,
