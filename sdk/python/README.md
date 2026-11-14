@@ -3,23 +3,44 @@
 Official Python SDK for the [Memoria](https://github.com/matrixorigin/Memoria) memory engine.
 
 ## Installation
-
-**v1 — GitHub Release wheel:**
+**From source (primary path today):**
 
 ```bash
-pip install https://github.com/matrixorigin/Memoria/releases/download/python-sdk-v1.0.0/memoria_client-1.0.0-py3-none-any.whl
+pip install ./sdk/python
 ```
+
+**From source (development, editable with dev tools):**
+
+```bash
+pip install -e "./sdk/python[dev]"
+```
+
+The package version is declared in `sdk/python/pyproject.toml` (currently `0.0.1`).
+That file is also the version source used by the current release workflow
+([`.github/workflows/sdk-python-release.yml`](https://github.com/matrixorigin/Memoria/blob/main/.github/workflows/sdk-python-release.yml)):
+the workflow is manually dispatched, runs `python -m build` in `sdk/python`, and
+publishes the built artifacts to PyPI — it does not override the version from release
+tags and creates no GitHub Release assets, so any wheel built from a given revision
+reports that revision's `pyproject.toml` version (#415).
+
+**Published package (PyPI)** — available once the release workflow has been dispatched:
+
+```bash
+pip install memoria-client
+```
+
+**Hypothetical GitHub Release wheel** — this is not a distribution path the repository
+currently provides: the release workflow publishes to PyPI only, and the
+`python-sdk-v1.0.0` release referenced by older install snippets does not exist
+(HTTP 404) (#415).
 
 **Offline / air-gapped:**
 
 ```bash
-pip install ./memoria_client-1.0.0-py3-none-any.whl
-```
-
-**From source (development):**
-
-```bash
-pip install -e ".[dev]"
+# Build the wheel on a connected host (run `python -m build` in `sdk/python`),
+# copy it over, then install the artifact that build produces for the current
+# `pyproject.toml` version:
+pip install ./memoria_client-0.0.1-py3-none-any.whl
 ```
 
 ## Quick Start
@@ -178,6 +199,7 @@ from memoria import (
     MemoriaUnprocessableError,# 422 — server-side validation (empty content, bad type, etc.)
     MemoriaServerError,       # 5xx
     MemoriaValidationError,   # local validation (request not sent)
+    MemoriaResponseError,     # malformed successful memory page response
 )
 
 try:

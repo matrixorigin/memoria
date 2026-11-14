@@ -11,6 +11,10 @@ class MemoriaConnectionError(MemoriaError):
     """Network unreachable, connection refused, or timeout."""
 
 
+class MemoriaResponseError(MemoriaError):
+    """A successful HTTP response does not match the expected response shape."""
+
+
 class MemoriaAPIError(MemoriaError):
     """HTTP 4xx / 5xx response from the Memoria API."""
 
