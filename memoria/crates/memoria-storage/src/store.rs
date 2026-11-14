@@ -6953,6 +6953,7 @@ mod tests {
     fn like_fallback_patterns_are_distinct_literal_and_bounded() {
         let patterns = super::fulltext_like_fallback_patterns("Rust rust 50%_off a'b");
         assert_eq!(patterns, vec!["%rust%", "%50%", "%\\_off%", "%a%", "%b%"]);
+        assert!(super::fulltext_like_fallback_patterns("____ |!#").is_empty());
         let many = (0..100)
             .map(|i| format!("w{i}"))
             .collect::<Vec<_>>()
@@ -7094,6 +7095,19 @@ mod tests {
         .execute(&store.pool)
         .await
         .expect("insert other owner");
+
+        // Exercise the production sqlx::Error -> MySqlDatabaseError adapter:
+        // a real unrelated database error must not be mistaken for either
+        // recognized FULLTEXT failure.
+        let unrelated = sqlx::query(&format!(
+            "SELECT definitely_missing_fulltext_column FROM {table} LIMIT 1"
+        ))
+        .fetch_all(&store.pool)
+        .await;
+        assert!(matches!(
+            super::fulltext_rows_or_degraded(unrelated),
+            Err(memoria_core::MemoriaError::Database(_))
+        ));
 
         super::SIMULATE_UNAVAILABLE_FULLTEXT_INDEX.with(|flag| flag.set(true));
         let semantic = [MemoryType::Semantic];
