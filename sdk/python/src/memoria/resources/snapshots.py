@@ -6,7 +6,11 @@ import builtins
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
-from ..exceptions import MemoriaConnectionError, MemoriaValidationError
+from ..exceptions import (
+    MemoriaConnectionError,
+    MemoriaResponseError,
+    MemoriaValidationError,
+)
 from ..models import Snapshot
 
 if TYPE_CHECKING:
@@ -61,7 +65,7 @@ def _parse_snapshot_list(data: Any) -> builtins.list[Snapshot]:
         raise MemoriaConnectionError("snapshot list response contains an invalid snapshot")
     try:
         return [Snapshot.from_dict(item) for item in items]
-    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+    except (KeyError, TypeError, ValueError, AttributeError, MemoriaResponseError) as exc:
         raise MemoriaConnectionError("snapshot list response contains an invalid snapshot") from exc
 
 

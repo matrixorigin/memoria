@@ -17,7 +17,7 @@ from .exceptions import MemoriaResponseError
 
 def _parse_dt(value: str | None) -> datetime | None:
     """Parse an ISO-8601 / RFC-3339 string to a timezone-aware datetime, or return None."""
-    if not value:
+    if not value or not isinstance(value, str):
         return None
     try:
         # Python 3.10 accepts only 3 or 6 fractional digits, while the API's
@@ -34,6 +34,51 @@ def _parse_dt(value: str | None) -> datetime | None:
         return dt
     except ValueError:
         return None
+
+
+def _require_object(d: Any, name: str) -> dict[str, Any]:
+    if not isinstance(d, dict):
+        raise MemoriaResponseError(
+            f"Invalid {name} response: expected a JSON object, got {type(d).__name__}"
+        )
+    return d
+
+
+def _require_int(value: Any, field_name: str, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise MemoriaResponseError(
+            f"Invalid {name} response: '{field_name}' must be an integer"
+        )
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise MemoriaResponseError(
+            f"Invalid {name} response: '{field_name}' must be an integer"
+        ) from exc
+
+
+def _require_float(value: Any, field_name: str, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise MemoriaResponseError(
+            f"Invalid {name} response: '{field_name}' must be a number"
+        )
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise MemoriaResponseError(
+            f"Invalid {name} response: '{field_name}' must be a number"
+        ) from exc
+
+
+def _optional_list(d: dict[str, Any], field_name: str, name: str) -> list[Any]:
+    if field_name not in d:
+        return []
+    value = d[field_name]
+    if not isinstance(value, list):
+        raise MemoriaResponseError(
+            f"Invalid {name} response: '{field_name}' must be a JSON array"
+        )
+    return list(value)
 
 
 @dataclass
@@ -59,14 +104,36 @@ class Memory:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Memory:
+        d = _require_object(d, "memory")
+        memory_id = d.get("memory_id")
+        content = d.get("content")
+        if not isinstance(memory_id, str) or not isinstance(content, str):
+            raise MemoriaResponseError(
+                "Invalid memory response: missing string 'memory_id' or 'content'"
+            )
+        raw_confidence = d.get("initial_confidence", 0.65)
+        confidence = (
+            0.65
+            if raw_confidence is None
+            else _require_float(raw_confidence, "initial_confidence", "memory")
+        )
+        memory_type = d.get("memory_type", "semantic")
+        trust_tier = d.get("trust_tier", "T3")
+        user_id = d.get("user_id", "")
+        if not isinstance(memory_type, str):
+            raise MemoriaResponseError("Invalid memory response: 'memory_type' must be a string")
+        if not isinstance(trust_tier, str):
+            raise MemoriaResponseError("Invalid memory response: 'trust_tier' must be a string")
+        if not isinstance(user_id, str):
+            raise MemoriaResponseError("Invalid memory response: 'user_id' must be a string")
         return cls(
-            memory_id=d["memory_id"],
-            content=d["content"],
-            memory_type=d.get("memory_type", "semantic"),
-            trust_tier=d.get("trust_tier", "T3"),
-            initial_confidence=float(d.get("initial_confidence", 0.65)),
+            memory_id=memory_id,
+            content=content,
+            memory_type=memory_type,
+            trust_tier=trust_tier,
+            initial_confidence=confidence,
             is_active=bool(d.get("is_active", True)),
-            user_id=d.get("user_id", ""),
+            user_id=user_id,
             author_id=d.get("author_id"),
             subject_id=d.get("subject_id"),
             session_id=d.get("session_id"),
@@ -107,10 +174,24 @@ class RetrieveResult:
         # REST returns either a plain array or {"results": [...], "explain": {...}}
         if isinstance(d, list):
             return cls(items=[Memory.from_dict(m) for m in d])
+        if not isinstance(d, dict):
+            raise MemoriaResponseError(
+                "Invalid retrieve response: expected a JSON array or object, "
+                f"got {type(d).__name__}"
+            )
         results = d.get("results", d.get("items", []))
+        if not isinstance(results, list):
+            raise MemoriaResponseError(
+                "Invalid retrieve response: expected 'results' or 'items' to be a JSON array"
+            )
+        explain = d.get("explain")
+        if explain is not None and not isinstance(explain, dict):
+            raise MemoriaResponseError(
+                "Invalid retrieve response: expected 'explain' to be a JSON object or null"
+            )
         return cls(
             items=[Memory.from_dict(m) for m in results],
-            explain=d.get("explain"),
+            explain=explain,
         )
 
 
@@ -124,8 +205,9 @@ class PurgeResult:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> PurgeResult:
+        d = _require_object(d, "purge")
         return cls(
-            purged=int(d.get("purged", 0)),
+            purged=_require_int(d.get("purged", 0), "purged", "purge"),
             snapshot_name=d.get("snapshot_name"),
             warning=d.get("warning"),
         )
@@ -141,8 +223,14 @@ class Snapshot:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Snapshot:
+        d = _require_object(d, "snapshot")
+        name = d.get("name")
+        if not isinstance(name, str) or not name:
+            raise MemoriaResponseError(
+                "Invalid snapshot response: missing non-empty string 'name'"
+            )
         return cls(
-            name=d["name"],
+            name=name,
             created_at=_parse_dt(d.get("created_at")),
             description=d.get("description"),
         )
@@ -158,8 +246,14 @@ class Branch:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Branch:
+        d = _require_object(d, "branch")
+        name = d.get("name")
+        if not isinstance(name, str) or not name:
+            raise MemoriaResponseError(
+                "Invalid branch response: missing non-empty string 'name'"
+            )
         return cls(
-            name=d["name"],
+            name=name,
             active=bool(d.get("active", False)),
             created_at=_parse_dt(d.get("created_at")),
         )
@@ -180,15 +274,16 @@ class ApplyResult:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> ApplyResult:
+        d = _require_object(d, "apply")
         return cls(
-            applied_adds=list(d.get("applied_adds", [])),
-            applied_updates=list(d.get("applied_updates", [])),
-            applied_removes=list(d.get("applied_removes", [])),
-            applied_conflicts=list(d.get("applied_conflicts", [])),
-            skipped_adds=list(d.get("skipped_adds", [])),
-            skipped_updates=list(d.get("skipped_updates", [])),
-            skipped_removes=list(d.get("skipped_removes", [])),
-            skipped_conflicts=list(d.get("skipped_conflicts", [])),
+            applied_adds=_optional_list(d, "applied_adds", "apply"),
+            applied_updates=_optional_list(d, "applied_updates", "apply"),
+            applied_removes=_optional_list(d, "applied_removes", "apply"),
+            applied_conflicts=_optional_list(d, "applied_conflicts", "apply"),
+            skipped_adds=_optional_list(d, "skipped_adds", "apply"),
+            skipped_updates=_optional_list(d, "skipped_updates", "apply"),
+            skipped_removes=_optional_list(d, "skipped_removes", "apply"),
+            skipped_conflicts=_optional_list(d, "skipped_conflicts", "apply"),
         )
 
 
@@ -202,10 +297,20 @@ class Profile:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Profile:
+        d = _require_object(d, "profile")
+        user_id = d.get("user_id", "")
+        profile = d.get("profile", "")
+        stats = d.get("stats", {})
+        if not isinstance(user_id, str):
+            raise MemoriaResponseError("Invalid profile response: 'user_id' must be a string")
+        if not isinstance(profile, str):
+            raise MemoriaResponseError("Invalid profile response: 'profile' must be a string")
+        if not isinstance(stats, dict):
+            raise MemoriaResponseError("Invalid profile response: 'stats' must be a JSON object")
         return cls(
-            user_id=d.get("user_id", ""),
-            profile=d.get("profile", ""),
-            stats=d.get("stats", {}),
+            user_id=user_id,
+            profile=profile,
+            stats=stats,
         )
 
 
@@ -243,22 +348,41 @@ class GovernanceResult:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> GovernanceResult:
+        d = _require_object(d, "governance")
+        raw_cooldown = d.get("cooldown_remaining_s")
+        cooldown_remaining_s = (
+            None
+            if raw_cooldown is None
+            else _require_int(raw_cooldown, "cooldown_remaining_s", "governance")
+        )
         return cls(
             skipped=bool(d.get("skipped", False)),
-            cooldown_remaining_s=d.get("cooldown_remaining_s"),
-            quarantined=int(d.get("quarantined", 0)),
-            cleaned_stale=int(d.get("cleaned_stale", 0)),
-            orphan_graph_cleaned=int(d.get("orphan_graph_cleaned", 0)),
+            cooldown_remaining_s=cooldown_remaining_s,
+            quarantined=_require_int(d.get("quarantined", 0), "quarantined", "governance"),
+            cleaned_stale=_require_int(d.get("cleaned_stale", 0), "cleaned_stale", "governance"),
+            orphan_graph_cleaned=_require_int(
+                d.get("orphan_graph_cleaned", 0), "orphan_graph_cleaned", "governance"
+            ),
             status=d.get("status"),
-            conflicts_detected=int(d.get("conflicts_detected", 0)),
-            orphaned_scenes=int(d.get("orphaned_scenes", 0)),
-            promoted=int(d.get("promoted", 0)),
-            demoted=int(d.get("demoted", 0)),
-            warnings=list(d.get("warnings", [])),
-            decision_count=int(d.get("decision_count", 0)),
-            scenes_created=int(d.get("scenes_created", 0)),
-            candidates_found=int(d.get("candidates_found", 0)),
-            candidates=list(d.get("candidates", [])),
+            conflicts_detected=_require_int(
+                d.get("conflicts_detected", 0), "conflicts_detected", "governance"
+            ),
+            orphaned_scenes=_require_int(
+                d.get("orphaned_scenes", 0), "orphaned_scenes", "governance"
+            ),
+            promoted=_require_int(d.get("promoted", 0), "promoted", "governance"),
+            demoted=_require_int(d.get("demoted", 0), "demoted", "governance"),
+            warnings=_optional_list(d, "warnings", "governance"),
+            decision_count=_require_int(
+                d.get("decision_count", 0), "decision_count", "governance"
+            ),
+            scenes_created=_require_int(
+                d.get("scenes_created", 0), "scenes_created", "governance"
+            ),
+            candidates_found=_require_int(
+                d.get("candidates_found", 0), "candidates_found", "governance"
+            ),
+            candidates=_optional_list(d, "candidates", "governance"),
         )
 
 
@@ -271,7 +395,13 @@ class ObserveResult:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> ObserveResult:
+        d = _require_object(d, "observe")
+        memories = _optional_list(d, "memories", "observe")
+        if any(not isinstance(item, dict) for item in memories):
+            raise MemoriaResponseError(
+                "Invalid observe response: 'memories' entries must be JSON objects"
+            )
         return cls(
-            memories=list(d.get("memories", [])),
+            memories=memories,
             warning=d.get("warning"),
         )

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import builtins
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
-from ..exceptions import MemoriaConnectionError
+from ..exceptions import MemoriaConnectionError, MemoriaResponseError
 from ..models import ApplyResult, Branch
 
 if TYPE_CHECKING:
@@ -28,13 +28,37 @@ def _branch_path(name: str, suffix: str = "") -> str:
 
 def _branch_creation_response(data: Any, name: str) -> Branch:
     """Reject malformed success responses rather than reporting a phantom branch."""
-    if isinstance(data, dict) and "error" not in data:
+    if name and isinstance(data, dict) and "error" not in data:
         if "name" in data:
             if data["name"] == name and "result" not in data:
                 return Branch.from_dict(data)
         elif data.get("result") == f"Created branch '{name}'":
             return Branch(name=name)
     raise MemoriaConnectionError("Invalid branch creation response")
+
+
+def _parse_branch_list(data: Any) -> builtins.list[Branch]:
+    # Server returns {"branches": [...], "result": "..."}, not a plain list
+    if isinstance(data, dict):
+        items = data.get("branches", [])
+    else:
+        items = data
+    if items is None:
+        return []
+    if not isinstance(items, builtins.list):
+        raise MemoriaResponseError(
+            f"Invalid branch list response: expected a JSON array, got {type(items).__name__}"
+        )
+    return [Branch.from_dict(b) for b in items]
+
+
+def _require_dict_response(data: Any, operation: str) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        raise MemoriaResponseError(
+            f"Invalid branch {operation} response: expected a JSON object, "
+            f"got {type(data).__name__}"
+        )
+    return data
 
 
 class BranchesResource:
@@ -47,19 +71,15 @@ class BranchesResource:
 
     def list(self) -> list[Branch]:
         data = self._client._request("GET", "/v1/branches")
-        # Server returns {"branches": [...], "result": "..."}, not a plain list
-        if isinstance(data, dict):
-            items = data.get("branches", [])
-        else:
-            items = data
-        return [Branch.from_dict(b) for b in (items if items is not None else [])]
+        return _parse_branch_list(data)
 
     def checkout(self, name: str) -> None:
         self._client._request("POST", _branch_path(name, "/checkout"), json={})
 
     def diff(self, name: str) -> dict[str, Any]:
         """Return high-level diff statistics (no pagination)."""
-        return cast(dict[str, Any], self._client._request("GET", _branch_path(name, "/diff")))
+        data = self._client._request("GET", _branch_path(name, "/diff"))
+        return _require_dict_response(data, "diff")
 
     def diff_items(
         self,
@@ -70,10 +90,8 @@ class BranchesResource:
     ) -> dict[str, Any]:
         """Return per-entry diff with optional pagination."""
         params = _strip_none({"limit": limit, "cursor": cursor})
-        return cast(
-            dict[str, Any],
-            self._client._request("GET", _branch_path(name, "/diff-items"), params=params),
-        )
+        data = self._client._request("GET", _branch_path(name, "/diff-items"), params=params)
+        return _require_dict_response(data, "diff_items")
 
     def merge(self, name: str, *, strategy: str = "accept") -> None:
         self._client._request("POST", _branch_path(name, "/merge"), json={"strategy": strategy})
@@ -123,10 +141,8 @@ class BranchesResource:
                 "dry_run": dry_run,
             }
         )
-        return cast(
-            dict[str, Any],
-            self._client._request("POST", _branch_path(name, "/pick"), json=body),
-        )
+        data = self._client._request("POST", _branch_path(name, "/pick"), json=body)
+        return _require_dict_response(data, "pick")
 
 
 class AsyncBranchesResource:
@@ -139,20 +155,14 @@ class AsyncBranchesResource:
 
     async def list(self) -> list[Branch]:
         data = await self._client._arequest("GET", "/v1/branches")
-        # Server returns {"branches": [...], "result": "..."}, not a plain list
-        if isinstance(data, dict):
-            items = data.get("branches", [])
-        else:
-            items = data
-        return [Branch.from_dict(b) for b in (items if items is not None else [])]
+        return _parse_branch_list(data)
 
     async def checkout(self, name: str) -> None:
         await self._client._arequest("POST", _branch_path(name, "/checkout"), json={})
 
     async def diff(self, name: str) -> dict[str, Any]:
-        return cast(
-            dict[str, Any], await self._client._arequest("GET", _branch_path(name, "/diff"))
-        )
+        data = await self._client._arequest("GET", _branch_path(name, "/diff"))
+        return _require_dict_response(data, "diff")
 
     async def diff_items(
         self,
@@ -162,10 +172,10 @@ class AsyncBranchesResource:
         cursor: str | None = None,
     ) -> dict[str, Any]:
         params = _strip_none({"limit": limit, "cursor": cursor})
-        return cast(
-            dict[str, Any],
-            await self._client._arequest("GET", _branch_path(name, "/diff-items"), params=params),
+        data = await self._client._arequest(
+            "GET", _branch_path(name, "/diff-items"), params=params
         )
+        return _require_dict_response(data, "diff_items")
 
     async def merge(self, name: str, *, strategy: str = "accept") -> None:
         await self._client._arequest(
@@ -214,8 +224,5 @@ class AsyncBranchesResource:
                 "dry_run": dry_run,
             }
         )
-        return cast(
-            dict[str, Any],
-            await self._client._arequest("POST", _branch_path(name, "/pick"), json=body),
-        )
-
+        data = await self._client._arequest("POST", _branch_path(name, "/pick"), json=body)
+        return _require_dict_response(data, "pick")

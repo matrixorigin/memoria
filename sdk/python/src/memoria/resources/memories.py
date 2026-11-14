@@ -8,7 +8,7 @@ import math
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
-from ..exceptions import MemoriaValidationError
+from ..exceptions import MemoriaResponseError, MemoriaValidationError
 from ..models import Memory, MemoryPage, PurgeResult, RetrieveResult
 
 if TYPE_CHECKING:
@@ -332,6 +332,14 @@ def _replay_safe_store(idempotency_key: str | None, branch: str | None) -> bool 
     return True
 
 
+def _parse_memory_list(data: Any, operation: str) -> builtins.list[Memory]:
+    if not isinstance(data, builtins.list):
+        raise MemoriaResponseError(
+            f"Invalid {operation} response: expected a JSON array, got {type(data).__name__}"
+        )
+    return [Memory.from_dict(m) for m in data]
+
+
 class MemoriesResource:
     def __init__(self, client: _HttpTransport) -> None:
         self._client = client
@@ -389,7 +397,7 @@ class MemoriesResource:
         if branch is not None:
             body["branch"] = branch
         data = self._client._request("POST", "/v1/memories/batch", json=body)
-        return [Memory.from_dict(m) for m in data]
+        return _parse_memory_list(data, "store_batch")
 
     def retrieve(
         self,
@@ -701,7 +709,7 @@ class AsyncMemoriesResource:
         if branch is not None:
             body["branch"] = branch
         data = await self._client._arequest("POST", "/v1/memories/batch", json=body)
-        return [Memory.from_dict(m) for m in data]
+        return _parse_memory_list(data, "store_batch")
 
     async def retrieve(
         self,
