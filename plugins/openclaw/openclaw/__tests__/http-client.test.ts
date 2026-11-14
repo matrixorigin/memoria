@@ -128,6 +128,8 @@ describe("Group 3: Cloud API Communication", () => {
                 ? { purged: 1 }
                 : tool === "memory_correct"
                   ? { memory_id: "abc", content: "x" }
+                  : tool === "memory_snapshot"
+                    ? { name: args.name }
                   : tool === "memory_snapshots"
                     ? { snapshots: [] }
                     : tool === "memory_branches"

@@ -6,7 +6,7 @@ import builtins
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
-from ..exceptions import MemoriaValidationError
+from ..exceptions import MemoriaConnectionError, MemoriaValidationError
 from ..models import Snapshot
 
 if TYPE_CHECKING:
@@ -32,6 +32,39 @@ def _validate_delete_prefix(prefix: str | None) -> None:
         raise MemoriaValidationError("delete: prefix must not be empty")
 
 
+def _parse_snapshot_list(data: Any) -> builtins.list[Snapshot]:
+    """Accept supported list envelopes; never mistake a malformed response for empty."""
+    if data is None:  # 204 No Content
+        return []
+    if isinstance(data, dict):
+        # An explicitly empty snapshots field is authoritative. Do not fall
+        # back to stale compatibility items just because [] is falsey.
+        if "snapshots" in data:
+            items = data["snapshots"]
+        elif "items" in data:
+            items = data["items"]
+        else:
+            raise MemoriaConnectionError("snapshot list response missing snapshots/items")
+    else:
+        items = data  # Legacy plain-list envelope.
+
+    if items is None:  # Older servers may return an explicit null list.
+        return []
+    if not isinstance(items, builtins.list):
+        raise MemoriaConnectionError("snapshot list response must be a list")
+    if any(
+        not isinstance(item, dict)
+        or not isinstance(item.get("name"), str)
+        or not item["name"]
+        for item in items
+    ):
+        raise MemoriaConnectionError("snapshot list response contains an invalid snapshot")
+    try:
+        return [Snapshot.from_dict(item) for item in items]
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise MemoriaConnectionError("snapshot list response contains an invalid snapshot") from exc
+
+
 class SnapshotsResource:
     def __init__(self, client: _HttpTransport) -> None:
         self._client = client
@@ -44,16 +77,7 @@ class SnapshotsResource:
     def list(self, *, limit: int = 20, offset: int = 0) -> list[Snapshot]:
         params = {"limit": limit, "offset": offset}
         data = self._client._request("GET", "/v1/snapshots", params=params)
-        # Server may return {"snapshots": [...], "has_more": bool} or a plain list
-        # An empty body (204) or a null field would otherwise be iterated as None.
-        items: builtins.list[Any]
-        if isinstance(data, dict):
-            items = data.get("snapshots") or data.get("items") or []
-        elif isinstance(data, builtins.list):
-            items = data
-        else:
-            items = []
-        return [Snapshot.from_dict(s) for s in items]
+        return _parse_snapshot_list(data)
 
     def rollback(self, name: str) -> None:
         self._client._request("POST", _snapshot_path(name, "/rollback"), json={})
@@ -111,15 +135,7 @@ class AsyncSnapshotsResource:
     async def list(self, *, limit: int = 20, offset: int = 0) -> list[Snapshot]:
         params = {"limit": limit, "offset": offset}
         data = await self._client._arequest("GET", "/v1/snapshots", params=params)
-        # An empty body (204) or a null field would otherwise be iterated as None.
-        items: builtins.list[Any]
-        if isinstance(data, dict):
-            items = data.get("snapshots") or data.get("items") or []
-        elif isinstance(data, builtins.list):
-            items = data
-        else:
-            items = []
-        return [Snapshot.from_dict(s) for s in items]
+        return _parse_snapshot_list(data)
 
     async def rollback(self, name: str) -> None:
         await self._client._arequest("POST", _snapshot_path(name, "/rollback"), json={})
