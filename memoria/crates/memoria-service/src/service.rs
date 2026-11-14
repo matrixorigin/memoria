@@ -3216,6 +3216,14 @@ impl MemoryService {
         // Normalize early so that stored subject_id always matches what retrieve
         // filters on (avoids trailing-space mismatches).
         let subject_id = normalize_opt_string(subject_id);
+        // Observe persists through `persist_with_dedup`, not the guarded store
+        // paths, so enforce the same column limits before LLM/embedding work.
+        validate_session_id_length(session_id.as_deref())?;
+        if subject_id.as_ref().is_some_and(|sid| sid.chars().count() > 128) {
+            return Err(MemoriaError::Validation(
+                "subject_id exceeds maximum length of 128 characters".into(),
+            ));
+        }
         let has_llm = self.llm.is_some();
         let exclusion_mode = !exclude_memory_ids.is_empty();
         if exclude_memory_ids.len() > 100
@@ -3926,5 +3934,41 @@ mod observed_at_validation_tests {
         assert!(validate_observed_at(None).is_ok());
         assert!(validate_observed_at(Some(Utc::now() - Duration::days(1))).is_ok());
         assert!(validate_observed_at(Some(Utc::now() + Duration::days(1))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod observe_identifier_length_tests {
+    use super::MemoryService;
+    use memoria_core::MemoriaError;
+    use std::sync::Arc;
+
+    fn offline_service() -> MemoryService {
+        // The pool is never connected: validation must fail before storage.
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://test:test@127.0.0.1:1/test")
+            .unwrap();
+        let store = Arc::new(memoria_storage::SqlMemoryStore::new(pool, 3, "test".into()));
+        MemoryService::new(store, None, None)
+    }
+
+    #[tokio::test]
+    async fn observe_rejects_overlong_session_and_subject_before_persistence() {
+        let service = offline_service();
+        let messages = vec![serde_json::json!({"role": "user", "content": "I like tea"})];
+        let cases = [
+            (Some("s".repeat(65)), None, "session_id"),
+            (None, Some("é".repeat(129)), "subject_id"),
+        ];
+        for (session_id, subject_id, field) in cases {
+            let error = service
+                .observe_turn_on_branch("u", None, &messages, session_id, subject_id)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, MemoriaError::Validation(message) if message.contains(field)),
+                "{field}: {error:?}"
+            );
+        }
     }
 }
