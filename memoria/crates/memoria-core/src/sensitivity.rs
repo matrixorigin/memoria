@@ -48,7 +48,9 @@ static PATTERNS: &[Pattern] = &[
     Pattern {
         label: "bearer_token",
         tier: SensitivityTier::High,
-        regex: r"(?i)\bBearer\s+[A-Za-z0-9\-._~+/]{20,}=*",
+        // An explicit Authorization header carries a credential of any length
+        // (RFC 6750 §2.1); standalone "bearer" prose needs a token-like value.
+        regex: r"(?i)\bAuthorization\s*:\s*Bearer\s+[A-Za-z0-9\-._~+/]+=*|\bBearer\s+[A-Za-z0-9\-._~+/]{20,}=*",
         replacement: "",
     },
     Pattern {
@@ -91,15 +93,17 @@ static PATTERNS: &[Pattern] = &[
         tier: SensitivityTier::High,
         // Require a URI authority with non-empty userinfo password; no plain
         // connection URL or username-only URL should trigger HIGH sensitivity.
-        regex: r"(?i)\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss)://[^\s/@:]+:[^\s/@]+@[^\s/]+",
+        // Redis also accepts a password with an empty username (`redis://:pw@`).
+        regex: r"(?i)\b(?:(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?)://[^\s/@:]+|rediss?://[^\s/@:]*):[^\s/@]+@[^\s/]+",
         replacement: "",
     },
     Pattern {
         label: "basic_auth",
         tier: SensitivityTier::High,
         // Basic credentials are base64-encoded user:password; require the
-        // Authorization header so arbitrary base64 text is not blocked.
-        regex: r"(?i)\bAuthorization\s*:\s*Basic\s+[A-Za-z0-9+/]{12,}={0,2}\b",
+        // Authorization header so arbitrary base64 text is not blocked, and a
+        // well-formed base64 value of any length (RFC 7617 §2, e.g. `u:p`).
+        regex: r"(?i)\bAuthorization\s*:\s*Basic\s+(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{4}|[A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{2}==)(?:[^A-Za-z0-9+/=]|$)",
         replacement: "",
     },
     // MEDIUM — redact
@@ -362,10 +366,18 @@ mod tests {
             "DATABASE_URL=postgres://admin:synthetic-pass@db.example:5432/app",
             "mysql://admin:synthetic-pass@localhost/db",
             "redis://default:synthetic-pass@localhost:6379/0",
+            "redis://:synthetic-pass@localhost:6379/0",
+            "rediss://:synthetic-pass@cache.example:6380",
         ] {
             assert!(check_sensitivity(value).blocked, "credential URL accepted");
         }
-        for value in ["postgres://db.example:5432/app", "mysql://admin@localhost/db"] {
+        for value in [
+            "postgres://db.example:5432/app",
+            "mysql://admin@localhost/db",
+            "redis://localhost:6379/0",
+            "redis://default@localhost:6379/0",
+            "redis://:@localhost:6379/0",
+        ] {
             assert!(!check_sensitivity(value).blocked, "safe URI rejected");
         }
     }
@@ -375,7 +387,12 @@ mod tests {
         let encoded = format!("{}{}", "dXNlcjpz", "M2NyZXRQYXNzd29yZA==");
         let header = format!("Authorization: Basic {encoded}");
         assert!(check_sensitivity(&header).blocked);
+        // Synthetic short credential `u:p` is still a valid Basic credential.
+        for short in ["Authorization: Basic dTpw", "authorization: basic YTo=, next"] {
+            assert!(check_sensitivity(short).blocked, "{short}");
+        }
         assert!(!check_sensitivity("Basic authentication is supported.").blocked);
+        assert!(!check_sensitivity("Authorization: Basic realm").blocked);
     }
 
     #[test]
@@ -396,6 +413,9 @@ mod tests {
         for text in [
             "Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456",
             "Bearer synthetic-test-token",
+            // Short tokens are still credentials inside an explicit header.
+            "Authorization: Bearer synthetic123",
+            "curl -H 'Authorization: BEARER token123'",
         ] {
             let result = check_sensitivity(text);
             assert!(result.blocked, "bearer credential allowed: {text}");
