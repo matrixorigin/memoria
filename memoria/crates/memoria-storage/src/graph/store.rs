@@ -2,9 +2,12 @@
 //! Mirrors Python's graph/graph_store.py core methods needed for consolidation.
 
 use crate::graph::types::{edge_type, GraphEdge, GraphNode, NodeType};
-use crate::store::{db_err, fulltext_rows_or_empty};
+use crate::store::{
+    db_err, fulltext_like_fallback_patterns, fulltext_rows_or_degraded,
+    push_like_fallback_predicate, push_like_fallback_score, FulltextRows,
+};
 use memoria_core::{nullable_str, nullable_str_from_row, MemoriaError};
-use sqlx::{MySqlPool, Row};
+use sqlx::{MySql, MySqlPool, QueryBuilder, Row};
 use uuid::Uuid;
 
 fn new_id() -> String {
@@ -829,13 +832,37 @@ impl GraphStore {
              ORDER BY ft_score DESC LIMIT ?",
             self.t("memory_graph_nodes"),
         );
-        let rows = fulltext_rows_or_empty(
+        let rows = match fulltext_rows_or_degraded(
             sqlx::query(&sql)
                 .bind(user_id)
                 .bind(top_k)
                 .fetch_all(&self.pool)
                 .await,
-        )?;
+        )? {
+            FulltextRows::Rows(rows) => rows,
+            FulltextRows::IndexUnavailable => {
+                // Same owner scope and limit, matching any term by substring.
+                let patterns = fulltext_like_fallback_patterns(&safe);
+                let mut fallback = QueryBuilder::<MySql>::new(format!("SELECT {NODE_COLS_NO_EMB}"));
+                push_like_fallback_score(&mut fallback, &patterns);
+                fallback
+                    .push(format!(
+                        " FROM {} WHERE user_id = ",
+                        self.t("memory_graph_nodes")
+                    ))
+                    .push_bind(user_id)
+                    .push(" AND is_active = 1");
+                push_like_fallback_predicate(&mut fallback, &patterns);
+                fallback
+                    .push(" ORDER BY ft_score DESC, node_id ASC LIMIT ")
+                    .push_bind(top_k);
+                fallback
+                    .build()
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(db_err)?
+            }
+        };
         Ok(rows
             .iter()
             .map(|r| {
