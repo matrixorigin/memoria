@@ -237,13 +237,22 @@ class _HttpTransport:
             if resp.is_success:
                 if resp.status_code == 204 or not resp.content:
                     return None
-                content_type = resp.headers.get("content-type", "")
-                if "json" in content_type:
-                    return resp.json()
                 try:
                     return resp.json()
-                except Exception:
-                    return resp.text
+                except Exception as exc:
+                    # Bodies advertised as JSON can still fail to parse (an
+                    # error page behind a 200, a truncated response). The
+                    # request may have committed, so reuse the idempotency /
+                    # unsafe-write replay boundary; never leak decoder
+                    # exceptions past the MemoriaError hierarchy.
+                    if "json" not in resp.headers.get("content-type", "").lower():
+                        return resp.text
+                    if attempt < self._max_retries and (
+                        _is_idempotent(method, idempotent) or self._retry_unsafe_writes
+                    ):
+                        time.sleep(_backoff(attempt))
+                        continue
+                    raise MemoriaConnectionError(str(exc)) from exc
 
             if (
                 _should_retry(method, resp.status_code, self._retry_unsafe_writes, idempotent)
@@ -302,13 +311,22 @@ class _HttpTransport:
             if resp.is_success:
                 if resp.status_code == 204 or not resp.content:
                     return None
-                content_type = resp.headers.get("content-type", "")
-                if "json" in content_type:
-                    return resp.json()
                 try:
                     return resp.json()
-                except Exception:
-                    return resp.text
+                except Exception as exc:
+                    # Bodies advertised as JSON can still fail to parse (an
+                    # error page behind a 200, a truncated response). The
+                    # request may have committed, so reuse the idempotency /
+                    # unsafe-write replay boundary; never leak decoder
+                    # exceptions past the MemoriaError hierarchy.
+                    if "json" not in resp.headers.get("content-type", "").lower():
+                        return resp.text
+                    if attempt < self._max_retries and (
+                        _is_idempotent(method, idempotent) or self._retry_unsafe_writes
+                    ):
+                        await asyncio.sleep(_backoff(attempt))
+                        continue
+                    raise MemoriaConnectionError(str(exc)) from exc
 
             if (
                 _should_retry(method, resp.status_code, self._retry_unsafe_writes, idempotent)
