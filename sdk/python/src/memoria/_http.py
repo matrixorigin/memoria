@@ -172,6 +172,8 @@ class _HttpTransport:
         max_retries: int = _DEFAULT_MAX_RETRIES,
         retry_unsafe_writes: bool = False,
     ) -> None:
+        if not isinstance(api_key, str) or not api_key:
+            raise MemoriaValidationError("api_key must be a non-empty string")
         if type(max_retries) is not int or max_retries < 0:
             raise MemoriaValidationError("max_retries must be a non-negative integer")
         if type(retry_unsafe_writes) is not bool:
