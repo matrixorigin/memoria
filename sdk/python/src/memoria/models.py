@@ -99,6 +99,41 @@ class RetrieveResult:
 
 
 @dataclass
+class EraseResult:
+    """Result of a physical memory erase. Counts are removed rows, not soft-deleted rows."""
+
+    memories: int = 0
+    branch_memories: int = 0
+    graph_nodes: int = 0
+    graph_edges: int = 0
+    entity_links: int = 0
+    memory_entity_links: int = 0
+    entities: int = 0
+    stats: int = 0
+    edit_log: int = 0
+    feedback: int = 0
+    snapshots_dropped: int = 0
+    snapshots_retained: bool = False
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> EraseResult:
+        return cls(
+            memories=int(d.get("memories", 0)),
+            branch_memories=int(d.get("branch_memories", 0)),
+            graph_nodes=int(d.get("graph_nodes", 0)),
+            graph_edges=int(d.get("graph_edges", 0)),
+            entity_links=int(d.get("entity_links", 0)),
+            memory_entity_links=int(d.get("memory_entity_links", 0)),
+            entities=int(d.get("entities", 0)),
+            stats=int(d.get("stats", 0)),
+            edit_log=int(d.get("edit_log", 0)),
+            feedback=int(d.get("feedback", 0)),
+            snapshots_dropped=int(d.get("snapshots_dropped", 0)),
+            snapshots_retained=bool(d.get("snapshots_retained", False)),
+        )
+
+
+@dataclass
 class PurgeResult:
     """Result of a bulk purge operation."""
 

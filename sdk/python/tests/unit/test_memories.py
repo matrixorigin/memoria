@@ -16,7 +16,7 @@ from memoria import (
     MemoriaUnprocessableError,
     MemoriaValidationError,
 )
-from memoria.models import Memory, MemoryPage, PurgeResult, RetrieveResult
+from memoria.models import EraseResult, Memory, MemoryPage, PurgeResult, RetrieveResult
 from tests.conftest import API_KEY, BASE_URL, MEMORY_STUB
 
 
@@ -560,6 +560,23 @@ def test_delete_happy_path(httpx_mock: HTTPXMock, client: MemoriaClient) -> None
 # ---------------------------------------------------------------------------
 # purge
 # ---------------------------------------------------------------------------
+
+
+def test_erase_group_posts_explicit_mode(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
+    httpx_mock.add_response(json={"memories": 2, "snapshots_dropped": 1, "snapshots_retained": False})
+    result = client.memories.erase(mode="group")
+    assert isinstance(result, EraseResult)
+    assert result.memories == 2
+    assert result.snapshots_dropped == 1
+    request = httpx_mock.get_request()
+    assert request is not None
+    assert request.url.path == "/v1/memories/erase"
+    assert json.loads(request.content) == {"mode": "group"}
+
+
+def test_erase_group_rejects_subject(client: MemoriaClient) -> None:
+    with pytest.raises(MemoriaValidationError):
+        client.memories.erase(mode="group", subject_id="consumer")
 
 
 def test_purge_by_ids(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
