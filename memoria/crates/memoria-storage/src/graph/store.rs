@@ -843,6 +843,9 @@ impl GraphStore {
             FulltextRows::IndexUnavailable => {
                 // Same owner scope and limit, matching any term by substring.
                 let patterns = fulltext_like_fallback_patterns(&safe);
+                if patterns.is_empty() {
+                    return Ok(Vec::new());
+                }
                 let mut fallback = QueryBuilder::<MySql>::new(format!("SELECT {NODE_COLS_NO_EMB}"));
                 push_like_fallback_score(&mut fallback, &patterns);
                 fallback
