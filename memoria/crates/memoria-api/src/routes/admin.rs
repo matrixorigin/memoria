@@ -33,6 +33,13 @@ async fn get_user_store(
     state.service.user_sql_store(user_id).await.map_err(api_err)
 }
 
+/// A `grp_*` scope has its own database only when a `DbRouter` is configured.
+/// Without one, `user_sql_store` returns the shared store for every id, so a
+/// table-wide statement would touch every user's rows.
+fn is_isolated_group_scope(state: &AppState, user_id: &str) -> bool {
+    user_id.starts_with("grp_") && state.service.db_router.is_some()
+}
+
 async fn list_known_users(state: &AppState) -> Result<Vec<String>, (StatusCode, String)> {
     let sql = state
         .service
@@ -166,7 +173,7 @@ pub async fn user_stats(
     // For group scopes (user_id starts with "grp_") count ALL active memories in the
     // group database — the individual user_id filter would always return 0 since
     // memories are attributed to each member's uid, not the group id itself.
-    let memory_count = if user_id.starts_with("grp_") {
+    let memory_count = if is_isolated_group_scope(&state, &user_id) {
         sqlx::query_scalar::<_, i64>(&format!(
             "SELECT COUNT(*) FROM {memories_table} WHERE is_active > 0"
         ))
@@ -202,11 +209,18 @@ pub async fn delete_user(
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth.require_master()?;
+    // Group memories belong to members, not the group id. Only an isolated
+    // group database may be cleared without the owner predicate; in
+    // router-less mode that statement would deactivate every user's rows.
+    if user_id.starts_with("grp_") && !is_isolated_group_scope(&state, &user_id) {
+        return Err((
+            StatusCode::CONFLICT,
+            "group deletion requires isolated group databases (multi-db mode)".into(),
+        ));
+    }
     let user_store = get_user_store(&state, &user_id).await?;
     let memories_table = user_store.t("mem_memories");
-    // Group memories belong to members, not the group id. The group has its
-    // own isolated database, so filtering by group id would delete nothing.
-    if user_id.starts_with("grp_") {
+    if is_isolated_group_scope(&state, &user_id) {
         sqlx::query(&format!(
             "UPDATE {memories_table} SET is_active = 0 WHERE is_active > 0"
         ))
@@ -848,7 +862,7 @@ pub async fn user_branch_stats(
     // we filter by user_id. Group users own an isolated per-group database where
     // mem_memories contains only group data, so no user_id filter is needed there.
     let memories_table = user_store.t("mem_memories");
-    let main_count: i64 = if user_id.starts_with("grp_") {
+    let main_count: i64 = if is_isolated_group_scope(&state, &user_id) {
         sqlx::query_scalar::<_, i64>(&format!(
             "SELECT COUNT(*) FROM {memories_table} WHERE is_active > 0"
         ))
@@ -999,7 +1013,10 @@ mod admin_user_pagination_tests {
         assert_eq!(validated_user_page_limit(Some(1)).unwrap(), 1);
         assert_eq!(validated_user_page_limit(Some(1000)).unwrap(), 1000);
         for limit in [i64::MIN, -1, 0, 1001, i64::MAX] {
-            assert_eq!(validated_user_page_limit(Some(limit)).unwrap_err().0, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                validated_user_page_limit(Some(limit)).unwrap_err().0,
+                StatusCode::BAD_REQUEST
+            );
         }
     }
 }
