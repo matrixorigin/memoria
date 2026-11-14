@@ -7,9 +7,12 @@ so the SDK remains forward-compatible with future API additions.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+
+from .exceptions import MemoriaResponseError
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -17,7 +20,15 @@ def _parse_dt(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        # Python 3.10 accepts only 3 or 6 fractional digits, while the API's
+        # RFC 3339 timestamps can contain nanoseconds. Match datetime's newer
+        # behavior: retain microseconds and truncate any finer precision.
+        normalized = re.sub(
+            r"^([0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}\.)([0-9]+)",
+            lambda match: match[1] + match[2][:6].ljust(6, "0"),
+            value,
+        )
+        dt = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
@@ -75,7 +86,12 @@ class MemoryPage:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> MemoryPage:
-        items = [Memory.from_dict(m) for m in d.get("items", [])]
+        # Missing or non-array items must not look like the end of pagination.
+        if not isinstance(d, dict) or not isinstance(d.get("items"), list):
+            raise MemoriaResponseError(
+                "Invalid memory page: expected an object with an items array"
+            )
+        items = [Memory.from_dict(m) for m in d["items"]]
         return cls(items=items, next_cursor=d.get("next_cursor"))
 
 
