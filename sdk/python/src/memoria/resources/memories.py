@@ -338,6 +338,7 @@ class MemoriesResource:
         session_id: str | None = None,
         subject_id: str | None = None,
         trust_tier: str | None = None,
+        extra_metadata: dict[str, Any] | None = None,
         branch: str | None = None,
         idempotency_key: str | None = None,
     ) -> Memory:
@@ -362,6 +363,7 @@ class MemoriesResource:
                 "session_id": session_id,
                 "subject_id": subject_id,
                 "trust_tier": trust_tier,
+                "extra_metadata": extra_metadata,
                 "branch": branch,
                 "idempotency_key": idempotency_key,
             }
@@ -669,6 +671,7 @@ class AsyncMemoriesResource:
         session_id: str | None = None,
         subject_id: str | None = None,
         trust_tier: str | None = None,
+        extra_metadata: dict[str, Any] | None = None,
         branch: str | None = None,
         idempotency_key: str | None = None,
     ) -> Memory:
@@ -685,6 +688,7 @@ class AsyncMemoriesResource:
                 "session_id": session_id,
                 "subject_id": subject_id,
                 "trust_tier": trust_tier,
+                "extra_metadata": extra_metadata,
                 "branch": branch,
                 "idempotency_key": idempotency_key,
             }
