@@ -199,6 +199,7 @@ from memoria import (
     MemoriaUnprocessableError,# 422 — server-side validation (empty content, bad type, etc.)
     MemoriaServerError,       # 5xx
     MemoriaValidationError,   # local validation (request not sent)
+    MemoriaResponseError,     # malformed successful memory page response
 )
 
 try:
