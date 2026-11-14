@@ -92,6 +92,25 @@ fn normalize_opt_string(s: Option<String>) -> Option<String> {
     s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
+fn validate_session_id_length(session_id: Option<&str>) -> Result<(), MemoriaError> {
+    if session_id.is_some_and(|id| id.chars().count() > 64) {
+        return Err(MemoriaError::Validation(
+            "session_id exceeds maximum length of 64 characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_observed_at(observed_at: Option<DateTime<Utc>>) -> Result<(), MemoriaError> {
+    // A future observation can produce negative age and unbounded recency scores.
+    if observed_at.is_some_and(|at| at > Utc::now()) {
+        return Err(MemoriaError::Validation(
+            "observed_at must not be in the future".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Extra retrieval controls that must be threaded through the full retrieval pipeline.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetrieveOptions {
@@ -1349,9 +1368,18 @@ impl MemoryService {
         mut extra_metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
         idempotency_key: Option<&str>,
     ) -> Result<Memory, MemoriaError> {
+        validate_session_id_length(session_id.as_deref())?;
+        if let Some(confidence) = initial_confidence {
+            if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
+                return Err(MemoriaError::Validation(
+                    "initial_confidence must be a finite number between 0 and 1".into(),
+                ));
+            }
+        }
+        validate_observed_at(observed_at)?;
         let subject_id = normalize_opt_string(subject_id);
         if let Some(ref sid) = subject_id {
-            if sid.len() > 128 {
+            if sid.chars().count() > 128 {
                 return Err(MemoriaError::Validation(
                     "subject_id exceeds maximum length of 128 characters".into(),
                 ));
@@ -3038,9 +3066,10 @@ impl MemoryService {
         let mut checked_items = Vec::with_capacity(items.len());
         for (content, mt, session_id, tier, subject_id, extra_metadata) in items {
             reject_reserved_metadata(extra_metadata.as_ref())?;
+            validate_session_id_length(session_id.as_deref())?;
             let subject_id = normalize_opt_string(subject_id);
             if let Some(ref sid) = subject_id {
-                if sid.len() > 128 {
+                if sid.chars().count() > 128 {
                     return Err(MemoriaError::Validation(
                         "subject_id exceeds maximum length of 128 characters".into(),
                     ));
@@ -3187,6 +3216,14 @@ impl MemoryService {
         // Normalize early so that stored subject_id always matches what retrieve
         // filters on (avoids trailing-space mismatches).
         let subject_id = normalize_opt_string(subject_id);
+        // Observe persists through `persist_with_dedup`, not the guarded store
+        // paths, so enforce the same column limits before LLM/embedding work.
+        validate_session_id_length(session_id.as_deref())?;
+        if subject_id.as_ref().is_some_and(|sid| sid.chars().count() > 128) {
+            return Err(MemoriaError::Validation(
+                "subject_id exceeds maximum length of 128 characters".into(),
+            ));
+        }
         let has_llm = self.llm.is_some();
         let exclusion_mode = !exclude_memory_ids.is_empty();
         if exclude_memory_ids.len() > 100
@@ -3852,5 +3889,86 @@ mod idempotency_tests {
             assert!(idempotent_memory_id("owner-a", None, key).is_err());
         }
         assert!(idempotent_memory_id("owner-a", None, &"x".repeat(129)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod subject_id_character_limit_tests {
+    #[test]
+    fn unicode_subject_id_limit_counts_characters_not_utf8_bytes() {
+        let exactly_128 = "é".repeat(128);
+        assert_eq!(exactly_128.chars().count(), 128);
+        assert!(exactly_128.len() > 128);
+        assert!(exactly_128.chars().count() <= 128);
+        assert!("é".repeat(129).chars().count() > 128);
+        assert!("x".repeat(129).chars().count() > 128);
+    }
+}
+
+#[cfg(test)]
+mod session_id_length_tests {
+    use super::validate_session_id_length;
+
+    #[test]
+    fn accepts_up_to_64_unicode_characters() {
+        assert!(validate_session_id_length(None).is_ok());
+        assert!(validate_session_id_length(Some("")).is_ok());
+        assert!(validate_session_id_length(Some(&"x".repeat(64))).is_ok());
+        assert!(validate_session_id_length(Some(&"é".repeat(64))).is_ok());
+    }
+
+    #[test]
+    fn rejects_more_than_64_characters() {
+        assert!(validate_session_id_length(Some(&"x".repeat(65))).is_err());
+        assert!(validate_session_id_length(Some(&"é".repeat(65))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod observed_at_validation_tests {
+    use super::validate_observed_at;
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn future_observations_are_rejected() {
+        assert!(validate_observed_at(None).is_ok());
+        assert!(validate_observed_at(Some(Utc::now() - Duration::days(1))).is_ok());
+        assert!(validate_observed_at(Some(Utc::now() + Duration::days(1))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod observe_identifier_length_tests {
+    use super::MemoryService;
+    use memoria_core::MemoriaError;
+    use std::sync::Arc;
+
+    fn offline_service() -> MemoryService {
+        // The pool is never connected: validation must fail before storage.
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://test:test@127.0.0.1:1/test")
+            .unwrap();
+        let store = Arc::new(memoria_storage::SqlMemoryStore::new(pool, 3, "test".into()));
+        MemoryService::new(store, None, None)
+    }
+
+    #[tokio::test]
+    async fn observe_rejects_overlong_session_and_subject_before_persistence() {
+        let service = offline_service();
+        let messages = vec![serde_json::json!({"role": "user", "content": "I like tea"})];
+        let cases = [
+            (Some("s".repeat(65)), None, "session_id"),
+            (None, Some("é".repeat(129)), "subject_id"),
+        ];
+        for (session_id, subject_id, field) in cases {
+            let error = service
+                .observe_turn_on_branch("u", None, &messages, session_id, subject_id)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, MemoriaError::Validation(message) if message.contains(field)),
+                "{field}: {error:?}"
+            );
+        }
     }
 }
