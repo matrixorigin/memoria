@@ -97,7 +97,7 @@ def test_invalid_json_preserves_error_cause_budget_and_write_safety(
     with pytest.raises(MemoriaConnectionError) as caught:
         call(handle, operation=operation, retries=retries)
     assert isinstance(caught.value.__cause__, json.JSONDecodeError)
-    assert str(caught.value) == str(caught.value.__cause__)
+    assert str(caught.value) == "Invalid JSON response from Memoria API"
     assert len(requests) == attempts
     assert delays == [0.5, 1.0][: attempts - 1]
 

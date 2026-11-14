@@ -255,6 +255,29 @@ describe("listMemories cursor pagination", () => {
     client.close();
   });
 
+  it.each([2, 3])("stops a %i-page cursor cycle without counting repeated rows", async (cycleLength) => {
+    const f = mockFetch();
+    f.respondWithHandler((url) => {
+      const cursor = new URL(url).searchParams.get("cursor");
+      const index = cursor === null ? 0 : (Number.parseInt(cursor, 16) + 1) % cycleLength;
+      return { status: 200, body: {
+        items: [{ memory_id: memoryId(index), content: `m${index}`, memory_type: "semantic" }],
+        next_cursor: memoryId(index),
+      } };
+    });
+    const client = new MemoriaClient(buildApiConfig());
+    try {
+      const result = await client.listMemories({ userId: "u", limit: 1000 });
+      expect(f.calls).toHaveLength(cycleLength + 1);
+      expect(result.items.map((m) => m.memory_id))
+        .toEqual(Array.from({ length: cycleLength }, (_, i) => memoryId(i)));
+      expect(result.count).toBe(cycleLength);
+      expect(result.partial).toBe(true);
+    } finally {
+      client.close();
+    }
+  });
+
   it("stats counts memories beyond the first page", async () => {
     const f = mockFetch();
     serveMemories(f, 800);

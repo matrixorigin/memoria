@@ -161,6 +161,7 @@ export class MemoriaHttpTransport {
     const typeFilter = typeof args.memory_type === "string"
       ? `&memory_type=${encodeURIComponent(args.memory_type)}` : "";
     let cursor: string | null = null;
+    const seenCursors = new Set<string>();
     for (let page = 0; page < this.maxListPages && items.length < limit; page++) {
       const pageSize = Math.min(limit - items.length, API_LIST_PAGE_MAX);
       const query = cursor
@@ -177,12 +178,13 @@ export class MemoriaHttpTransport {
         throw new Error("Invalid Memoria API list page: next_cursor must be a string or null");
       }
       const next = typeof rawCursor === "string" && rawCursor ? rawCursor : null;
-      // A cursor that does not advance means the server repeated a page: drop it
+      // A cursor seen before means the server repeated a page: drop it
       // so rows are not counted twice, and stop so a misbehaving server cannot
       // loop us. The leftover cursor still marks the result as incomplete.
-      if (next !== null && next === cursor) {
+      if (next !== null && seenCursors.has(next)) {
         break;
       }
+      if (next !== null) seenCursors.add(next);
       items.push(...pageItems);
       cursor = next;
       if (!next || pageItems.length === 0) {
@@ -201,7 +203,10 @@ export class MemoriaHttpTransport {
   private async profile() {
     const data = await this.get("/v1/profiles/me");
     const rec = this.asRecord(data);
-    if (rec?.profile && typeof rec.profile === "string") {
+    if (!rec || (rec.profile !== null && typeof rec.profile !== "string")) {
+      throw new Error("Invalid Memoria API profile response");
+    }
+    if (rec.profile && typeof rec.profile === "string") {
       return rec.profile;
     }
     return "No profile memories found.";
@@ -303,7 +308,10 @@ export class MemoriaHttpTransport {
     if (args.description) body.description = args.description;
     const data = await this.post("/v1/snapshots", body);
     const rec = this.asRecord(data);
-    const name = rec?.name ?? args.name ?? "";
+    if (typeof rec?.name !== "string" || !rec.name.trim()) {
+      throw new Error("Invalid Memoria API snapshot creation response: missing name");
+    }
+    const name = rec.name;
     const ts = rec?.timestamp ?? rec?.created_at ?? "";
     return `Snapshot '${name}' created at ${ts}`;
   }
@@ -342,7 +350,7 @@ export class MemoriaHttpTransport {
   }
 
   private async rollbackSnapshot(args: Record<string, unknown>) {
-    return this.post(`/v1/snapshots/${encodeURIComponent(String(args.name))}/rollback`, {});
+    return this.post(this.resourcePath("snapshots", String(args.name), "/rollback"), {});
   }
 
   // ── Branches ──────────────────────────────────────────────────
@@ -359,22 +367,22 @@ export class MemoriaHttpTransport {
   }
 
   private async branchCheckout(args: Record<string, unknown>) {
-    return this.post(`/v1/branches/${encodeURIComponent(String(args.name))}/checkout`, {});
+    return this.post(this.resourcePath("branches", String(args.name), "/checkout"), {});
   }
 
   private async branchDelete(args: Record<string, unknown>) {
-    return this.delete(`/v1/branches/${encodeURIComponent(String(args.name))}`);
+    return this.delete(this.resourcePath("branches", String(args.name)));
   }
 
   private async branchMerge(args: Record<string, unknown>) {
     const body: Record<string, unknown> = {};
     if (args.strategy) body.strategy = args.strategy;
-    return this.post(`/v1/branches/${encodeURIComponent(String(args.source))}/merge`, body);
+    return this.post(this.resourcePath("branches", String(args.source), "/merge"), body);
   }
 
   private async branchDiff(args: Record<string, unknown>) {
     const limit = typeof args.limit === "number" ? args.limit : 50;
-    return this.get(`/v1/branches/${encodeURIComponent(String(args.source))}/diff?limit=${limit}`);
+    return this.get(this.resourcePath("branches", String(args.source), `/diff?limit=${limit}`));
   }
 
   // ── Health ──────────────────────────────────────────────────────
@@ -396,11 +404,16 @@ export class MemoriaHttpTransport {
   // ── HTTP primitives ───────────────────────────────────────────
 
   private memoryPath(id: string, suffix = ""): string {
+    return this.resourcePath("memories", id, suffix);
+  }
+
+  private resourcePath(collection: "memories" | "branches" | "snapshots", id: string, suffix = ""): string {
     // WHATWG URLs normalize even percent-encoded dot-only segments as navigation.
     if (id === "." || id === "..") {
-      throw new Error("memory_id must not be a dot-only path segment");
+      const selector = collection === "memories" ? "memory_id" : "name";
+      throw new Error(`${selector} must not be a dot-only path segment`);
     }
-    return `/v1/memories/${encodeURIComponent(id)}${suffix}`;
+    return `/v1/${collection}/${encodeURIComponent(id)}${suffix}`;
   }
 
   private headers(): Record<string, string> {

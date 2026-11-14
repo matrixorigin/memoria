@@ -12,6 +12,8 @@ that call ``self._client._request(...)`` or ``await self._client._arequest(...)`
 
 from __future__ import annotations
 
+import json
+import math
 import time
 from typing import Any
 
@@ -139,6 +141,8 @@ def _map_error(resp: httpx.Response) -> MemoriaAPIError:
         detail = resp.json().get("detail") or resp.text
     except Exception:
         detail = resp.text
+    if not isinstance(detail, str):
+        detail = json.dumps(detail, ensure_ascii=False, separators=(",", ":"))
     if not detail:
         detail = _HTTP_STATUS_TEXTS.get(resp.status_code, f"HTTP {resp.status_code}")
     sc = resp.status_code
@@ -174,6 +178,31 @@ class _HttpTransport:
     ) -> None:
         if not isinstance(api_key, str) or not api_key:
             raise MemoriaValidationError("api_key must be a non-empty string")
+        try:
+            valid_timeout = (
+                type(timeout) in (int, float) and timeout > 0 and math.isfinite(timeout)
+            )
+        except OverflowError:
+            valid_timeout = False
+        if not valid_timeout:
+            raise MemoriaValidationError("timeout must be a positive finite number")
+        try:
+            parsed_base_url = httpx.URL(base_url) if type(base_url) is str else None
+        except (httpx.InvalidURL, UnicodeError):
+            parsed_base_url = None
+        parsed_port = parsed_base_url.port if parsed_base_url is not None else None
+        if (
+            parsed_base_url is None
+            or parsed_base_url.scheme not in ("http", "https")
+            or not parsed_base_url.host
+            or not parsed_base_url.is_absolute_url
+            or "?" in base_url
+            or "#" in base_url
+            or (parsed_port is not None and not 1 <= parsed_port <= 65535)
+        ):
+            raise MemoriaValidationError(
+                "base_url must be an absolute HTTP URL with a valid port and no query or fragment"
+            )
         if type(max_retries) is not int or max_retries < 0:
             raise MemoriaValidationError("max_retries must be a non-negative integer")
         if type(retry_unsafe_writes) is not bool:
@@ -237,22 +266,26 @@ class _HttpTransport:
             if resp.is_success:
                 if resp.status_code == 204 or not resp.content:
                     return None
+                content_type = resp.headers.get("content-type", "").lower()
+                if "json" in content_type:
+                    try:
+                        return resp.json()
+                    except ValueError as exc:
+                        # The response was received, so a write may already
+                        # have committed. Only safe requests or explicit
+                        # unsafe-write opt-in may replay it.
+                        if attempt < self._max_retries and (
+                            _is_idempotent(method, idempotent) or self._retry_unsafe_writes
+                        ):
+                            time.sleep(_backoff(attempt))
+                            continue
+                        raise MemoriaConnectionError(
+                            "Invalid JSON response from Memoria API"
+                        ) from exc
                 try:
                     return resp.json()
-                except Exception as exc:
-                    # Bodies advertised as JSON can still fail to parse (an
-                    # error page behind a 200, a truncated response). The
-                    # request may have committed, so reuse the idempotency /
-                    # unsafe-write replay boundary; never leak decoder
-                    # exceptions past the MemoriaError hierarchy.
-                    if "json" not in resp.headers.get("content-type", "").lower():
-                        return resp.text
-                    if attempt < self._max_retries and (
-                        _is_idempotent(method, idempotent) or self._retry_unsafe_writes
-                    ):
-                        time.sleep(_backoff(attempt))
-                        continue
-                    raise MemoriaConnectionError(str(exc)) from exc
+                except Exception:
+                    return resp.text
 
             if (
                 _should_retry(method, resp.status_code, self._retry_unsafe_writes, idempotent)
@@ -311,22 +344,26 @@ class _HttpTransport:
             if resp.is_success:
                 if resp.status_code == 204 or not resp.content:
                     return None
+                content_type = resp.headers.get("content-type", "").lower()
+                if "json" in content_type:
+                    try:
+                        return resp.json()
+                    except ValueError as exc:
+                        # The response was received, so a write may already
+                        # have committed. Only safe requests or explicit
+                        # unsafe-write opt-in may replay it.
+                        if attempt < self._max_retries and (
+                            _is_idempotent(method, idempotent) or self._retry_unsafe_writes
+                        ):
+                            await asyncio.sleep(_backoff(attempt))
+                            continue
+                        raise MemoriaConnectionError(
+                            "Invalid JSON response from Memoria API"
+                        ) from exc
                 try:
                     return resp.json()
-                except Exception as exc:
-                    # Bodies advertised as JSON can still fail to parse (an
-                    # error page behind a 200, a truncated response). The
-                    # request may have committed, so reuse the idempotency /
-                    # unsafe-write replay boundary; never leak decoder
-                    # exceptions past the MemoriaError hierarchy.
-                    if "json" not in resp.headers.get("content-type", "").lower():
-                        return resp.text
-                    if attempt < self._max_retries and (
-                        _is_idempotent(method, idempotent) or self._retry_unsafe_writes
-                    ):
-                        await asyncio.sleep(_backoff(attempt))
-                        continue
-                    raise MemoriaConnectionError(str(exc)) from exc
+                except Exception:
+                    return resp.text
 
             if (
                 _should_retry(method, resp.status_code, self._retry_unsafe_writes, idempotent)
