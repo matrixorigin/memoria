@@ -68,9 +68,7 @@ fn parse_session_scope(
         .transpose()
 }
 
-fn parse_memory_types_opt(
-    types: Option<&Vec<String>>,
-) -> Result<Option<Vec<MemoryType>>, String> {
+fn parse_memory_types_opt(types: Option<&Vec<String>>) -> Result<Option<Vec<MemoryType>>, String> {
     let mut parsed = types
         .map(|ts| {
             ts.iter()
@@ -111,14 +109,12 @@ impl RetrieveRequest {
 
     pub fn retrieve_options(&self) -> Result<memoria_service::RetrieveOptions, String> {
         let memory_types = parse_memory_types_opt(self.memory_types.as_ref())?;
-        Ok(
-            memoria_service::RetrieveOptions::from_session_scope(
-                self.session_id.as_deref(),
-                self.session_scope()?,
-            )
-            .with_subject_id(self.subject_id.clone())
-            .with_memory_types(memory_types),
+        Ok(memoria_service::RetrieveOptions::from_session_scope(
+            self.session_id.as_deref(),
+            self.session_scope()?,
         )
+        .with_subject_id(self.subject_id.clone())
+        .with_memory_types(memory_types))
     }
 }
 
@@ -150,14 +146,12 @@ impl SearchRequest {
 
     pub fn retrieve_options(&self) -> Result<memoria_service::RetrieveOptions, String> {
         let memory_types = parse_memory_types_opt(self.memory_types.as_ref())?;
-        Ok(
-            memoria_service::RetrieveOptions::from_session_scope(
-                self.session_id.as_deref(),
-                self.session_scope()?,
-            )
-            .with_subject_id(self.subject_id.clone())
-            .with_memory_types(memory_types),
+        Ok(memoria_service::RetrieveOptions::from_session_scope(
+            self.session_id.as_deref(),
+            self.session_scope()?,
         )
+        .with_subject_id(self.subject_id.clone())
+        .with_memory_types(memory_types))
     }
 }
 
@@ -193,8 +187,7 @@ impl StructuredQueryRequest {
 
         let subject_id = normalized_filter("subject_id", self.subject_id.as_deref())?;
         let session_id = normalized_filter("session_id", self.session_id.as_deref())?;
-        let normalized_trust_tier =
-            normalized_filter("trust_tier", self.trust_tier.as_deref())?;
+        let normalized_trust_tier = normalized_filter("trust_tier", self.trust_tier.as_deref())?;
         let branch = normalized_filter("branch", self.branch.as_deref())?;
         let trust_tier = normalized_trust_tier
             .as_deref()
@@ -349,14 +342,12 @@ impl CorrectByQueryRequest {
 
     pub fn retrieve_options(&self) -> Result<memoria_service::RetrieveOptions, String> {
         let memory_types = parse_memory_types_opt(self.memory_types.as_ref())?;
-        Ok(
-            memoria_service::RetrieveOptions::from_session_scope(
-                self.session_id.as_deref(),
-                parse_session_scope(self.session_scope.as_deref())?,
-            )
-            .with_subject_id(self.subject_id.clone())
-            .with_memory_types(memory_types),
+        Ok(memoria_service::RetrieveOptions::from_session_scope(
+            self.session_id.as_deref(),
+            parse_session_scope(self.session_scope.as_deref())?,
         )
+        .with_subject_id(self.subject_id.clone())
+        .with_memory_types(memory_types))
     }
 }
 
@@ -456,7 +447,7 @@ pub struct MemoryResponse {
 impl From<Memory> for MemoryResponse {
     fn from(mut m: Memory) -> Self {
         if let Some(metadata) = m.extra_metadata.as_mut() {
-            metadata.remove(memoria_core::STORE_REQUEST_HASH_FIELD);
+            metadata.retain(|key, _| !memoria_core::is_reserved_metadata_key(key));
         }
         Self {
             memory_id: m.memory_id,
@@ -475,6 +466,71 @@ impl From<Memory> for MemoryResponse {
             // 空 map 在响应里归一为 None（省略），与读取侧「"{}" → None」一致：新写记录直接
             // 返回内存对象时也不会出现「POST 带 {} 而后续 list/get 无该字段」的不一致。
             extra_metadata: m.extra_metadata.filter(|md| !md.is_empty()),
+        }
+    }
+}
+
+/// Operator disable. `subject_id`, when set,
+/// fences the target: a memory of another subject is reported as not found.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryGovernanceRequest {
+    pub subject_id: Option<String>,
+    /// Recorded with the disable marker.
+    #[serde(default)]
+    pub reason: String,
+    pub branch: Option<String>,
+}
+
+/// Restore and erase do not record a reason; reject it rather than silently ignoring it.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryLifecycleRequest {
+    pub subject_id: Option<String>,
+    pub branch: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct DisabledMemoriesQuery {
+    pub subject_id: Option<String>,
+    pub limit: Option<i64>,
+    pub branch: Option<String>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct DisabledMemoriesResponse {
+    pub items: Vec<DisabledMemoryResponse>,
+    pub next_cursor: Option<String>,
+}
+
+/// A disabled memory with its disable marker lifted out of the (reserved) metadata.
+#[derive(Serialize)]
+pub struct DisabledMemoryResponse {
+    #[serde(flatten)]
+    pub memory: MemoryResponse,
+    pub disabled_at: Option<String>,
+    pub disabled_reason: Option<String>,
+}
+
+impl From<Memory> for DisabledMemoryResponse {
+    fn from(memory: Memory) -> Self {
+        let marker = memory
+            .extra_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(memoria_core::DISABLED_FIELD))
+            .cloned();
+        let field = |name: &str| {
+            marker
+                .as_ref()
+                .and_then(|marker| marker.get(name))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        Self {
+            disabled_at: field("at"),
+            disabled_reason: field("reason").filter(|reason| !reason.is_empty()),
+            memory: memory.into(),
         }
     }
 }
@@ -668,6 +724,47 @@ mod tests {
         StructuredQueryRequest,
     };
     use memoria_core::MemoryType;
+
+    #[test]
+    fn disabled_response_exposes_reason_without_internal_metadata() {
+        let memory: memoria_core::Memory = serde_json::from_value(serde_json::json!({
+            "memory_id":"synthetic-memory", "user_id":"owner", "memory_type":"semantic",
+            "content":"Synthetic fact", "initial_confidence":0.65, "source_event_ids":[],
+            "is_active":false, "access_count":0, "trust_tier":"T3",
+            "extra_metadata":{
+                "scene":"support",
+                "_memoria_disabled":{"at":"2026-01-01T00:00:00Z","reason":"rejected"},
+                "_memoria_store_request_sha256":"internal-fingerprint"
+            }
+        }))
+        .unwrap();
+        let output = serde_json::to_value(super::DisabledMemoryResponse::from(memory)).unwrap();
+        assert_eq!(output["disabled_reason"], "rejected");
+        assert_eq!(output["disabled_at"], "2026-01-01T00:00:00Z");
+        assert_eq!(
+            output["extra_metadata"],
+            serde_json::json!({"scene":"support"})
+        );
+    }
+
+    #[test]
+    fn governance_conflicts_are_not_internal_server_errors() {
+        let (status, _) = crate::routes::memory::api_err_typed(
+            memoria_core::MemoriaError::Conflict("memory changed".into()),
+        );
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn callers_cannot_filter_on_governance_marker() {
+        assert!(
+            memoria_storage::validate_extra_metadata_filter(&std::collections::HashMap::from([(
+                "_memoria_disabled".into(),
+                serde_json::json!(true)
+            )]))
+            .is_err()
+        );
+    }
 
     #[test]
     fn memory_type_parser_deduplicates_before_sql_option_construction() {

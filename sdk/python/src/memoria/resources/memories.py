@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 from ..exceptions import MemoriaValidationError
-from ..models import Memory, MemoryPage, PurgeResult, RetrieveResult
+from ..models import DisabledMemoryPage, Memory, MemoryPage, PurgeResult, RetrieveResult
 
 if TYPE_CHECKING:
     from .._http import _HttpTransport
@@ -594,6 +594,66 @@ class MemoriesResource:
         params = _strip_none({"reason": reason, "branch": branch})
         self._client._request("DELETE", _memory_path(id), params=params)
 
+    # Operator governance. ``subject_id`` fences the target: a memory of another
+    # subject is reported as not found.
+    def disable(
+        self,
+        id: str,
+        *,
+        subject_id: str | None = None,
+        reason: str | None = None,
+        branch: str | None = None,
+    ) -> Memory:
+        """Take a memory out of retrieval while keeping it restorable."""
+        body = _strip_none({"subject_id": subject_id, "reason": reason, "branch": branch})
+        data = self._client._request(
+            "POST", _memory_path(id, "/disable"), json=body, idempotent=False
+        )
+        return Memory.from_dict(data)
+
+    def restore(
+        self,
+        id: str,
+        *,
+        subject_id: str | None = None,
+        branch: str | None = None,
+    ) -> Memory:
+        """Reactivate a memory disabled with :meth:`disable`."""
+        body = _strip_none({"subject_id": subject_id, "branch": branch})
+        data = self._client._request(
+            "POST", _memory_path(id, "/restore"), json=body, idempotent=False
+        )
+        return Memory.from_dict(data)
+
+    def erase(
+        self,
+        id: str,
+        *,
+        subject_id: str | None = None,
+        branch: str | None = None,
+    ) -> None:
+        """Erase a non-superseded row's content, retaining an idempotency receipt if needed.
+
+        This is not deletion across graph data, edit logs, history, branches or backups.
+        """
+        body = _strip_none({"subject_id": subject_id, "branch": branch})
+        self._client._request("POST", _memory_path(id, "/erase"), json=body, idempotent=False)
+
+    def list_disabled(
+        self,
+        *,
+        subject_id: str | None = None,
+        limit: int | None = None,
+        branch: str | None = None,
+        cursor: str | None = None,
+    ) -> DisabledMemoryPage:
+        """Disabled memories, most recently disabled first."""
+        params = _strip_none(
+            {"subject_id": subject_id, "limit": limit, "branch": branch, "cursor": cursor}
+        )
+        data = self._client._request("GET", "/v1/memories/disabled", params=params)
+        return DisabledMemoryPage.from_dict(data)
+
     def purge(
         self,
         *,
@@ -903,6 +963,60 @@ class AsyncMemoriesResource:
     ) -> None:
         params = _strip_none({"reason": reason, "branch": branch})
         await self._client._arequest("DELETE", _memory_path(id), params=params)
+
+    async def disable(
+        self,
+        id: str,
+        *,
+        subject_id: str | None = None,
+        reason: str | None = None,
+        branch: str | None = None,
+    ) -> Memory:
+        body = _strip_none({"subject_id": subject_id, "reason": reason, "branch": branch})
+        data = await self._client._arequest(
+            "POST", _memory_path(id, "/disable"), json=body, idempotent=False
+        )
+        return Memory.from_dict(data)
+
+    async def restore(
+        self,
+        id: str,
+        *,
+        subject_id: str | None = None,
+        branch: str | None = None,
+    ) -> Memory:
+        body = _strip_none({"subject_id": subject_id, "branch": branch})
+        data = await self._client._arequest(
+            "POST", _memory_path(id, "/restore"), json=body, idempotent=False
+        )
+        return Memory.from_dict(data)
+
+    async def erase(
+        self,
+        id: str,
+        *,
+        subject_id: str | None = None,
+        branch: str | None = None,
+    ) -> None:
+        """Erase row content (retaining an idempotency receipt), not all historical copies."""
+        body = _strip_none({"subject_id": subject_id, "branch": branch})
+        await self._client._arequest(
+            "POST", _memory_path(id, "/erase"), json=body, idempotent=False
+        )
+
+    async def list_disabled(
+        self,
+        *,
+        subject_id: str | None = None,
+        limit: int | None = None,
+        branch: str | None = None,
+        cursor: str | None = None,
+    ) -> DisabledMemoryPage:
+        params = _strip_none(
+            {"subject_id": subject_id, "limit": limit, "branch": branch, "cursor": cursor}
+        )
+        data = await self._client._arequest("GET", "/v1/memories/disabled", params=params)
+        return DisabledMemoryPage.from_dict(data)
 
     async def purge(
         self,

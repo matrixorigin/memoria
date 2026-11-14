@@ -378,6 +378,74 @@ async fn test_solo_owner_group_key_can_write_on_main() {
 
 #[tokio::test]
 #[serial]
+async fn test_group_governance_honors_explicit_target_in_both_checkout_states() {
+    let server = spawn_server().await;
+    register_user(&server, "bob").await;
+    let group = create_group_with_members(&server, "alice", &["alice", "bob"]).await;
+    let group_id = group["group_id"].as_str().unwrap();
+    let key = create_group_key(&server, "alice", group_id).await;
+    let auth = format!("Bearer {key}");
+    create_branch(&server, &auth, "seed").await;
+    checkout_branch(&server, &auth, "seed").await;
+    let memory = store_memory(&server, &auth, "Synthetic shared governance fact").await;
+    let id = memory["memory_id"].as_str().unwrap();
+    apply_branch(&server, &auth, "seed", json!({"adds":[id]})).await;
+    checkout_branch(&server, &auth, "main").await;
+    create_branch(&server, &auth, "review").await;
+    // On main, an explicit branch is writable without changing checkout.
+    for action in ["disable", "restore"] {
+        let response = server
+            .client
+            .post(format!("{}/v1/memories/{id}/{action}", server.base))
+            .header("Authorization", &auth)
+            .json(&json!({"branch":"review"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            200,
+            "explicit review {action} was rejected"
+        );
+    }
+    checkout_branch(&server, &auth, "review").await;
+    // A non-main checkout must not authorize an explicit shared-main mutation.
+    for action in ["disable", "restore", "erase"] {
+        let response = server
+            .client
+            .post(format!("{}/v1/memories/{id}/{action}", server.base))
+            .header("Authorization", &auth)
+            .json(&json!({"branch":"main"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            403,
+            "non-main checkout bypassed {action} protection"
+        );
+    }
+    checkout_branch(&server, &auth, "main").await;
+    let response = server
+        .client
+        .post(format!("{}/v1/memories/{id}/erase", server.base))
+        .header("Authorization", &auth)
+        .json(&json!({"branch":"review"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    let main = list_memories(&server, &auth).await;
+    assert!(main["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["memory_id"] == id));
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
 async fn test_owner_scoped_master_cannot_enter_group_database() {
     let server = spawn_server().await;
     let group = create_group(&server, "alice").await;
