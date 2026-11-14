@@ -112,7 +112,7 @@ fn classify_fulltext_error_code(number: u16, message: &str) -> Option<FulltextFa
     }
 }
 
-fn classify_fulltext_error(error: &sqlx::Error) -> Option<FulltextFailure> {
+fn mysql_error_details(error: &sqlx::Error) -> Option<(u16, &str)> {
     use sqlx::mysql::MySqlDatabaseError;
 
     error
@@ -122,9 +122,12 @@ fn classify_fulltext_error(error: &sqlx::Error) -> Option<FulltextFailure> {
                 .as_error()
                 .downcast_ref::<MySqlDatabaseError>()
         })
-        .and_then(|mysql_error| {
-            classify_fulltext_error_code(mysql_error.number(), mysql_error.message())
-        })
+        .map(|mysql_error| (mysql_error.number(), mysql_error.message()))
+}
+
+fn classify_fulltext_error(error: &sqlx::Error) -> Option<FulltextFailure> {
+    mysql_error_details(error)
+        .and_then(|(number, message)| classify_fulltext_error_code(number, message))
 }
 
 /// Rows of a FULLTEXT query, or a signal that the index is unusable and the
@@ -7103,9 +7106,18 @@ mod tests {
             "SELECT definitely_missing_fulltext_column FROM {table} LIMIT 1"
         ))
         .fetch_all(&store.pool)
-        .await;
+        .await
+        .expect_err("missing column must return a database error");
+        let (number, message) =
+            super::mysql_error_details(&unrelated).expect("downcast MySQL database error");
+        assert_ne!(number, 0);
+        assert!(
+            message.contains("definitely_missing_fulltext_column")
+                || message.contains("column")
+        );
+        assert_eq!(super::classify_fulltext_error(&unrelated), None);
         assert!(matches!(
-            super::fulltext_rows_or_degraded(unrelated),
+            super::fulltext_rows_or_degraded(Err(unrelated)),
             Err(memoria_core::MemoriaError::Database(_))
         ));
 
