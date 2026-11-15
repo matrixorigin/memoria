@@ -88,11 +88,31 @@ pub(crate) fn db_err(e: sqlx::Error) -> MemoriaError {
     MemoriaError::Database(e.to_string())
 }
 
-/// MatrixOne currently reports an empty tokenized full-text pattern as generic
-/// internal error 20101. The code is shared by many internal errors, so retain
-/// the specific message check in one place until MatrixOne exposes a dedicated
-/// error code. See MatrixOne `pkg/fulltext/fulltext.go`.
-fn is_empty_fulltext_pattern_error(error: &sqlx::Error) -> bool {
+/// MatrixOne reports both recognized FULLTEXT failures through generic error
+/// codes (20101 internal, 20301 invalid input) shared with unrelated errors, so
+/// retain the specific message checks in one place until MatrixOne exposes
+/// dedicated codes. See MatrixOne `pkg/fulltext/fulltext.go`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FulltextFailure {
+    /// The query tokenized to nothing; there is nothing to search for.
+    EmptyPattern,
+    /// The FULLTEXT secondary index is unusable (#247). The rows may still
+    /// match, so callers must run their scoped LIKE fallback instead.
+    IndexUnavailable,
+}
+
+fn classify_fulltext_error_code(number: u16, message: &str) -> Option<FulltextFailure> {
+    if number == 20101 && message.contains("empty pattern") {
+        Some(FulltextFailure::EmptyPattern)
+    } else if number == 20301 && message.contains("column word does not exist") {
+        // `word` is a column of MatrixOne's internal FULLTEXT index table.
+        Some(FulltextFailure::IndexUnavailable)
+    } else {
+        None
+    }
+}
+
+fn mysql_error_details(error: &sqlx::Error) -> Option<(u16, &str)> {
     use sqlx::mysql::MySqlDatabaseError;
 
     error
@@ -102,20 +122,110 @@ fn is_empty_fulltext_pattern_error(error: &sqlx::Error) -> bool {
                 .as_error()
                 .downcast_ref::<MySqlDatabaseError>()
         })
-        .is_some_and(|mysql_error| {
-            mysql_error.number() == 20101
-                && mysql_error.message().contains("empty pattern")
-        })
+        .map(|mysql_error| (mysql_error.number(), mysql_error.message()))
 }
 
-pub(crate) fn fulltext_rows_or_empty(
-    result: Result<Vec<sqlx::mysql::MySqlRow>, sqlx::Error>,
-) -> Result<Vec<sqlx::mysql::MySqlRow>, MemoriaError> {
+fn classify_fulltext_error(error: &sqlx::Error) -> Option<FulltextFailure> {
+    mysql_error_details(error)
+        .and_then(|(number, message)| classify_fulltext_error_code(number, message))
+}
+
+/// Rows of a FULLTEXT query, or a signal that the index is unusable and the
+/// caller must answer the same scoped query through LIKE.
+#[derive(Debug)]
+pub(crate) enum FulltextRows<T> {
+    Rows(Vec<T>),
+    IndexUnavailable,
+}
+
+fn resolve_fulltext_rows<T, E>(
+    result: Result<Vec<T>, E>,
+    classify: impl Fn(&E) -> Option<FulltextFailure>,
+    into_error: impl FnOnce(E) -> MemoriaError,
+) -> Result<FulltextRows<T>, MemoriaError> {
     match result {
-        Ok(rows) => Ok(rows),
-        Err(error) if is_empty_fulltext_pattern_error(&error) => Ok(Vec::new()),
-        Err(error) => Err(db_err(error)),
+        Ok(rows) => Ok(FulltextRows::Rows(rows)),
+        Err(error) => match classify(&error) {
+            Some(FulltextFailure::EmptyPattern) => Ok(FulltextRows::Rows(Vec::new())),
+            Some(FulltextFailure::IndexUnavailable) => {
+                tracing::warn!("FULLTEXT index unavailable; degrading to scoped LIKE search");
+                Ok(FulltextRows::IndexUnavailable)
+            }
+            None => Err(into_error(error)),
+        },
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// MatrixOne cannot be driven into the broken-index state on demand, so
+    /// database tests set this to run the real degraded path end to end.
+    static SIMULATE_UNAVAILABLE_FULLTEXT_INDEX: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn fulltext_rows_or_degraded(
+    result: Result<Vec<sqlx::mysql::MySqlRow>, sqlx::Error>,
+) -> Result<FulltextRows<sqlx::mysql::MySqlRow>, MemoriaError> {
+    #[cfg(test)]
+    if SIMULATE_UNAVAILABLE_FULLTEXT_INDEX.with(std::cell::Cell::get) {
+        // The real FULLTEXT query still ran, so its SQL errors still surface.
+        return result
+            .map(|_| FulltextRows::IndexUnavailable)
+            .map_err(db_err);
+    }
+    resolve_fulltext_rows(result, classify_fulltext_error, db_err)
+}
+
+/// Upper bound on LIKE predicates in one degraded query; matches the
+/// FULLTEXT batch size.
+const FULLTEXT_LIKE_FALLBACK_MAX_TERMS: usize = 64;
+
+/// Distinct lowercase `%term%` patterns for the degraded LIKE search.
+pub(crate) fn fulltext_like_fallback_patterns(query: &str) -> Vec<String> {
+    let safe = sanitize_fulltext_query(query).to_lowercase();
+    let mut seen = std::collections::HashSet::new();
+    safe.split_whitespace()
+        .filter(|word| seen.insert(*word))
+        .take(FULLTEXT_LIKE_FALLBACK_MAX_TERMS)
+        .map(|word| format!("%{}%", sanitize_like_pattern(word)))
+        .collect()
+}
+
+/// Push `, CAST(<matched terms> AS FLOAT) AS ft_score`; FLOAT keeps the
+/// column readable by both the memory (f64/f32) and graph (f32) decoders.
+pub(crate) fn push_like_fallback_score<'a>(
+    builder: &mut QueryBuilder<'a, MySql>,
+    patterns: &'a [String],
+) {
+    builder.push(", CAST((");
+    for (index, pattern) in patterns.iter().enumerate() {
+        if index > 0 {
+            builder.push(" + ");
+        }
+        builder
+            .push("CASE WHEN LOWER(content) LIKE ")
+            .push_bind(pattern.as_str())
+            .push(" THEN 1 ELSE 0 END");
+    }
+    builder.push(") AS FLOAT) AS ft_score");
+}
+
+/// Push ` AND (LOWER(content) LIKE ? OR ...)`, the OR semantics FULLTEXT uses.
+pub(crate) fn push_like_fallback_predicate<'a>(
+    builder: &mut QueryBuilder<'a, MySql>,
+    patterns: &'a [String],
+) {
+    builder.push(" AND (");
+    for (index, pattern) in patterns.iter().enumerate() {
+        if index > 0 {
+            builder.push(" OR ");
+        }
+        builder
+            .push("LOWER(content) LIKE ")
+            .push_bind(pattern.as_str());
+    }
+    builder.push(")");
 }
 
 fn fulltext_score(row: &sqlx::mysql::MySqlRow) -> Option<f64> {
@@ -6080,7 +6190,73 @@ impl SqlMemoryStore {
         // MatrixOne 4.1.2 can return no rows when re-executing a prepared MATCH
         // query. Use the text protocol, as in vector search, with escaped scope
         // literals and an already-sanitized query. Hydration still uses binds.
-        fulltext_rows_or_empty(sqlx::raw_sql(&sql).fetch_all(&self.pool).await)
+        match fulltext_rows_or_degraded(sqlx::raw_sql(&sql).fetch_all(&self.pool).await)? {
+            FulltextRows::Rows(rows) => Ok(rows),
+            FulltextRows::IndexUnavailable => {
+                self.search_like_fallback_batch(
+                    table,
+                    user_id,
+                    safe,
+                    limit,
+                    session_id,
+                    subject_id,
+                    memory_types,
+                    include_memory,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Degraded form of `search_fulltext_batch` for an unusable FULLTEXT
+    /// index: the same owner/session/subject/type scope and limit, matching
+    /// any term by case-insensitive substring and ranking by matched terms.
+    #[allow(clippy::too_many_arguments)]
+    async fn search_like_fallback_batch(
+        &self,
+        table: &str,
+        user_id: &str,
+        safe: &str,
+        limit: i64,
+        session_id: Option<&str>,
+        subject_id: Option<&str>,
+        memory_types: Option<&[MemoryType]>,
+        include_memory: bool,
+    ) -> Result<Vec<sqlx::mysql::MySqlRow>, MemoriaError> {
+        let patterns = fulltext_like_fallback_patterns(safe);
+        if patterns.is_empty() || limit <= 0 {
+            return Ok(Vec::new());
+        }
+        let columns = if include_memory {
+            FULLTEXT_MEMORY_COLUMNS
+        } else {
+            "memory_id"
+        };
+        let mut stmt = QueryBuilder::<MySql>::new(format!("SELECT {columns}"));
+        push_like_fallback_score(&mut stmt, &patterns);
+        stmt.push(format!(" FROM {table} WHERE user_id = "))
+            .push_bind(user_id)
+            .push(" AND is_active = 1");
+        if let Some(session) = session_id {
+            stmt.push(" AND (session_id = ")
+                .push_bind(session)
+                .push(" OR session_id IS NULL)");
+        }
+        if let Some(subject) = subject_id {
+            stmt.push(" AND subject_id = ").push_bind(subject);
+        }
+        if let Some(types) = memory_types.filter(|types| !types.is_empty()) {
+            stmt.push(" AND memory_type IN (");
+            let mut separated = stmt.separated(", ");
+            for memory_type in types {
+                separated.push_bind(memory_type.to_string());
+            }
+            stmt.push(")");
+        }
+        push_like_fallback_predicate(&mut stmt, &patterns);
+        stmt.push(" ORDER BY ft_score DESC, memory_id ASC LIMIT ")
+            .push_bind(limit);
+        stmt.build().fetch_all(&self.pool).await.map_err(db_err)
     }
 
     /// Pure MatrixOne full-text search with exact structured SQL pre-filters.
@@ -6116,58 +6292,75 @@ impl SqlMemoryStore {
         let mut metadata_filters: Vec<_> = extra_metadata_filter.iter().collect();
         metadata_filters.sort_by_key(|(key, _)| *key);
 
-        let mut sql = format!(
+        let metadata_values = metadata_filters
+            .iter()
+            .map(|(key, value)| Ok(((*key).clone(), serde_json::to_string(value)?)))
+            .collect::<Result<Vec<_>, MemoriaError>>()?;
+        // Shared by the FULLTEXT query and its degraded LIKE form so both
+        // apply exactly the same structured scope.
+        let push_scope = |stmt: &mut QueryBuilder<'_, MySql>| {
+            stmt.push(format!(" FROM {table} WHERE user_id = "))
+                .push_bind(user_id.to_string())
+                .push(" AND is_active = 1");
+            if let Some(types) = memory_types.filter(|types| !types.is_empty()) {
+                stmt.push(" AND memory_type IN (");
+                let mut separated = stmt.separated(", ");
+                for memory_type in types {
+                    separated.push_bind(memory_type.to_string());
+                }
+                stmt.push(")");
+            }
+            if let Some(value) = session_id {
+                stmt.push(" AND session_id = ").push_bind(value.to_string());
+            }
+            if let Some(value) = trust_tier {
+                stmt.push(" AND trust_tier = ").push_bind(value.to_string());
+            }
+            if let Some(value) = subject_id {
+                stmt.push(" AND subject_id = ").push_bind(value.to_string());
+            }
+            for (key, value) in &metadata_values {
+                stmt.push(format!(
+                    " AND json_extract(extra_metadata, '$.{key}') = CAST("
+                ))
+                .push_bind(value.clone())
+                .push(" AS JSON)");
+            }
+        };
+        const LITE_COLUMNS: &str =
             "SELECT memory_id, user_id, author_id, subject_id, memory_type, content, \
              session_id, is_active, superseded_by, trust_tier, \
              initial_confidence, observed_at, created_at, updated_at, \
-             CAST(extra_metadata AS CHAR) AS extra_meta, \
-             MATCH(content) AGAINST('{safe_query}' IN BOOLEAN MODE) AS ft_score \
-             FROM {table} WHERE user_id = ? AND is_active = 1"
-        );
-        if let Some(types) = memory_types.filter(|types| !types.is_empty()) {
-            sql.push_str(" AND memory_type IN (");
-            sql.push_str(&vec!["?"; types.len()].join(", "));
-            sql.push(')');
-        }
-        if session_id.is_some() {
-            sql.push_str(" AND session_id = ?");
-        }
-        if trust_tier.is_some() {
-            sql.push_str(" AND trust_tier = ?");
-        }
-        if subject_id.is_some() {
-            sql.push_str(" AND subject_id = ?");
-        }
-        for (key, _) in &metadata_filters {
-            sql.push_str(&format!(
-                " AND json_extract(extra_metadata, '$.{key}') = CAST(? AS JSON)"
-            ));
-        }
-        sql.push_str(&format!(
-            " AND MATCH(content) AGAINST('{safe_query}' IN BOOLEAN MODE) \
-             ORDER BY ft_score DESC, memory_id DESC LIMIT ?"
+             CAST(extra_metadata AS CHAR) AS extra_meta";
+
+        let mut stmt = QueryBuilder::<MySql>::new(format!(
+            "{LITE_COLUMNS}, MATCH(content) AGAINST('{safe_query}' IN BOOLEAN MODE) AS ft_score"
         ));
+        push_scope(&mut stmt);
+        stmt.push(format!(
+            " AND MATCH(content) AGAINST('{safe_query}' IN BOOLEAN MODE) \
+             ORDER BY ft_score DESC, memory_id DESC LIMIT "
+        ))
+        .push_bind(limit);
 
-        let mut statement = sqlx::query(&sql).bind(user_id);
-        if let Some(types) = memory_types.filter(|types| !types.is_empty()) {
-            for memory_type in types {
-                statement = statement.bind(memory_type.to_string());
+        let rows = match fulltext_rows_or_degraded(stmt.build().fetch_all(&self.pool).await)? {
+            FulltextRows::Rows(rows) => rows,
+            FulltextRows::IndexUnavailable => {
+                let patterns = fulltext_like_fallback_patterns(&safe_query);
+                let mut fallback = QueryBuilder::<MySql>::new(LITE_COLUMNS);
+                push_like_fallback_score(&mut fallback, &patterns);
+                push_scope(&mut fallback);
+                push_like_fallback_predicate(&mut fallback, &patterns);
+                fallback
+                    .push(" ORDER BY ft_score DESC, memory_id DESC LIMIT ")
+                    .push_bind(limit);
+                fallback
+                    .build()
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(db_err)?
             }
-        }
-        if let Some(value) = session_id {
-            statement = statement.bind(value);
-        }
-        if let Some(value) = trust_tier {
-            statement = statement.bind(value);
-        }
-        if let Some(value) = subject_id {
-            statement = statement.bind(value);
-        }
-        for (_, value) in metadata_filters {
-            statement = statement.bind(serde_json::to_string(value)?);
-        }
-
-        let rows = fulltext_rows_or_empty(statement.bind(limit).fetch_all(&self.pool).await)?;
+        };
         rows.iter()
             .map(|row| {
                 let mut memory = row_to_memory_lite(row)?;
@@ -6707,6 +6900,351 @@ mod tests {
     use sqlx::mysql::MySqlPoolOptions;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex, OnceLock};
+
+    #[test]
+    fn broken_fulltext_index_requests_fallback_and_other_sql_errors_propagate() {
+        use super::{
+            classify_fulltext_error_code, resolve_fulltext_rows, FulltextFailure, FulltextRows,
+        };
+        assert_eq!(
+            classify_fulltext_error_code(20101, "empty pattern"),
+            Some(FulltextFailure::EmptyPattern)
+        );
+        assert_eq!(
+            classify_fulltext_error_code(20301, "invalid input: column word does not exist"),
+            Some(FulltextFailure::IndexUnavailable)
+        );
+        assert_eq!(
+            classify_fulltext_error_code(20301, "invalid input: unrelated failure"),
+            None
+        );
+        assert_eq!(
+            classify_fulltext_error_code(20101, "unexpected internal error"),
+            None
+        );
+        assert_eq!(
+            classify_fulltext_error_code(1064, "column word does not exist"),
+            None
+        );
+
+        let resolve = |result: Result<Vec<u8>, (u16, &'static str)>| {
+            resolve_fulltext_rows(
+                result,
+                |(number, message)| classify_fulltext_error_code(*number, message),
+                |(number, message)| {
+                    memoria_core::MemoriaError::Database(format!("{number}: {message}"))
+                },
+            )
+        };
+        assert!(matches!(resolve(Ok(vec![1])), Ok(FulltextRows::Rows(rows)) if rows == vec![1]));
+        // An empty tokenized pattern really has nothing to match.
+        assert!(
+            matches!(resolve(Err((20101, "empty pattern"))), Ok(FulltextRows::Rows(rows)) if rows.is_empty())
+        );
+        // A broken index is never reported as an authoritative empty result.
+        assert!(matches!(
+            resolve(Err((20301, "invalid input: column word does not exist"))),
+            Ok(FulltextRows::IndexUnavailable)
+        ));
+        assert!(matches!(
+            resolve(Err((1064, "syntax error"))),
+            Err(memoria_core::MemoriaError::Database(message)) if message == "1064: syntax error"
+        ));
+    }
+
+    #[test]
+    fn like_fallback_patterns_are_distinct_literal_and_bounded() {
+        let patterns = super::fulltext_like_fallback_patterns("Rust rust 50%_off a'b");
+        assert_eq!(patterns, vec!["%rust%", "%50%", "%\\_off%", "%a%", "%b%"]);
+        assert!(super::fulltext_like_fallback_patterns("____ |!#").is_empty());
+        let many = (0..100)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            super::fulltext_like_fallback_patterns(&many).len(),
+            super::FULLTEXT_LIKE_FALLBACK_MAX_TERMS
+        );
+    }
+
+    /// The degraded searches must return matching rows under the caller's
+    /// scope through the real entry points. The broken index is simulated
+    /// (see `SIMULATE_UNAVAILABLE_FULLTEXT_INDEX`); the queries run against
+    /// the CI database (`DATABASE_URL`) and the test is skipped without one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unavailable_fulltext_index_returns_scoped_like_candidates() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("DATABASE_URL not set; skipping FULLTEXT fallback database test");
+            return;
+        };
+        let dim = std::env::var("EMBEDDING_DIM")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1024);
+        let store = SqlMemoryStore::connect(&url, dim, uuid::Uuid::new_v4().to_string())
+            .await
+            .expect("connect");
+        store.migrate().await.expect("migrate");
+        let user = format!("ft_fallback_{}", uuid::Uuid::new_v4().simple());
+        let table = store.t("mem_memories");
+        let rows: [(&str, &str, &str, Option<&str>, &str, MemoryType, bool, &str); 8] = [
+            (
+                "both",
+                &user,
+                "Rust ownership and borrow rules",
+                Some("s1"),
+                "me",
+                MemoryType::Semantic,
+                true,
+                r#"{"tag":"a"}"#,
+            ),
+            (
+                "one",
+                &user,
+                "borrow checker notes",
+                Some("s1"),
+                "me",
+                MemoryType::Semantic,
+                true,
+                r#"{"tag":"a"}"#,
+            ),
+            (
+                "unscoped",
+                &user,
+                "rust without a session",
+                None,
+                "me",
+                MemoryType::Semantic,
+                true,
+                r#"{"tag":"a"}"#,
+            ),
+            (
+                "nomatch",
+                &user,
+                "unrelated text",
+                Some("s1"),
+                "me",
+                MemoryType::Semantic,
+                true,
+                r#"{"tag":"a"}"#,
+            ),
+            (
+                "session",
+                &user,
+                "rust in another session",
+                Some("s2"),
+                "me",
+                MemoryType::Semantic,
+                true,
+                r#"{"tag":"a"}"#,
+            ),
+            (
+                "subject",
+                &user,
+                "rust for someone else",
+                Some("s1"),
+                "you",
+                MemoryType::Semantic,
+                true,
+                r#"{"tag":"a"}"#,
+            ),
+            (
+                "type",
+                &user,
+                "rust episode",
+                Some("s1"),
+                "me",
+                MemoryType::Episodic,
+                true,
+                r#"{"tag":"a"}"#,
+            ),
+            (
+                "inactive",
+                &user,
+                "rust retired",
+                Some("s1"),
+                "me",
+                MemoryType::Semantic,
+                false,
+                r#"{"tag":"b"}"#,
+            ),
+        ];
+        for (suffix, owner, content, session, subject, kind, active, metadata) in rows {
+            sqlx::query(&format!(
+                "INSERT INTO {table} (memory_id, user_id, memory_type, content, initial_confidence, \
+                 is_active, session_id, subject_id, trust_tier, source_event_ids, extra_metadata, \
+                 observed_at, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, 0.8, ?, ?, ?, 'T3', '[]', ?, NOW(), NOW(), NOW())"
+            ))
+            .bind(format!("{user}_{suffix}"))
+            .bind(owner)
+            .bind(kind.to_string())
+            .bind(content)
+            .bind(active)
+            .bind(session)
+            .bind(subject)
+            .bind(metadata)
+            .execute(&store.pool)
+            .await
+            .expect("insert memory");
+        }
+        sqlx::query(&format!(
+            "INSERT INTO {table} (memory_id, user_id, memory_type, content, is_active, session_id, \
+             subject_id, source_event_ids, observed_at, created_at) \
+             VALUES (?, ?, 'semantic', 'rust of another owner', 1, 's1', 'me', '[]', NOW(), NOW())"
+        ))
+        .bind(format!("{user}_owner"))
+        .bind(format!("{user}_other"))
+        .execute(&store.pool)
+        .await
+        .expect("insert other owner");
+
+        // Exercise the production sqlx::Error -> MySqlDatabaseError adapter:
+        // a real unrelated database error must not be mistaken for either
+        // recognized FULLTEXT failure.
+        let unrelated = sqlx::query(&format!(
+            "SELECT definitely_missing_fulltext_column FROM {table} LIMIT 1"
+        ))
+        .fetch_all(&store.pool)
+        .await
+        .expect_err("missing column must return a database error");
+        let (number, message) =
+            super::mysql_error_details(&unrelated).expect("downcast MySQL database error");
+        assert_ne!(number, 0);
+        assert!(
+            message.contains("definitely_missing_fulltext_column")
+                || message.contains("column")
+        );
+        assert_eq!(super::classify_fulltext_error(&unrelated), None);
+        assert!(matches!(
+            super::fulltext_rows_or_degraded(Err(unrelated)),
+            Err(memoria_core::MemoriaError::Database(_))
+        ));
+
+        super::SIMULATE_UNAVAILABLE_FULLTEXT_INDEX.with(|flag| flag.set(true));
+        let semantic = [MemoryType::Semantic];
+        let ids = |memories: Vec<Memory>| {
+            memories
+                .into_iter()
+                .map(|memory| {
+                    (
+                        memory
+                            .memory_id
+                            .trim_start_matches(&format!("{user}_"))
+                            .to_string(),
+                        memory.retrieval_score,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        // Ordinary retrieval: session also admits NULL-session rows, as FULLTEXT does.
+        let scoped = store
+            .search_fulltext_from_scoped(
+                &table,
+                &user,
+                "RUST borrow",
+                10,
+                Some("s1"),
+                Some("me"),
+                Some(&semantic),
+            )
+            .await;
+        let limited = store
+            .search_fulltext_from_scoped(
+                &table,
+                &user,
+                "rust borrow",
+                1,
+                Some("s1"),
+                Some("me"),
+                Some(&semantic),
+            )
+            .await;
+        // Structured retrieval: strict session, trust tier and metadata filters.
+        let filter = std::collections::HashMap::from([("tag".to_string(), serde_json::json!("a"))]);
+        let structured = store
+            .search_fulltext_structured_lite(
+                "mem_memories",
+                &user,
+                "rust borrow",
+                10,
+                Some(&semantic),
+                Some("s1"),
+                Some("T3"),
+                Some("me"),
+                &filter,
+            )
+            .await;
+        // Graph retrieval keeps its owner scope and limit as well.
+        let graph = store.graph_store();
+        for (suffix, owner, content, active) in [
+            ("node_match", user.clone(), "rust graph node", true),
+            ("node_inactive", user.clone(), "rust retired node", false),
+            (
+                "node_other",
+                format!("{user}_other"),
+                "rust foreign node",
+                true,
+            ),
+            ("node_nomatch", user.clone(), "plain node", true),
+        ] {
+            graph
+                .create_node(&crate::graph::GraphNode {
+                    // node_id is VARCHAR(32).
+                    node_id: format!("{suffix}_{}", &user[12..24]),
+                    user_id: owner,
+                    node_type: crate::graph::NodeType::Semantic,
+                    content: content.to_string(),
+                    entity_type: None,
+                    embedding: None,
+                    memory_id: None,
+                    session_id: None,
+                    confidence: 0.8,
+                    trust_tier: "T3".to_string(),
+                    importance: 0.5,
+                    source_nodes: Vec::new(),
+                    conflicts_with: None,
+                    conflict_resolution: None,
+                    access_count: 0,
+                    cross_session_count: 0,
+                    is_active: active,
+                    superseded_by: None,
+                    created_at: None,
+                })
+                .await
+                .expect("create graph node");
+        }
+        let nodes = graph.search_nodes_fulltext(&user, "rust", 10).await;
+        super::SIMULATE_UNAVAILABLE_FULLTEXT_INDEX.with(|flag| flag.set(false));
+
+        assert_eq!(
+            ids(scoped.expect("ordinary fallback")),
+            vec![
+                ("both".to_string(), Some(2.0)),
+                ("one".to_string(), Some(1.0)),
+                ("unscoped".to_string(), Some(1.0))
+            ]
+        );
+        assert_eq!(
+            ids(limited.expect("limited fallback")),
+            vec![("both".to_string(), Some(2.0))]
+        );
+        assert_eq!(
+            ids(structured.expect("structured fallback")),
+            vec![
+                ("both".to_string(), Some(2.0)),
+                ("one".to_string(), Some(1.0))
+            ]
+        );
+        let nodes = nodes.expect("graph fallback");
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|(node, score)| (node.node_id.clone(), *score))
+                .collect::<Vec<_>>(),
+            vec![(format!("node_match_{}", &user[12..24]), 1.0)]
+        );
+    }
 
     #[test]
     fn sanitize_like_pattern_escapes_wildcards_for_literal_topic_match() {
