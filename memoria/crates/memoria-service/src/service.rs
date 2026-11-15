@@ -6,7 +6,10 @@ use memoria_core::{
 };
 use memoria_embedding::llm::ChatMessage;
 use memoria_embedding::LlmClient;
-use memoria_storage::{DbRouter, OwnedEditLogEntry, SqlMemoryStore};
+use memoria_storage::{
+    DbRouter, EraseStepGate, MemoryEraseReport, MemoryEraseSelector,
+    OwnedEditLogEntry, SqlMemoryStore,
+};
 use moka::sync::Cache;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -613,6 +616,9 @@ impl MemoryService {
         embedder: Option<Arc<dyn EmbeddingProvider>>,
         llm: Option<Arc<LlmClient>>,
     ) -> Self {
+        if let Some(router) = &db_router {
+            store.set_erase_barrier(router.erase_barrier());
+        }
         // Create edit-log buffer early so background stores inherit the sender
         let edit_log = EditLogBuffer::new(store.clone());
         store.set_edit_log_tx(edit_log.entry_sender());
@@ -910,6 +916,13 @@ impl MemoryService {
         reason: &str,
         snapshot_before: Option<&str>,
     ) {
+        let _permit = match &self.sql_store {
+            Some(sql) => match sql.erase_barrier().try_enter(user_id) {
+                Some(permit) => Some(permit),
+                None => return,
+            },
+            None => None,
+        };
         if let Some(buf) = self.edit_log.lock().unwrap().as_ref() {
             buf.send(
                 user_id,
@@ -1068,6 +1081,13 @@ impl MemoryService {
             );
             return;
         }
+        let Some(_permit) = store.erase_barrier().try_enter(&user_id) else {
+            tracing::info!(
+                user_id,
+                "skipping entity batch because memory erase is running"
+            );
+            return;
+        };
         let user_store = if let Some(router) = store.db_router() {
             match router.routed_store_for_user(&user_id) {
                 Ok(user_store) => Some(user_store),
@@ -1704,6 +1724,9 @@ impl MemoryService {
         }
 
         let branch = format!("mem_sandbox_{}", &Uuid::new_v4().simple().to_string()[..16]);
+        let Some(_permit) = sql.erase_barrier().try_enter(user_id) else {
+            return true;
+        };
 
         // Create branch (zero-copy of mem_memories)
         if git.create_branch(&branch, "mem_memories").await.is_err() {
@@ -2385,6 +2408,67 @@ impl MemoryService {
             old_updated.superseded_by = Some(new_mem.memory_id.clone());
             self.store.update(&old_updated).await?;
             Ok(new_mem)
+        }
+    }
+
+    /// Physically erase memory data in the authenticated scope. This operation
+    /// holds the lock until the statement already sent to the database returns.
+    /// A lost lock stops later steps and is never reported as success.
+    pub async fn erase_memories(
+        &self,
+        scope_id: &str,
+        selector: &MemoryEraseSelector,
+    ) -> Result<MemoryEraseReport, MemoriaError> {
+        let shared = self.shared_sql_store()?;
+        let key = format!("memory-erase:{scope_id}");
+        if shared.database_url().is_some() {
+            let connection =
+                memoria_storage::EraseLockConnection::connect((*shared).clone()).await?;
+            let session = crate::erase_guard::EraseSession::start(
+                std::sync::Arc::new(connection),
+                key,
+            )
+            .await?;
+            return self.finish_erase(session, scope_id, selector).await;
+        }
+        let session = crate::erase_guard::EraseSession::start(shared, key).await?;
+        self.finish_erase(session, scope_id, selector).await
+    }
+
+    async fn finish_erase<L: crate::erase_guard::EraseLock + 'static>(
+        &self,
+        session: crate::erase_guard::EraseSession<L>,
+        scope_id: &str,
+        selector: &MemoryEraseSelector,
+    ) -> Result<MemoryEraseReport, MemoriaError> {
+        let store = match self.user_sql_store(scope_id).await {
+            Ok(store) => store,
+            Err(error) => {
+                if let Err(release_error) = session.finish().await {
+                    error!(%release_error, scope_id, "failed to release memory erase lock");
+                }
+                return Err(error);
+            }
+        };
+        let barrier = store.erase_barrier();
+        barrier.seal(scope_id).await;
+        self.flush_edit_log().await;
+        let _seal = memoria_storage::erase_barrier::SealGuard::new(barrier, scope_id);
+        let (cancel, lease, gate) = session.handoff();
+        let scope = scope_id.to_string();
+        let selector = selector.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut steps = EraseStepGate::new(gate.clone());
+            let result = store.erase_memories(&scope, &selector, &mut steps).await;
+            let result = crate::erase_guard::conclude_erase(result, &gate).await;
+            lease.shutdown_renew();
+            let _ = tx.send(result);
+        });
+        let _cancel = cancel;
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err(crate::erase_guard::lock_lost_error()),
         }
     }
 

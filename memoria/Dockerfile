@@ -4,7 +4,7 @@
 
 # ── Stage 1: deps — cache dependency build ──────────────────────────────────
 ARG RUST_VERSION=1.85
-FROM rust:${RUST_VERSION}-slim AS builder
+FROM rust:${RUST_VERSION}-slim-bookworm AS builder
 
 # Rust crates mirror (USTC)
 RUN printf '[source.crates-io]\nreplace-with = "mirror"\n[source.mirror]\nregistry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"\n' \

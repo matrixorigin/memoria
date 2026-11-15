@@ -130,6 +130,7 @@ fn should_mark_metrics_dirty(
             | "/v1/memories/batch"
             | "/v1/memories/correct"
             | "/v1/memories/purge"
+            | "/v1/memories/erase"
             | "/v1/observe"
             | "/v1/observe/deduplicated"
             | "/v1/pipeline/run" => Some(DirtyMask::MEMORY),
@@ -252,6 +253,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/v1/memories/retrieve", post(routes::memory::retrieve))
         .route("/v1/memories/search", post(routes::memory::search))
+        .route("/v1/memories/erase", post(routes::memory::erase_memories))
         .route("/v1/memories/:id", get(routes::memory::get_memory))
         .route(
             "/v1/memories/:id/history",

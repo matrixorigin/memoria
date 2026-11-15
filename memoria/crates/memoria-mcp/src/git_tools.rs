@@ -1103,6 +1103,10 @@ pub async fn call(
             let safe = sanitize_branch_table_suffix(branch_name);
             let table_name = format!("br_{}_{}", &Uuid::new_v4().simple().to_string()[..8], safe);
 
+            let _erase_permit = sql.erase_barrier().try_enter(user_id).ok_or_else(|| {
+                MemoriaError::Blocked("memory erase is already running for this scope".into())
+            })?;
+
             if let Some(snap) = from_snapshot {
                 // Snapshot clones inherit the historical schema, which may predate
                 // subject_id. Reconcile it before the branch becomes visible.
