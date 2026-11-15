@@ -977,11 +977,22 @@ pub async fn list_branches(
     })))
 }
 
+fn validate_branch_name_length(name: &str) -> Result<(), (StatusCode, String)> {
+    if name.chars().count() > 100 {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "branch name exceeds maximum length of 100 characters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn create_branch(
     State(state): State<AppState>,
     auth: AuthUser,
     Json(req): Json<CreateBranchRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    validate_branch_name_length(&req.name)?;
     let r = git_call(
         &state,
         auth.scope_id(),
@@ -1280,5 +1291,20 @@ mod snapshot_list_tests {
             .await
             .unwrap_err();
         assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}
+
+#[cfg(test)]
+mod branch_name_length_tests {
+    use super::*;
+
+    #[test]
+    fn branch_names_use_character_limit_before_database_access() {
+        assert!(validate_branch_name_length(&"a".repeat(100)).is_ok());
+        assert!(validate_branch_name_length(&"é".repeat(100)).is_ok());
+        let err = validate_branch_name_length(&"a".repeat(101)).unwrap_err();
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        let err = validate_branch_name_length(&"é".repeat(101)).unwrap_err();
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

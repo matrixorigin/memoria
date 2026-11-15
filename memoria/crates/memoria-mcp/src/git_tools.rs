@@ -1038,6 +1038,13 @@ pub async fn call(
 
         GitToolCallName::MemoryBranch => {
             let branch_name = args["name"].as_str().unwrap_or("");
+            // Shared by REST and MCP: reject before any branch DDL so an
+            // overlong name cannot leave a table without its registration.
+            if branch_name.chars().count() > 100 {
+                return Err(MemoriaError::Validation(
+                    "branch name exceeds maximum length of 100 characters".into(),
+                ));
+            }
             let from_snapshot = args["from_snapshot"].as_str();
             let from_timestamp = args["from_timestamp"].as_str();
 
@@ -2607,6 +2614,38 @@ mod tests {
             assert!(result
                 .to_string()
                 .contains("Snapshot prefix must not be blank"));
+        }
+    }
+
+    #[tokio::test]
+    async fn branch_creation_rejects_overlong_names_before_storage() {
+        use std::sync::Arc;
+
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://test:test@127.0.0.1:1/test")
+            .unwrap();
+        let store = Arc::new(memoria_storage::SqlMemoryStore::new(
+            pool.clone(),
+            3,
+            "test".into(),
+        ));
+        let service = Arc::new(memoria_service::MemoryService::new(store, None, None));
+        let git = Arc::new(memoria_git::GitForDataService::new(pool, "test"));
+        for name in ["b".repeat(101), "é".repeat(101)] {
+            let error = super::call(
+                "memory_branch",
+                serde_json::json!({ "name": name }),
+                &git,
+                &service,
+                "test",
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(&error, memoria_core::MemoriaError::Validation(message)
+                    if message.contains("100 characters")),
+                "{error:?}"
+            );
         }
     }
 
