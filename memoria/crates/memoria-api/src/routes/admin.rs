@@ -33,6 +33,13 @@ async fn get_user_store(
     state.service.user_sql_store(user_id).await.map_err(api_err)
 }
 
+/// A `grp_*` scope has its own database only when a `DbRouter` is configured.
+/// Without one, `user_sql_store` returns the shared store for every id, so a
+/// table-wide statement would touch every user's rows.
+fn is_isolated_group_scope(state: &AppState, user_id: &str) -> bool {
+    user_id.starts_with("grp_") && state.service.db_router.is_some()
+}
+
 async fn list_known_users(state: &AppState) -> Result<Vec<String>, (StatusCode, String)> {
     let sql = state
         .service
@@ -134,18 +141,16 @@ pub async fn list_users(
     Query(params): Query<CursorParams>,
 ) -> Result<Json<UserListResponse>, (StatusCode, String)> {
     auth.require_master()?;
-    let limit = params.limit.unwrap_or(100);
+    let limit = validated_user_page_limit(params.limit)?;
     let mut users = list_known_users(&state).await?;
     if let Some(ref cursor) = params.cursor {
         users.retain(|user_id| user_id > cursor);
     }
-    let users: Vec<String> = users.into_iter().take(limit as usize).collect();
-
-    let next_cursor = if users.len() as i64 == limit {
-        users.last().cloned()
-    } else {
-        None
-    };
+    // Fetch one extra item to distinguish a full final page from a next page.
+    let users: Vec<String> = users.into_iter().take(limit + 1).collect();
+    let has_more = users.len() > limit;
+    let users: Vec<String> = users.into_iter().take(limit).collect();
+    let next_cursor = if has_more { users.last().cloned() } else { None };
 
     Ok(Json(UserListResponse {
         users: users
@@ -168,7 +173,7 @@ pub async fn user_stats(
     // For group scopes (user_id starts with "grp_") count ALL active memories in the
     // group database — the individual user_id filter would always return 0 since
     // memories are attributed to each member's uid, not the group id itself.
-    let memory_count = if user_id.starts_with("grp_") {
+    let memory_count = if is_isolated_group_scope(&state, &user_id) {
         sqlx::query_scalar::<_, i64>(&format!(
             "SELECT COUNT(*) FROM {memories_table} WHERE is_active > 0"
         ))
@@ -204,15 +209,33 @@ pub async fn delete_user(
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth.require_master()?;
+    // Group memories belong to members, not the group id. Only an isolated
+    // group database may be cleared without the owner predicate; in
+    // router-less mode that statement would deactivate every user's rows.
+    if user_id.starts_with("grp_") && !is_isolated_group_scope(&state, &user_id) {
+        return Err((
+            StatusCode::CONFLICT,
+            "group deletion requires isolated group databases (multi-db mode)".into(),
+        ));
+    }
     let user_store = get_user_store(&state, &user_id).await?;
     let memories_table = user_store.t("mem_memories");
-    sqlx::query(&format!(
-        "UPDATE {memories_table} SET is_active = 0 WHERE user_id = ?"
-    ))
-    .bind(&user_id)
-    .execute(user_store.pool())
-    .await
-    .map_err(db_err)?;
+    if is_isolated_group_scope(&state, &user_id) {
+        sqlx::query(&format!(
+            "UPDATE {memories_table} SET is_active = 0 WHERE is_active > 0"
+        ))
+        .execute(user_store.pool())
+        .await
+        .map_err(db_err)?;
+    } else {
+        sqlx::query(&format!(
+            "UPDATE {memories_table} SET is_active = 0 WHERE user_id = ? AND is_active > 0"
+        ))
+        .bind(&user_id)
+        .execute(user_store.pool())
+        .await
+        .map_err(db_err)?;
+    }
     if let Err(e) = state
         .mark_metrics_dirty(&user_id, crate::metrics_summary::DirtyMask::FULL)
         .await
@@ -839,7 +862,7 @@ pub async fn user_branch_stats(
     // we filter by user_id. Group users own an isolated per-group database where
     // mem_memories contains only group data, so no user_id filter is needed there.
     let memories_table = user_store.t("mem_memories");
-    let main_count: i64 = if user_id.starts_with("grp_") {
+    let main_count: i64 = if is_isolated_group_scope(&state, &user_id) {
         sqlx::query_scalar::<_, i64>(&format!(
             "SELECT COUNT(*) FROM {memories_table} WHERE is_active > 0"
         ))
@@ -919,11 +942,81 @@ pub async fn user_branch_stats(
 
 /// Redact password from database URL for safe display.
 fn redact_url(url: &str) -> String {
-    // mysql://user:pass@host:port/db → mysql://user:***@host:port/db
-    if let Some(at) = url.find('@') {
-        if let Some(colon) = url[..at].rfind(':') {
-            return format!("{}:***{}", &url[..colon], &url[at..]);
+    // Only inspect the authority: '@' in a password is not the host separator,
+    // and '@' in a path, query, or fragment is never userinfo.
+    if let Some(scheme_end) = url.find("://") {
+        let authority_start = scheme_end + 3;
+        let authority_end = url[authority_start..]
+            .find(&['/', '?', '#'][..])
+            .map_or(url.len(), |offset| authority_start + offset);
+        let authority = &url[authority_start..authority_end];
+        if let Some(at) = authority.rfind('@') {
+            if let Some(colon) = authority[..at].find(':') {
+                let password_start = authority_start + colon;
+                let host_start = authority_start + at;
+                return format!("{}:***{}", &url[..password_start], &url[host_start..]);
+            }
         }
     }
     url.to_string()
+}
+
+fn validated_user_page_limit(limit: Option<i64>) -> Result<usize, (StatusCode, String)> {
+    let limit = limit.unwrap_or(100);
+    if !(1..=1000).contains(&limit) {
+        return Err((StatusCode::BAD_REQUEST, "limit must be between 1 and 1000".into()));
+    }
+    Ok(limit as usize)
+}
+
+#[cfg(test)]
+mod redact_url_tests {
+    use super::redact_url;
+
+    #[test]
+    fn redacts_entire_password_even_when_it_contains_at_signs() {
+        assert_eq!(
+            redact_url("mysql://user:p@ss@host:3306/db"),
+            "mysql://user:***@host:3306/db"
+        );
+        assert_eq!(
+            redact_url("mysql://user:p@ss@word@host/db?x=1"),
+            "mysql://user:***@host/db?x=1"
+        );
+        assert_eq!(
+            redact_url("mysql://user:pass@host/db"),
+            "mysql://user:***@host/db"
+        );
+    }
+
+    #[test]
+    fn does_not_confuse_path_query_or_fragment_with_userinfo() {
+        for url in [
+            "mysql://host/db@archive",
+            "mysql://host/db?contact=user@example.com",
+            "mysql://host/db#user:pass@comment",
+            "mysql://host/db",
+        ] {
+            assert_eq!(redact_url(url), url);
+        }
+    }
+}
+
+#[cfg(test)]
+mod admin_user_pagination_tests {
+    use super::validated_user_page_limit;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn rejects_invalid_limits_and_defaults_safely() {
+        assert_eq!(validated_user_page_limit(None).unwrap(), 100);
+        assert_eq!(validated_user_page_limit(Some(1)).unwrap(), 1);
+        assert_eq!(validated_user_page_limit(Some(1000)).unwrap(), 1000);
+        for limit in [i64::MIN, -1, 0, 1001, i64::MAX] {
+            assert_eq!(
+                validated_user_page_limit(Some(limit)).unwrap_err().0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
 }
