@@ -164,5 +164,5 @@ def test_genuinely_idempotent_delete_is_still_retried(httpx_mock: HTTPXMock) -> 
     httpx_mock.add_exception(httpx.RemoteProtocolError("server disconnected"))
     httpx_mock.add_response(status_code=204)
     client = MemoriaClient(base_url=BASE_URL, api_key=API_KEY, max_retries=3)
-    client.memories.delete("m1")
+    client._request("DELETE", "/idempotent-resource/m1")
     assert len(httpx_mock.get_requests()) == 2
