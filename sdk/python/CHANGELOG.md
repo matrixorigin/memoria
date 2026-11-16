@@ -3,6 +3,11 @@
 ## [Unreleased]
 
 ### Fixed
+- `observe()` and `observe_deduplicated()` (sync and async) no longer crash with a raw
+  `AttributeError` on a 2xx body that is a JSON array, string or number, and no longer turn a
+  falsy or empty body (`[]`, `false`, `null`, 204, zero-length 200) into an empty
+  `ObserveResult`. These now raise `MemoriaResponseError`. An explicit `"memories": null` is read
+  as an empty list.
 - Every `httpx.TransportError` now surfaces as `MemoriaConnectionError` with the original
   exception preserved as `__cause__`. `RemoteProtocolError` ("server disconnected without
   sending a response"), `LocalProtocolError` and `ProxyError` are siblings of `NetworkError`
