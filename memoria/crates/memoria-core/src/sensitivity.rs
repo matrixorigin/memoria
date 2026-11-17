@@ -2,7 +2,7 @@
 //!
 //! Three tiers:
 //!   HIGH   (passwords, API keys, private keys) → block entire memory
-//!   MEDIUM (email, phone, SSN, credit card)    → redact in-place, keep memory
+//!   MEDIUM (email, credit card, phone, SSN)    → redact in-place, keep memory
 //!   LOW    (usernames)                          → allow through unchanged
 
 use std::borrow::Cow;
@@ -113,6 +113,16 @@ static PATTERNS: &[Pattern] = &[
         regex: r"[a-zA-Z0-9_.+-]+@(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}",
         replacement: "[email]",
     },
+    // Cards must be redacted before `phone`: the phone pattern matches 6-4 digit
+    // sub-groups inside hyphen- or dot-grouped card numbers (for example the
+    // trailing `930902-5904` of `3056-930902-5904`), which would leave the BIN
+    // in the clear and hide the card from the Luhn check.
+    Pattern {
+        label: "credit_card",
+        tier: SensitivityTier::Medium,
+        regex: r"\b(?:\d[ -]*?){13,19}\b",
+        replacement: "[card]",
+    },
     Pattern {
         label: "phone",
         tier: SensitivityTier::Medium,
@@ -126,12 +136,6 @@ static PATTERNS: &[Pattern] = &[
         tier: SensitivityTier::Medium,
         regex: r"\b\d{3}-\d{2}-\d{4}\b",
         replacement: "[ssn]",
-    },
-    Pattern {
-        label: "credit_card",
-        tier: SensitivityTier::Medium,
-        regex: r"\b(?:\d[ -]*?){13,19}\b",
-        replacement: "[card]",
     },
 ];
 
@@ -199,21 +203,39 @@ fn luhn_valid_digits(digits: &[u32]) -> bool {
 /// Find Luhn-valid card candidates, including candidates that overlap an
 /// earlier invalid numeric match. The regex `replace_all` API consumes a
 /// failed match, which can hide a valid card beginning later in that match.
-fn luhn_valid_card_spans(text: &str) -> Vec<(usize, usize, usize)> {
+///
+/// `protected` holds byte spans of other MEDIUM matches (phone, SSN). A card
+/// candidate may not start inside one or end inside one, so a number that sits
+/// next to a phone or SSN cannot swallow its digits and leave the rest of a real
+/// card in the clear. A card that merely contains such a match (the hybrid
+/// `3056-930902-5904` grouping) is still accepted.
+fn luhn_valid_card_spans(text: &str, protected: &[(usize, usize)]) -> Vec<(usize, usize, usize)> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let word_boundaries: std::collections::HashSet<usize> =
         WORD_BOUNDARY.find_iter(text).map(|m| m.start()).collect();
     let mut candidates = Vec::new();
 
     for (start_index, &(start, first)) in chars.iter().enumerate() {
-        if decimal_digit(first).is_none() || !word_boundaries.contains(&start) {
+        if decimal_digit(first).is_none()
+            || !word_boundaries.contains(&start)
+            || protected
+                .iter()
+                .any(|&(from, to)| from <= start && start < to)
+        {
             continue;
         }
 
         let mut digits = Vec::new();
-        for &(byte, c) in chars.iter().skip(start_index) {
+        let mut group_len = 0;
+        // A card is grouped either with dots or with spaces/hyphens, never both.
+        // Mixing them would let a sentence-ending period join two separate numbers.
+        let mut dotted = false;
+        let mut spaced = false;
+        let mut rest = chars.iter().skip(start_index).peekable();
+        while let Some(&(byte, c)) = rest.next() {
             if let Some(digit) = decimal_digit(c) {
                 digits.push(digit);
+                group_len += 1;
                 let end = byte + c.len_utf8();
                 if digits.len() > 19 {
                     break;
@@ -221,11 +243,31 @@ fn luhn_valid_card_spans(text: &str) -> Vec<(usize, usize, usize)> {
 
                 if (13..=19).contains(&digits.len())
                     && word_boundaries.contains(&(end))
+                    && !protected.iter().any(|&(from, to)| from < end && end < to)
                     && luhn_valid_digits(&digits)
                 {
                     candidates.push((start, end, digits.len()));
                 }
-            } else if !matches!(c, ' ' | '-') {
+            } else if c == '.' {
+                // Dot-grouped cards (3056.930902.5904) use 4-6 digit groups. Requiring
+                // that keeps fractional timestamps such as 1730284800.123456 out. The
+                // dot must also be followed directly by a digit, so a period that ends a
+                // sentence never continues into the next number.
+                let next_is_digit = rest
+                    .peek()
+                    .is_some_and(|&&(_, n)| decimal_digit(n).is_some());
+                if spaced || !next_is_digit || !(4..=6).contains(&group_len) {
+                    break;
+                }
+                dotted = true;
+                group_len = 0;
+            } else if matches!(c, ' ' | '-') {
+                if dotted {
+                    break;
+                }
+                spaced = true;
+                group_len = 0;
+            } else {
                 break;
             }
         }
@@ -247,8 +289,8 @@ fn luhn_valid_card_spans(text: &str) -> Vec<(usize, usize, usize)> {
     selected
 }
 
-fn redact_luhn_valid_cards(text: &str, replacement: &str) -> String {
-    let spans = luhn_valid_card_spans(text);
+fn redact_luhn_valid_cards(text: &str, replacement: &str, protected: &[(usize, usize)]) -> String {
+    let spans = luhn_valid_card_spans(text, protected);
     if spans.is_empty() {
         return text.to_owned();
     }
@@ -285,7 +327,18 @@ pub fn check_sensitivity(text: &str) -> SensitivityResult {
         if p.tier == SensitivityTier::Medium {
             let result = if p.label == "credit_card" {
                 // Only redact digit runs that pass Luhn; keep timestamps and IDs.
-                Cow::Owned(redact_luhn_valid_cards(&redacted, p.replacement))
+                // Cards run before phone/SSN, so those matches are passed in to keep
+                // a neighbouring phone or SSN from absorbing part of a card.
+                let protected: Vec<(usize, usize)> = COMPILED
+                    .iter()
+                    .filter(|(q, _)| matches!(q.label, "phone" | "ssn"))
+                    .flat_map(|(_, r)| r.find_iter(&redacted).map(|m| (m.start(), m.end())))
+                    .collect();
+                Cow::Owned(redact_luhn_valid_cards(
+                    &redacted,
+                    p.replacement,
+                    &protected,
+                ))
             } else {
                 re.replace_all(&redacted, p.replacement)
             };
@@ -872,6 +925,113 @@ mod tests {
             result.redacted_content.as_deref(),
             Some("card [card] on file")
         );
+    }
+
+    #[test]
+    fn card_redaction_is_not_preempted_by_phone_for_any_grouping() {
+        // The 4-6-4 (Diners) and 4-6-5 (Amex) groupings contain 6-4 and 6-5 digit
+        // sub-groups that the phone pattern would otherwise claim first.
+        for grouped in [
+            "3056-930902-5904",
+            "3056.930902.5904",
+            "3056 930902 5904",
+            "3782-822463-10005",
+            "3782.822463.10005",
+            "4111-1111-1111-1111",
+            "4111.1111.1111.1111",
+        ] {
+            let result = check_sensitivity(&format!("card {grouped} on file"));
+            assert!(!result.blocked);
+            assert_eq!(
+                result.redacted_content.as_deref(),
+                Some("card [card] on file"),
+                "grouped card was not fully redacted: {grouped}"
+            );
+            assert_eq!(result.matched_labels, vec!["credit_card"], "{grouped}");
+        }
+    }
+
+    #[test]
+    fn dot_grouped_card_detection_ignores_fractional_timestamps() {
+        for text in [
+            "at 1730284800.123456 seconds",
+            "ratio 1234567890123.4567 measured",
+        ] {
+            let result = check_sensitivity(text);
+            assert!(
+                !result.matched_labels.contains(&"credit_card"),
+                "timestamp-like number labeled as card: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn luhn_invalid_hybrid_grouping_is_not_labeled_as_card() {
+        let result = check_sensitivity("ref 3056-930902-5905 on file");
+        assert!(!result.matched_labels.contains(&"credit_card"));
+    }
+
+    #[test]
+    fn phone_still_redacted_next_to_a_card() {
+        let result = check_sensitivity("call 555-867-5309; card 3056-930902-5904");
+        assert_eq!(
+            result.redacted_content.as_deref(),
+            Some("call [phone]; card [card]")
+        );
+        assert_eq!(result.matched_labels, vec!["credit_card", "phone"]);
+    }
+
+    #[test]
+    fn phone_or_ssn_next_to_a_card_cannot_swallow_card_digits() {
+        // Without the protected spans, `555-867-5309 4111 11` (15 digits) passes
+        // Luhn and is redacted as one card, leaving the rest of the real card.
+        for (text, expected) in [
+            ("555-867-5309 4111 1111 1111 1111", "[phone] [card]"),
+            ("123-45-6789 4111 1111 1111 1111", "[ssn] [card]"),
+            ("4111 1111 1111 1111 555-867-5309", "[card] [phone]"),
+        ] {
+            let result = check_sensitivity(text);
+            assert_eq!(result.redacted_content.as_deref(), Some(expected), "{text}");
+        }
+    }
+
+    #[test]
+    fn sentence_punctuation_does_not_join_independent_cards() {
+        // Both numbers are Luhn-valid. The first 14 digits plus the first four digits
+        // of the next card also form a Luhn-valid 18-digit run, which used to win and
+        // leave the rest of the second card in the clear.
+        for (text, expected) in [
+            (
+                "card 3056 930902 5904. 5553 0000 0000 0000 on file",
+                "card [card]. [card] on file",
+            ),
+            (
+                "card 3056.930902.5904. 5553.0000.0000.0000 on file",
+                "card [card]. [card] on file",
+            ),
+            ("4111 1111 1111 1111. 5555 5555 5555 4444", "[card]. [card]"),
+            // No space after the period: dots and spaces are never mixed in one card.
+            (
+                "card 3056 930902 5904.5553 0000 0000 0000 on file",
+                "card [card].[card] on file",
+            ),
+        ] {
+            let result = check_sensitivity(text);
+            assert_eq!(result.redacted_content.as_deref(), Some(expected), "{text}");
+        }
+    }
+
+    #[test]
+    fn dotted_numbers_that_are_not_cards_stay_untouched() {
+        for text in [
+            "ip 192.168.100.200 ok",
+            "at 1730284800.123456 seconds",
+            "version 10.20.30.40 shipped",
+        ] {
+            assert_eq!(check_sensitivity(text).redacted_content, None, "{text}");
+        }
+        let result = check_sensitivity("call 555-867-5309 123");
+        assert_eq!(result.redacted_content.as_deref(), Some("call [phone] 123"));
     }
 
     #[test]
