@@ -9,7 +9,10 @@ from tests.conftest import BRANCH_STUB, MEMORY_STUB, SNAPSHOT_STUB
 EMPTY_BODIES = {
     "204": httpx.Response(204),
     "empty-200": httpx.Response(200, content=b""),
-    "json-null": httpx.Response(200, json=None),
+    # httpx.Response(200, json=None) sends an empty body, so spell out the literal.
+    "json-null": httpx.Response(
+        200, content=b"null", headers={"content-type": "application/json"}
+    ),
 }
 
 # (resource, method, kwargs) for every endpoint whose contract is a JSON object.
