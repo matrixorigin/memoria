@@ -130,6 +130,12 @@ fn classify_fulltext_error(error: &sqlx::Error) -> Option<FulltextFailure> {
         .and_then(|(number, message)| classify_fulltext_error_code(number, message))
 }
 
+/// True for the recognized FULLTEXT failures (empty pattern, unusable index) that a
+/// caller may degrade past instead of failing the whole request (#247).
+pub fn is_degradable_fulltext_error(error: &sqlx::Error) -> bool {
+    classify_fulltext_error(error).is_some()
+}
+
 /// Rows of a FULLTEXT query, or a signal that the index is unusable and the
 /// caller must answer the same scoped query through LIKE.
 #[derive(Debug)]
@@ -5947,14 +5953,20 @@ impl SqlMemoryStore {
                    AND MATCH(content) AGAINST('{ft_terms}' IN BOOLEAN MODE) \
                    AND content LIKE ?"
             );
-            let rows: Vec<(String,)> = sqlx::query_as(&sql)
+            let result = sqlx::query(&sql)
                 .bind(user_id)
                 .bind(&like_pat)
                 .fetch_all(&mut *conn)
-                .await
-                .map_err(db_err)?;
-            if !rows.is_empty() {
-                return Ok(rows.into_iter().map(|r| r.0).collect());
+                .await;
+            // An unusable FULLTEXT index must fall through to the LIKE scan below,
+            // as every other read path does (#247). Other database errors surface.
+            if let FulltextRows::Rows(rows) = fulltext_rows_or_degraded(result)? {
+                if !rows.is_empty() {
+                    return rows
+                        .iter()
+                        .map(|row| row.try_get::<String, _>("memory_id").map_err(db_err))
+                        .collect();
+                }
             }
         }
 
@@ -6900,6 +6912,84 @@ mod tests {
     use sqlx::mysql::MySqlPoolOptions;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex, OnceLock};
+
+    #[test]
+    fn only_recognized_fulltext_failures_are_degradable() {
+        // Errors that are not database errors never carry a FULLTEXT code, so they
+        // must keep propagating instead of being swallowed as an empty result.
+        assert!(!super::is_degradable_fulltext_error(
+            &sqlx::Error::RowNotFound
+        ));
+        assert!(!super::is_degradable_fulltext_error(
+            &sqlx::Error::PoolTimedOut
+        ));
+    }
+
+    /// `purge` finds its targets through `find_ids_by_topic`. With the FULLTEXT index
+    /// unusable (simulated, see `SIMULATE_UNAVAILABLE_FULLTEXT_INDEX`) it must answer
+    /// from the scoped LIKE scan instead of failing. The real 20301 failure cannot be
+    /// produced on demand, so this drives the degraded branch end to end. The test is
+    /// skipped without `DATABASE_URL`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unavailable_fulltext_index_degrades_topic_lookup_to_like() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("DATABASE_URL not set; skipping topic lookup fallback database test");
+            return;
+        };
+        let dim = std::env::var("EMBEDDING_DIM")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1024);
+        let store = SqlMemoryStore::connect(&url, dim, uuid::Uuid::new_v4().to_string())
+            .await
+            .expect("connect");
+        store.migrate().await.expect("migrate");
+        let user = format!("topic_fallback_{}", uuid::Uuid::new_v4().simple());
+        let other = format!("{user}_other");
+        let table = store.t("mem_memories");
+        for (suffix, owner, content, active) in [
+            ("hit", &user, "deploy checklist for staging", true),
+            ("hit_again", &user, "Notes: deploy checklist v2", true),
+            ("inactive", &user, "deploy checklist retired", false),
+            ("miss", &user, "unrelated text", true),
+            ("owner", &other, "deploy checklist of another owner", true),
+        ] {
+            sqlx::query(&format!(
+                "INSERT INTO {table} (memory_id, user_id, memory_type, content, initial_confidence, \
+                 is_active, trust_tier, source_event_ids, observed_at, created_at, updated_at) \
+                 VALUES (?, ?, 'semantic', ?, 0.8, ?, 'T3', '[]', NOW(), NOW(), NOW())"
+            ))
+            .bind(format!("{user}_{suffix}"))
+            .bind(owner)
+            .bind(content)
+            .bind(active)
+            .execute(&store.pool)
+            .await
+            .expect("insert memory");
+        }
+        let sorted = |mut ids: Vec<String>| {
+            ids.sort();
+            ids
+        };
+        let expected = vec![format!("{user}_hit"), format!("{user}_hit_again")];
+
+        let normal = store
+            .find_ids_by_topic("mem_memories", &user, "deploy checklist")
+            .await
+            .expect("fulltext fast path");
+        assert_eq!(sorted(normal), expected);
+
+        super::SIMULATE_UNAVAILABLE_FULLTEXT_INDEX.with(|flag| flag.set(true));
+        let degraded = store
+            .find_ids_by_topic("mem_memories", &user, "deploy checklist")
+            .await;
+        super::SIMULATE_UNAVAILABLE_FULLTEXT_INDEX.with(|flag| flag.set(false));
+        assert_eq!(
+            sorted(degraded.expect("degrades to LIKE instead of failing")),
+            expected,
+            "LIKE fallback must keep the owner and active-row scope"
+        );
+    }
 
     #[test]
     fn broken_fulltext_index_requests_fallback_and_other_sql_errors_propagate() {

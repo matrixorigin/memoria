@@ -2374,7 +2374,9 @@ async fn select_retrieved_pick_candidates(
             Ok(rows) => rows,
             Err(err) => {
                 let msg = err.to_string();
-                if (msg.contains("20101") && msg.contains("empty pattern"))
+                // An empty pattern or an unusable FULLTEXT index (#247) only drops the
+                // lexical score; vector and overlap scoring still rank the candidates.
+                if memoria_storage::store::is_degradable_fulltext_error(&err)
                     || (msg.contains("20105") && msg.contains("not supported"))
                 {
                     vec![]
