@@ -227,6 +227,10 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/memories/:id/correct-idempotent",
             put(routes::memory::correct_memory_idempotent),
         )
+        .route(
+            "/v1/memories/:id/correct-attributed",
+            put(routes::memory::correct_memory_attributed),
+        )
         .route("/v1/memories/:id", delete(routes::memory::delete_memory))
         .route(
             "/v1/memories/:id/retire-extracted",

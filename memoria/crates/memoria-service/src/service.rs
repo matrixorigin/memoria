@@ -7,8 +7,8 @@ use memoria_core::{
 use memoria_embedding::llm::ChatMessage;
 use memoria_embedding::LlmClient;
 use memoria_storage::{
-    DbRouter, EraseStepGate, MemoryEraseReport, MemoryEraseSelector,
-    OwnedEditLogEntry, SqlMemoryStore,
+    DbRouter, EraseStepGate, MemoryEraseReport, MemoryEraseSelector, OwnedEditLogEntry,
+    SqlMemoryStore,
 };
 use moka::sync::Cache;
 use std::collections::HashMap;
@@ -1438,9 +1438,7 @@ impl MemoryService {
             }
         }
         if content.trim().is_empty() {
-            return Err(MemoriaError::Validation(
-                "content must not be empty".into(),
-            ));
+            return Err(MemoriaError::Validation("content must not be empty".into()));
         }
         if content.len() > MAX_MEMORY_CONTENT_BYTES {
             return Err(MemoriaError::Validation(
@@ -2352,8 +2350,38 @@ impl MemoryService {
         memory_id: &str,
         new_content: &str,
     ) -> Result<Memory, MemoriaError> {
-        self.correct_inner(user_id, branch, memory_id, new_content, None, None, false)
+        self.correct_with_metadata_on_branch(user_id, branch, memory_id, new_content, None, None)
             .await
+    }
+
+    /// The new content and its source attribution must be one atomic revision.
+    pub async fn correct_with_metadata_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        memory_id: &str,
+        new_content: &str,
+        extra_metadata: Option<&HashMap<String, serde_json::Value>>,
+        session_id: Option<&str>,
+    ) -> Result<Memory, MemoriaError> {
+        reject_reserved_metadata(extra_metadata)?;
+        if session_id.is_some_and(|id| id.is_empty() || id.len() > 64) {
+            return Err(MemoriaError::Validation(
+                "invalid correction session_id".into(),
+            ));
+        }
+        self.correct_inner(
+            user_id,
+            branch,
+            memory_id,
+            new_content,
+            None,
+            None,
+            false,
+            extra_metadata,
+            session_id,
+        )
+        .await
     }
 
     /// A correction receipt is bound to authenticated owner, explicit branch,
@@ -2389,6 +2417,8 @@ impl MemoryService {
             Some(subject_id),
             Some(key),
             omit_structured_content,
+            None,
+            None,
         )
         .await
     }
@@ -2402,6 +2432,8 @@ impl MemoryService {
         subject_id: Option<&str>,
         key: Option<&str>,
         omit_structured_content: bool,
+        extra_metadata: Option<&HashMap<String, serde_json::Value>>,
+        session_id: Option<&str>,
     ) -> Result<Memory, MemoriaError> {
         let requested_content = new_content;
         if new_content.trim().is_empty() {
@@ -2473,7 +2505,7 @@ impl MemoryService {
                 .as_ref()
                 .map(|(id, _)| id.clone())
                 .unwrap_or_else(|| Uuid::now_v7().simple().to_string());
-            let mut metadata = correction_metadata(&old);
+            let mut metadata = patched_correction_metadata(&old, extra_metadata);
             if let Some((_, hash)) = &receipt {
                 metadata
                     .get_or_insert_with(HashMap::new)
@@ -2488,7 +2520,9 @@ impl MemoryService {
                 trust_tier: TrustTier::T2Curated,
                 initial_confidence: old.initial_confidence,
                 embedding: self.embed(new_content).await?,
-                session_id: old.session_id.clone(),
+                session_id: session_id
+                    .map(str::to_string)
+                    .or_else(|| old.session_id.clone()),
                 source_event_ids: vec![format!("correct:{}", memory_id)],
                 extra_metadata: metadata,
                 observed_at: Some(Utc::now()),
@@ -2563,10 +2597,12 @@ impl MemoryService {
                 trust_tier: TrustTier::T2Curated,
                 initial_confidence: old.initial_confidence,
                 embedding: self.embed(new_content).await?,
-                session_id: old.session_id.clone(),
+                session_id: session_id
+                    .map(str::to_string)
+                    .or_else(|| old.session_id.clone()),
                 source_event_ids: vec![format!("correct:{}", memory_id)],
                 extra_metadata: without_structured_content(
-                    correction_metadata(&old),
+                    patched_correction_metadata(&old, extra_metadata),
                     omit_structured_content,
                 ),
                 observed_at: Some(Utc::now()),
@@ -2603,11 +2639,9 @@ impl MemoryService {
         if shared.database_url().is_some() {
             let connection =
                 memoria_storage::EraseLockConnection::connect((*shared).clone()).await?;
-            let session = crate::erase_guard::EraseSession::start(
-                std::sync::Arc::new(connection),
-                key,
-            )
-            .await?;
+            let session =
+                crate::erase_guard::EraseSession::start(std::sync::Arc::new(connection), key)
+                    .await?;
             return self.finish_erase(session, scope_id, selector).await;
         }
         let session = crate::erase_guard::EraseSession::start(shared, key).await?;
@@ -3641,9 +3675,7 @@ impl MemoryService {
                 }
             }
             if content.trim().is_empty() {
-                return Err(MemoriaError::Validation(
-                    "content must not be empty".into(),
-                ));
+                return Err(MemoriaError::Validation("content must not be empty".into()));
             }
             if content.len() > MAX_MEMORY_CONTENT_BYTES {
                 return Err(MemoriaError::Validation(
@@ -4337,7 +4369,11 @@ mod tests {
         let pool = MySqlPoolOptions::new()
             .connect_lazy("mysql://root:root@localhost:3306/memoria")
             .expect("lazy mysql pool");
-        let store = Arc::new(SqlMemoryStore::new(pool, 1024, "blank-validation".to_string()));
+        let store = Arc::new(SqlMemoryStore::new(
+            pool,
+            1024,
+            "blank-validation".to_string(),
+        ));
         let service = MemoryService::new_sql_with_llm(store, None, None).await;
 
         for content in ["", "  ", "\t\n", "\u{2003}"] {
@@ -4483,6 +4519,24 @@ fn correction_metadata(memory: &Memory) -> Option<HashMap<String, serde_json::Va
         metadata.retain(|key, _| !is_reserved_metadata_key(key));
         metadata
     })
+}
+
+fn patched_correction_metadata(
+    memory: &Memory,
+    patch: Option<&HashMap<String, serde_json::Value>>,
+) -> Option<HashMap<String, serde_json::Value>> {
+    let mut metadata = correction_metadata(memory);
+    if let Some(patch) = patch {
+        let values = metadata.get_or_insert_with(HashMap::new);
+        for (key, value) in patch {
+            if value.is_null() {
+                values.remove(key);
+            } else {
+                values.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    metadata
 }
 
 /// Drops only the business JSON copy. Identity, source and type stay on the
@@ -4761,6 +4815,9 @@ mod batch_confidence_tests {
         assert_eq!(resolved_batch_confidence(Some(1.1), &tier), default);
         assert_eq!(resolved_batch_confidence(Some(-0.01), &tier), default);
         assert_eq!(resolved_batch_confidence(Some(f64::NAN), &tier), default);
-        assert_eq!(resolved_batch_confidence(Some(f64::INFINITY), &tier), default);
+        assert_eq!(
+            resolved_batch_confidence(Some(f64::INFINITY), &tier),
+            default
+        );
     }
 }

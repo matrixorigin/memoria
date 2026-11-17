@@ -496,6 +496,84 @@ async fn test_purge() {
 }
 
 #[tokio::test]
+async fn test_attributed_correction_merges_metadata_and_rejects_reserved_patch() {
+    use serde_json::json;
+    use std::collections::HashMap;
+    let svc = make_service();
+    let original = svc
+        .store_memory(
+            "u1",
+            "original",
+            MemoryType::Semantic,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let first = HashMap::from([
+        ("workflow_id".into(), json!("workflow-a")),
+        ("workflow_label".into(), json!("platform_default")),
+        ("business_memory_type".into(), json!("factual_memory")),
+    ]);
+    let a = svc
+        .correct_with_metadata_on_branch(
+            "u1",
+            None,
+            &original.memory_id,
+            "source A",
+            Some(&first),
+            Some("session-a"),
+        )
+        .await
+        .unwrap();
+    let patch = HashMap::from([
+        ("workflow_id".into(), json!("workflow-b")),
+        ("workflow_label".into(), json!(null)),
+    ]);
+    let b = svc
+        .correct_with_metadata_on_branch(
+            "u1",
+            None,
+            &a.memory_id,
+            "source B",
+            Some(&patch),
+            Some("session-b"),
+        )
+        .await
+        .unwrap();
+    let metadata = b.extra_metadata.as_ref().unwrap();
+    assert_eq!(metadata["workflow_id"], "workflow-b");
+    assert_eq!(metadata["business_memory_type"], "factual_memory");
+    assert!(!metadata.contains_key("workflow_label"));
+    assert_eq!(b.session_id.as_deref(), Some("session-b"));
+    let reserved = HashMap::from([(
+        memoria_core::STORE_REQUEST_HASH_FIELD.into(),
+        json!("forged"),
+    )]);
+    assert!(svc
+        .correct_with_metadata_on_branch(
+            "u1",
+            None,
+            &b.memory_id,
+            "must not commit",
+            Some(&reserved),
+            None
+        )
+        .await
+        .is_err());
+    let plain = svc
+        .correct("u1", &b.memory_id, "operator correction")
+        .await
+        .unwrap();
+    assert_eq!(plain.extra_metadata.unwrap()["workflow_id"], "workflow-b");
+    assert_eq!(plain.session_id.as_deref(), Some("session-b"));
+}
+
+#[tokio::test]
 async fn test_list_active_excludes_deleted() {
     let svc = make_service();
     svc.store_memory(
@@ -646,7 +724,17 @@ async fn test_memory_types() {
         MemoryType::Episodic,
     ] {
         let m = svc
-            .store_memory("u1", "content", mt.clone(), None, None, None, None, None, None)
+            .store_memory(
+                "u1",
+                "content",
+                mt.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(m.memory_type, mt);

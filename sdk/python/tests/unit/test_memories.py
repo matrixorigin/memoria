@@ -1,4 +1,4 @@
-"""Unit tests for MemoriesResource (sync)."""
+"""Unit tests for memory resources."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import pytest
 from pytest_httpx import HTTPXMock
 
 from memoria import (
+    AsyncMemoriaClient,
     MemoriaAuthError,
     MemoriaClient,
     MemoriaForbiddenError,
@@ -563,7 +564,9 @@ def test_delete_happy_path(httpx_mock: HTTPXMock, client: MemoriaClient) -> None
 
 
 def test_erase_group_posts_explicit_mode(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
-    httpx_mock.add_response(json={"memories": 2, "snapshots_dropped": 1, "snapshots_retained": False})
+    httpx_mock.add_response(
+        json={"memories": 2, "snapshots_dropped": 1, "snapshots_retained": False}
+    )
     result = client.memories.erase(mode="group")
     assert isinstance(result, EraseResult)
     assert result.memories == 2
@@ -577,6 +580,41 @@ def test_erase_group_posts_explicit_mode(httpx_mock: HTTPXMock, client: MemoriaC
 def test_erase_group_rejects_subject(client: MemoriaClient) -> None:
     with pytest.raises(MemoriaValidationError):
         client.memories.erase(mode="group", subject_id="consumer")
+
+
+def test_erase_workflow_is_explicit(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
+    httpx_mock.add_response(
+        json={"memories": 2, "snapshots_dropped": 0, "snapshots_retained": True}
+    )
+    assert client.memories.erase(mode="workflow", workflow_id="workflow-a").memories == 2
+    assert json.loads(httpx_mock.get_request().content) == {
+        "mode": "workflow", "workflow_id": "workflow-a"
+    }
+
+
+@pytest.mark.asyncio
+async def test_async_workflow_erase_is_explicit(
+    httpx_mock: HTTPXMock, async_client: AsyncMemoriaClient
+) -> None:
+    httpx_mock.add_response(
+        json={"memories": 2, "snapshots_dropped": 0, "snapshots_retained": True}
+    )
+    result = await async_client.memories.erase(mode="workflow", workflow_id="workflow-a")
+    assert result.memories == 2
+    assert json.loads(httpx_mock.get_request().content) == {
+        "mode": "workflow", "workflow_id": "workflow-a"
+    }
+
+
+@pytest.mark.parametrize("body", [
+    {"mode":"workflow"}, {"mode":"workflow", "workflow_id":" padded"},
+    {"mode":"workflow", "workflow_id":"中"*43},
+    {"mode":"workflow", "workflow_id":"a", "subject_id":"s"},
+    {"mode":"group", "workflow_id":"a"},
+])
+def test_workflow_erase_rejects_ambiguous_scope(client: MemoriaClient, body: dict) -> None:
+    with pytest.raises(MemoriaValidationError):
+        client.memories.erase(**body)
 
 
 def test_purge_by_ids(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:

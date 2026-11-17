@@ -1134,6 +1134,14 @@ impl Default for UserRetrievalParams {
 pub struct MemoryEraseSelector {
     pub subject_id: Option<String>,
     pub connector_id: Option<String>,
+    pub workflow_id: Option<String>,
+}
+
+impl MemoryEraseSelector {
+    /// A workflow filter without a subject is still a narrow erase.
+    pub fn is_full_scope(&self) -> bool {
+        self.subject_id.is_none() && self.connector_id.is_none() && self.workflow_id.is_none()
+    }
 }
 
 /// Counts of physically removed rows. `snapshots_retained` is true when this
@@ -1170,6 +1178,19 @@ fn memory_erase_predicate(
     }
     let mut binds = vec![user_id.to_string()];
     let mut predicate = "user_id = ?".to_string();
+    if let Some(workflow) = &selector.workflow_id {
+        if !valid_erase_token(workflow, 128)
+            || selector.subject_id.is_some()
+            || selector.connector_id.is_some()
+        {
+            return Err(MemoriaError::Validation(
+                "invalid workflow erase selector".into(),
+            ));
+        }
+        predicate.push_str(" AND JSON_UNQUOTE(JSON_EXTRACT(extra_metadata, '$.workflow_id')) = ?");
+        binds.push(workflow.clone());
+        return Ok((predicate, binds));
+    }
     match (&selector.subject_id, &selector.connector_id) {
         (None, None) => {}
         (Some(subject), None) => {
@@ -1198,6 +1219,26 @@ fn memory_erase_predicate(
         }
     }
     Ok((predicate, binds))
+}
+
+/// Related rows are shared by memory_id across branches. Keep them if another
+/// branch still has that ID attributed to a different (or unknown) workflow.
+fn erase_link_predicate(
+    tables: &[String],
+    scope: &str,
+    selector: &MemoryEraseSelector,
+    predicate: &str,
+    binds: &[String],
+) -> (String, Vec<String>) {
+    let mut predicate = predicate.to_string();
+    let mut binds = binds.to_vec();
+    if let Some(workflow) = &selector.workflow_id {
+        for table in tables {
+            predicate.push_str(&format!(" AND memory_id NOT IN (SELECT memory_id FROM {table} WHERE user_id = ? AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(extra_metadata, '$.workflow_id')), '') <> ?)"));
+            binds.extend([scope.to_string(), workflow.clone()]);
+        }
+    }
+    (predicate, binds)
 }
 
 /// One erase statement. Boxed so the step future stays `'static` on Rust 1.85.
@@ -1321,6 +1362,7 @@ mod erase_scope_tests {
         let selector = MemoryEraseSelector {
             subject_id: Some("subject-a".into()),
             connector_id: Some("connector-a".into()),
+            ..Default::default()
         };
         let (predicate, binds) = memory_erase_predicate("grp", &selector).expect("predicate");
         let sql = subject_graph_edge_delete_sql("edges", "nodes", "memories", &predicate);
@@ -1351,6 +1393,52 @@ mod erase_scope_tests {
         assert!(sql.contains("NOT IN"));
         assert!(sql.contains("mem_memory_entity_links"));
         assert_eq!(sql.matches('?').count(), 2);
+    }
+
+    #[test]
+    fn workflow_without_subject_is_narrow_and_binds_both_edge_endpoints() {
+        let selector = MemoryEraseSelector {
+            workflow_id: Some("wf-'a".into()),
+            ..Default::default()
+        };
+        assert!(!selector.is_full_scope());
+        assert!(MemoryEraseSelector::default().is_full_scope());
+        let (predicate, binds) = memory_erase_predicate("scope", &selector).unwrap();
+        assert!(predicate.contains("$.workflow_id"));
+        assert!(!predicate.contains("wf-'a"));
+        assert_eq!(binds, vec!["scope", "wf-'a"]);
+        let sql = subject_graph_edge_delete_sql("edges", "nodes", "memories", &predicate);
+        assert_eq!(
+            sql.matches('?').count(),
+            subject_graph_edge_binds(&binds).len()
+        );
+        let mixed = MemoryEraseSelector {
+            subject_id: Some("subject".into()),
+            ..selector
+        };
+        assert!(memory_erase_predicate("scope", &mixed).is_err());
+    }
+
+    #[test]
+    fn workflow_shared_links_survive_when_any_branch_has_a_different_attribution() {
+        let selector = MemoryEraseSelector {
+            workflow_id: Some("workflow-a".into()),
+            ..Default::default()
+        };
+        let (predicate, binds) = memory_erase_predicate("scope", &selector).unwrap();
+        let tables = vec!["mem_memories".to_string(), "branch_copy".to_string()];
+        let (linked, linked_binds) =
+            super::erase_link_predicate(&tables, "scope", &selector, &predicate, &binds);
+        assert_eq!(linked.matches("NOT IN").count(), 2);
+        assert!(linked.contains("COALESCE")); // null/missing attribution is also a surviving reference
+        assert_eq!(linked.matches('?').count(), linked_binds.len());
+        let sql = subject_graph_edge_delete_sql("edges", "nodes", "mem_memories", &linked);
+        assert_eq!(
+            sql.matches('?').count(),
+            subject_graph_edge_binds(&linked_binds).len()
+        );
+        // Only link selection is guarded; matching memory rows still use the original predicate.
+        assert!(!predicate.contains("NOT IN"));
     }
 
     #[test]
@@ -5240,7 +5328,7 @@ impl SqlMemoryStore {
     ) -> Result<MemoryEraseReport, MemoriaError> {
         let (predicate, binds) = memory_erase_predicate(user_id, selector)?;
         let mut report = MemoryEraseReport::default();
-        if selector.subject_id.is_none() {
+        if selector.is_full_scope() {
             let (dropped, retained) = self.drop_scope_snapshots(user_id, gate).await?;
             report.snapshots_dropped = dropped;
             report.snapshots_retained = retained;
@@ -5258,13 +5346,15 @@ impl SqlMemoryStore {
         }
 
         let memory_tables = self.erase_memory_tables(user_id).await?;
+        let (link_predicate, link_binds) =
+            erase_link_predicate(&memory_tables, user_id, selector, &predicate, &binds);
         report.stats = self
             .delete_memory_id_rows(
                 gate,
                 "mem_memories_stats",
                 &memory_tables,
-                &predicate,
-                &binds,
+                &link_predicate,
+                &link_binds,
             )
             .await?;
         report.feedback = self
@@ -5272,8 +5362,8 @@ impl SqlMemoryStore {
                 gate,
                 "mem_retrieval_feedback",
                 &memory_tables,
-                &predicate,
-                &binds,
+                &link_predicate,
+                &link_binds,
                 selector,
             )
             .await?;
@@ -5282,8 +5372,8 @@ impl SqlMemoryStore {
                 gate,
                 "mem_edit_log",
                 &memory_tables,
-                &predicate,
-                &binds,
+                &link_predicate,
+                &link_binds,
                 selector,
             )
             .await?;
@@ -5292,8 +5382,8 @@ impl SqlMemoryStore {
                 gate,
                 "mem_entity_links",
                 &memory_tables,
-                &predicate,
-                &binds,
+                &link_predicate,
+                &link_binds,
                 selector,
             )
             .await?;
@@ -5302,26 +5392,26 @@ impl SqlMemoryStore {
                 gate,
                 "mem_memory_entity_links",
                 &memory_tables,
-                &predicate,
-                &binds,
+                &link_predicate,
+                &link_binds,
                 selector,
             )
             .await?;
         report.graph_edges = self
-            .delete_graph_edges(gate, &memory_tables, &predicate, &binds, selector)
+            .delete_graph_edges(gate, &memory_tables, &link_predicate, &link_binds, selector)
             .await?;
         report.graph_nodes = self
             .delete_scoped_or_linked(
                 gate,
                 "memory_graph_nodes",
                 &memory_tables,
-                &predicate,
-                &binds,
+                &link_predicate,
+                &link_binds,
                 selector,
             )
             .await?;
         let entities = self.t("mem_entities");
-        report.entities = if selector.subject_id.is_none() {
+        report.entities = if selector.is_full_scope() {
             run_gated_erase_step(
                 gate,
                 self.owned_delete(
@@ -5460,7 +5550,7 @@ impl SqlMemoryStore {
         selector: &MemoryEraseSelector,
     ) -> Result<u64, MemoriaError> {
         let edges = self.t("memory_graph_edges");
-        if selector.subject_id.is_none() {
+        if selector.is_full_scope() {
             return run_gated_erase_step(
                 gate,
                 self.owned_delete(
@@ -5494,7 +5584,7 @@ impl SqlMemoryStore {
         binds: &[String],
         selector: &MemoryEraseSelector,
     ) -> Result<u64, MemoriaError> {
-        if selector.subject_id.is_none() {
+        if selector.is_full_scope() {
             return run_gated_erase_step(
                 gate,
                 self.owned_delete(

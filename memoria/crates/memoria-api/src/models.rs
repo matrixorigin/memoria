@@ -353,6 +353,19 @@ pub struct CorrectRequest {
     pub branch: Option<String>,
 }
 
+/// Old servers reject this endpoint instead of ignoring source attribution.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttributedCorrectRequest {
+    pub new_content: String,
+    pub reason: Option<String>,
+    pub branch: Option<String>,
+    /// Merges top-level caller-owned keys atomically with the content.
+    /// Null removes a key; keys absent from the patch are preserved.
+    pub extra_metadata_patch: HashMap<String, serde_json::Value>,
+    pub session_id: String,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IdempotentCorrectRequest {
@@ -606,10 +619,34 @@ pub struct EraseRequest {
     pub subject_id: Option<String>,
     #[serde(default)]
     pub connector_id: Option<String>,
+    #[serde(default)]
+    pub workflow_id: Option<String>,
 }
 
 impl EraseRequest {
     pub fn selector(&self) -> Result<memoria_storage::MemoryEraseSelector, &'static str> {
+        if self.mode == "workflow" {
+            let id = self
+                .workflow_id
+                .as_deref()
+                .ok_or("workflow_id is required")?;
+            if id.is_empty()
+                || id.len() > 128
+                || id.trim() != id
+                || id.chars().any(char::is_control)
+                || self.subject_id.is_some()
+                || self.connector_id.is_some()
+            {
+                return Err("invalid workflow erase identifiers");
+            }
+            return Ok(memoria_storage::MemoryEraseSelector {
+                workflow_id: Some(id.to_string()),
+                ..Default::default()
+            });
+        }
+        if self.workflow_id.is_some() {
+            return Err("workflow_id requires workflow mode");
+        }
         let subject_id = self
             .subject_id
             .as_deref()
@@ -630,18 +667,48 @@ impl EraseRequest {
                 Ok(memoria_storage::MemoryEraseSelector {
                     subject_id,
                     connector_id: None,
+                    ..Default::default()
                 })
             }
             "subject_connector" if subject_id.is_some() && connector_id.is_some() => {
                 Ok(memoria_storage::MemoryEraseSelector {
                     subject_id,
                     connector_id,
+                    ..Default::default()
                 })
             }
             "group" | "subject" | "subject_connector" => {
                 Err("erase mode does not match the supplied identifiers")
             }
-            _ => Err("mode must be group, subject, or subject_connector"),
+            _ => Err("mode must be group, subject, subject_connector, or workflow"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod workflow_erase_tests {
+    use super::EraseRequest;
+    use serde_json::json;
+
+    #[test]
+    fn workflow_erase_never_becomes_group_erase() {
+        let request: EraseRequest =
+            serde_json::from_value(json!({"mode":"workflow", "workflow_id":"wf-a"})).unwrap();
+        let selector = request.selector().unwrap();
+        assert!(!selector.is_full_scope());
+        assert_eq!(selector.workflow_id.as_deref(), Some("wf-a"));
+        for value in [
+            json!({"mode":"workflow"}),
+            json!({"mode":"workflow", "workflow_id":""}),
+            json!({"mode":"workflow", "workflow_id":" wf-a"}),
+            json!({"mode":"workflow", "workflow_id":"wf-a", "subject_id":"s"}),
+            json!({"mode":"workflow", "workflow_id":"wf-a", "connector_id":"c"}),
+            json!({"mode":"group", "workflow_id":"wf-a"}),
+        ] {
+            assert!(serde_json::from_value::<EraseRequest>(value)
+                .unwrap()
+                .selector()
+                .is_err());
         }
     }
 }
@@ -983,6 +1050,7 @@ mod tests {
             mode: "group".into(),
             subject_id: None,
             connector_id: None,
+            workflow_id: None,
         };
         assert!(group.selector().unwrap().subject_id.is_none());
 
@@ -990,6 +1058,7 @@ mod tests {
             mode: "subject".into(),
             subject_id: Some("consumer".into()),
             connector_id: None,
+            workflow_id: None,
         };
         assert_eq!(
             subject.selector().unwrap().subject_id.as_deref(),
@@ -1000,6 +1069,7 @@ mod tests {
             mode: "group".into(),
             subject_id: Some("consumer".into()),
             connector_id: None,
+            workflow_id: None,
         };
         assert!(mismatched.selector().is_err());
     }

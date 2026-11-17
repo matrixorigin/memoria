@@ -705,6 +705,39 @@ pub async fn correct_memory(
     Path(id): Path<String>,
     Json(req): Json<CorrectRequest>,
 ) -> ApiResult<MemoryResponse> {
+    correct_memory_with_source(&state, auth, id, req, None, None).await
+}
+
+pub async fn correct_memory_attributed(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    Json(req): Json<AttributedCorrectRequest>,
+) -> ApiResult<MemoryResponse> {
+    let request = CorrectRequest {
+        new_content: req.new_content,
+        reason: req.reason,
+        branch: req.branch,
+    };
+    correct_memory_with_source(
+        &state,
+        auth,
+        id,
+        request,
+        Some(&req.extra_metadata_patch),
+        Some(&req.session_id),
+    )
+    .await
+}
+
+async fn correct_memory_with_source(
+    state: &AppState,
+    auth: AuthUser,
+    id: String,
+    req: CorrectRequest,
+    metadata: Option<&std::collections::HashMap<String, serde_json::Value>>,
+    session_id: Option<&str>,
+) -> ApiResult<MemoryResponse> {
     let effective_user_id = if auth.is_master {
         find_memory_any_user(&state, &id, branch_param(req.branch.as_deref()))
             .await?
@@ -724,11 +757,13 @@ pub async fn correct_memory(
     };
     let m = state
         .service
-        .correct_on_branch(
+        .correct_with_metadata_on_branch(
             &effective_user_id,
             branch_param(req.branch.as_deref()),
             &id,
             &req.new_content,
+            metadata,
+            session_id,
         )
         .await
         .map_err(api_err_typed)?;
@@ -1166,10 +1201,7 @@ fn erase_failure(error: memoria_core::MemoriaError) -> (StatusCode, String) {
         }
         other => {
             let (status, _) = api_err_typed(other);
-            (
-                status,
-                r#"{"code":"memory_erase_incomplete"}"#.to_string(),
-            )
+            (status, r#"{"code":"memory_erase_incomplete"}"#.to_string())
         }
     }
 }

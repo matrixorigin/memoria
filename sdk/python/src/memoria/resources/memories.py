@@ -31,17 +31,18 @@ _FULLTEXT_QUERY_MAX_BYTES = 4096
 _FULLTEXT_SEARCH_DEFAULT_LIMIT = 20
 _FULLTEXT_SEARCH_MAX_LIMIT = 100
 _MEMORY_CURSOR_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
-_ERASE_MODES = frozenset({"group", "subject", "subject_connector"})
+_ERASE_MODES = frozenset({"group", "subject", "subject_connector", "workflow"})
 
 
 def _erase_body(
     mode: str,
     subject_id: str | None,
     connector_id: str | None,
+    workflow_id: str | None = None,
 ) -> dict[str, str]:
     if mode not in _ERASE_MODES:
         raise MemoriaValidationError(
-            "erase: mode must be group, subject, or subject_connector"
+            "erase: mode must be group, subject, subject_connector, or workflow"
         )
     if mode == "group" and (subject_id is not None or connector_id is not None):
         raise MemoriaValidationError("erase: group mode does not accept identifiers")
@@ -51,11 +52,24 @@ def _erase_body(
         raise MemoriaValidationError(
             "erase: subject_connector mode requires subject_id and connector_id"
         )
+    if mode != "workflow" and workflow_id is not None:
+        raise MemoriaValidationError("erase: workflow_id requires workflow mode")
+    if mode == "workflow" and (
+        not isinstance(workflow_id, str) or not workflow_id
+        or workflow_id.strip() != workflow_id or len(workflow_id.encode()) > 128
+        or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in workflow_id)
+        or subject_id is not None or connector_id is not None
+    ):
+        raise MemoriaValidationError(
+            "erase: workflow mode requires workflow_id only (up to 128 bytes)"
+        )
     body = {"mode": mode}
     if subject_id is not None:
         body["subject_id"] = subject_id
     if connector_id is not None:
         body["connector_id"] = connector_id
+    if workflow_id is not None:
+        body["workflow_id"] = workflow_id
     return body
 
 _MEMORY_TYPE_NAMES = {
@@ -778,8 +792,9 @@ class MemoriesResource:
         mode: str,
         subject_id: str | None = None,
         connector_id: str | None = None,
+        workflow_id: str | None = None,
     ) -> EraseResult:
-        body = _erase_body(mode, subject_id, connector_id)
+        body = _erase_body(mode, subject_id, connector_id, workflow_id)
         data = self._client._request("POST", "/v1/memories/erase", json=body)
         return EraseResult.from_dict(data)
 
@@ -1183,8 +1198,9 @@ class AsyncMemoriesResource:
         mode: str,
         subject_id: str | None = None,
         connector_id: str | None = None,
+        workflow_id: str | None = None,
     ) -> EraseResult:
-        body = _erase_body(mode, subject_id, connector_id)
+        body = _erase_body(mode, subject_id, connector_id, workflow_id)
         data = await self._client._arequest("POST", "/v1/memories/erase", json=body)
         return EraseResult.from_dict(data)
 
