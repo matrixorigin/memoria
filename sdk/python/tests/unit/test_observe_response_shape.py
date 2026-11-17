@@ -14,7 +14,10 @@ INVALID_BODIES = {
     "string": httpx.Response(200, json="text"),
     "number": httpx.Response(200, json=42),
     "false": httpx.Response(200, json=False),
-    "json-null": httpx.Response(200, json=None),
+    # httpx.Response(200, json=None) sends an empty body, so spell out the literal.
+    "json-null": httpx.Response(
+        200, content=b"null", headers={"content-type": "application/json"}
+    ),
     "empty-200": httpx.Response(200, content=b""),
     "204": httpx.Response(204),
     "memories-string": httpx.Response(200, json={"memories": "abc"}),
