@@ -126,7 +126,7 @@ class MemoriaClient(_HttpTransport):
             }
         )
         data = self._request("POST", "/v1/observe", json=body)
-        return ObserveResult.from_dict(data or {})
+        return ObserveResult.from_dict(data)
 
     def observe_deduplicated(
         self,
@@ -148,7 +148,7 @@ class MemoriaClient(_HttpTransport):
             }
         )
         data = self._request("POST", "/v1/observe/deduplicated", json=body)
-        return ObserveResult.from_dict(data or {})
+        return ObserveResult.from_dict(data)
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +243,7 @@ class AsyncMemoriaClient(_HttpTransport):
             }
         )
         data = await self._arequest("POST", "/v1/observe", json=body)
-        return ObserveResult.from_dict(data or {})
+        return ObserveResult.from_dict(data)
 
     async def observe_deduplicated(
         self,
@@ -265,4 +265,4 @@ class AsyncMemoriaClient(_HttpTransport):
             }
         )
         data = await self._arequest("POST", "/v1/observe/deduplicated", json=body)
-        return ObserveResult.from_dict(data or {})
+        return ObserveResult.from_dict(data)

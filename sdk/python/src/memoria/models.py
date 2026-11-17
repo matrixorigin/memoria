@@ -271,7 +271,19 @@ class ObserveResult:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> ObserveResult:
-        return cls(
-            memories=list(d.get("memories", [])),
-            warning=d.get("warning"),
-        )
+        # The endpoint always answers with an object. An empty or non-object 2xx body
+        # must not be reported as "no memories extracted".
+        if not isinstance(d, dict):
+            raise MemoriaResponseError(
+                "Invalid observe response: expected a JSON object, got "
+                + ("an empty body" if d is None else type(d).__name__)
+            )
+        memories = d.get("memories")
+        if memories is None:  # an explicit null means no memories
+            memories = []
+        elif not isinstance(memories, list):
+            raise MemoriaResponseError(
+                "Invalid observe response: memories must be an array, "
+                f"got {type(memories).__name__}"
+            )
+        return cls(memories=list(memories), warning=d.get("warning"))
