@@ -227,7 +227,12 @@ fn luhn_valid_card_spans(text: &str, protected: &[(usize, usize)]) -> Vec<(usize
 
         let mut digits = Vec::new();
         let mut group_len = 0;
-        for &(byte, c) in chars.iter().skip(start_index) {
+        // A card is grouped either with dots or with spaces/hyphens, never both.
+        // Mixing them would let a sentence-ending period join two separate numbers.
+        let mut dotted = false;
+        let mut spaced = false;
+        let mut rest = chars.iter().skip(start_index).peekable();
+        while let Some(&(byte, c)) = rest.next() {
             if let Some(digit) = decimal_digit(c) {
                 digits.push(digit);
                 group_len += 1;
@@ -245,12 +250,22 @@ fn luhn_valid_card_spans(text: &str, protected: &[(usize, usize)]) -> Vec<(usize
                 }
             } else if c == '.' {
                 // Dot-grouped cards (3056.930902.5904) use 4-6 digit groups. Requiring
-                // that keeps fractional timestamps such as 1730284800.123456 out.
-                if !(4..=6).contains(&group_len) {
+                // that keeps fractional timestamps such as 1730284800.123456 out. The
+                // dot must also be followed directly by a digit, so a period that ends a
+                // sentence never continues into the next number.
+                let next_is_digit = rest
+                    .peek()
+                    .is_some_and(|&&(_, n)| decimal_digit(n).is_some());
+                if spaced || !next_is_digit || !(4..=6).contains(&group_len) {
                     break;
                 }
+                dotted = true;
                 group_len = 0;
             } else if matches!(c, ' ' | '-') {
+                if dotted {
+                    break;
+                }
+                spaced = true;
                 group_len = 0;
             } else {
                 break;
@@ -978,6 +993,45 @@ mod tests {
             let result = check_sensitivity(text);
             assert_eq!(result.redacted_content.as_deref(), Some(expected), "{text}");
         }
+    }
+
+    #[test]
+    fn sentence_punctuation_does_not_join_independent_cards() {
+        // Both numbers are Luhn-valid. The first 14 digits plus the first four digits
+        // of the next card also form a Luhn-valid 18-digit run, which used to win and
+        // leave the rest of the second card in the clear.
+        for (text, expected) in [
+            (
+                "card 3056 930902 5904. 5553 0000 0000 0000 on file",
+                "card [card]. [card] on file",
+            ),
+            (
+                "card 3056.930902.5904. 5553.0000.0000.0000 on file",
+                "card [card]. [card] on file",
+            ),
+            ("4111 1111 1111 1111. 5555 5555 5555 4444", "[card]. [card]"),
+            // No space after the period: dots and spaces are never mixed in one card.
+            (
+                "card 3056 930902 5904.5553 0000 0000 0000 on file",
+                "card [card].[card] on file",
+            ),
+        ] {
+            let result = check_sensitivity(text);
+            assert_eq!(result.redacted_content.as_deref(), Some(expected), "{text}");
+        }
+    }
+
+    #[test]
+    fn dotted_numbers_that_are_not_cards_stay_untouched() {
+        for text in [
+            "ip 192.168.100.200 ok",
+            "at 1730284800.123456 seconds",
+            "version 10.20.30.40 shipped",
+        ] {
+            assert_eq!(check_sensitivity(text).redacted_content, None, "{text}");
+        }
+        let result = check_sensitivity("call 555-867-5309 123");
+        assert_eq!(result.redacted_content.as_deref(), Some("call [phone] 123"));
     }
 
     #[test]
