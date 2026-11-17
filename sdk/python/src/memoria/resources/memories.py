@@ -8,7 +8,7 @@ import math
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
-from ..exceptions import MemoriaValidationError
+from ..exceptions import MemoriaResponseError, MemoriaValidationError
 from ..models import Memory, MemoryPage, PurgeResult, RetrieveResult
 
 if TYPE_CHECKING:
@@ -36,6 +36,16 @@ _MEMORY_TYPE_NAMES = {
 
 def _strip_none(d: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
+
+
+def _parse_memory_list(data: Any) -> builtins.list[Memory]:
+    """Parse a batch-store response, which must be a JSON array of memories."""
+    if not isinstance(data, list):
+        raise MemoriaResponseError(
+            "Invalid store_batch response: expected a JSON array, got "
+            + ("an empty body" if data is None else type(data).__name__)
+        )
+    return [Memory.from_dict(m) for m in data]
 
 
 def _memory_path(memory_id: str, suffix: str = "") -> str:
@@ -400,7 +410,7 @@ class MemoriesResource:
         if subject_id is not None:
             body["subject_id"] = subject_id
         data = self._client._request("POST", "/v1/memories/batch", json=body)
-        return [Memory.from_dict(m) for m in data]
+        return _parse_memory_list(data)
 
     def retrieve(
         self,
@@ -739,7 +749,7 @@ class AsyncMemoriesResource:
         if subject_id is not None:
             body["subject_id"] = subject_id
         data = await self._client._arequest("POST", "/v1/memories/batch", json=body)
-        return [Memory.from_dict(m) for m in data]
+        return _parse_memory_list(data)
 
     async def retrieve(
         self,

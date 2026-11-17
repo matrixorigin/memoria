@@ -3,6 +3,11 @@
 ## [Unreleased]
 
 ### Fixed
+- A 2xx response with an empty body (204, zero-length 200, or JSON `null`) from an endpoint that
+  returns a JSON object no longer leaks `AttributeError: 'NoneType' object has no attribute 'get'`.
+  `profile.me`, `memories.purge/correct/retrieve/search`, `snapshots.create`, `branches.apply`,
+  `governance.*` and `memories.store_batch` now raise `MemoriaResponseError`, so existing
+  `except MemoriaError` handlers catch it. `observe()` is tracked separately in #498.
 - Every `httpx.TransportError` now surfaces as `MemoriaConnectionError` with the original
   exception preserved as `__cause__`. `RemoteProtocolError` ("server disconnected without
   sending a response"), `LocalProtocolError` and `ProxyError` are siblings of `NetworkError`

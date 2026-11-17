@@ -15,6 +15,21 @@ from typing import Any
 from .exceptions import MemoriaResponseError
 
 
+def _require_object(d: Any, what: str) -> dict[str, Any]:
+    """Return ``d`` if it is a JSON object, else raise ``MemoriaResponseError``.
+
+    A 2xx response with an empty body (204, zero-length 200, JSON ``null``) reaches
+    the parsers as ``None``. Endpoints that promise a JSON object treat that as a
+    protocol violation rather than leaking ``AttributeError`` from ``d.get``.
+    """
+    if not isinstance(d, dict):
+        raise MemoriaResponseError(
+            f"Invalid {what} response: expected a JSON object, got "
+            + ("an empty body" if d is None else type(d).__name__)
+        )
+    return d
+
+
 def _parse_dt(value: str | None) -> datetime | None:
     """Parse an ISO-8601 / RFC-3339 string to a timezone-aware datetime, or return None."""
     if not value:
@@ -59,6 +74,7 @@ class Memory:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Memory:
+        d = _require_object(d, "memory")
         return cls(
             memory_id=d["memory_id"],
             content=d["content"],
@@ -107,6 +123,7 @@ class RetrieveResult:
         # REST returns either a plain array or {"results": [...], "explain": {...}}
         if isinstance(d, list):
             return cls(items=[Memory.from_dict(m) for m in d])
+        d = _require_object(d, "retrieve")
         results = d.get("results", d.get("items", []))
         return cls(
             items=[Memory.from_dict(m) for m in results],
@@ -124,6 +141,7 @@ class PurgeResult:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> PurgeResult:
+        d = _require_object(d, "purge")
         return cls(
             purged=int(d.get("purged", 0)),
             snapshot_name=d.get("snapshot_name"),
@@ -141,6 +159,7 @@ class Snapshot:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Snapshot:
+        d = _require_object(d, "snapshot")
         return cls(
             name=d["name"],
             created_at=_parse_dt(d.get("created_at")),
@@ -158,6 +177,7 @@ class Branch:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Branch:
+        d = _require_object(d, "branch")
         return cls(
             name=d["name"],
             active=bool(d.get("active", False)),
@@ -180,6 +200,7 @@ class ApplyResult:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> ApplyResult:
+        d = _require_object(d, "branch apply")
         return cls(
             applied_adds=list(d.get("applied_adds", [])),
             applied_updates=list(d.get("applied_updates", [])),
@@ -202,6 +223,7 @@ class Profile:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Profile:
+        d = _require_object(d, "profile")
         return cls(
             user_id=d.get("user_id", ""),
             profile=d.get("profile", ""),
@@ -243,6 +265,7 @@ class GovernanceResult:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> GovernanceResult:
+        d = _require_object(d, "governance")
         return cls(
             skipped=bool(d.get("skipped", False)),
             cooldown_remaining_s=d.get("cooldown_remaining_s"),
