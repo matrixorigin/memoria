@@ -259,7 +259,10 @@ export class MemoriaHttpTransport {
     if (args.reason) body.reason = args.reason;
     const data = await this.post("/v1/memories/purge", body);
     const rec = this.asRecord(data);
-    const count = typeof rec?.purged === "number" ? rec.purged : 0;
+    const count = rec?.purged;
+    if (typeof count !== "number" || !Number.isSafeInteger(count) || count < 0) {
+      throw new Error("Memoria API returned invalid purge response: missing or invalid purged count");
+    }
     return `Purged ${count} memory(ies).`;
   }
 
