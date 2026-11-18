@@ -65,7 +65,7 @@ services:
     environment:
       - RUST_LOG=${RUST_LOG:-info,memoria_api=info,memoria_service=info,tower_http=info}
       - DATABASE_URL=${DATABASE_URL:-mysql://root:${MEMORIA_DB_PASSWORD:-111}@matrixone:6001/${MEMORIA_DB_NAME:-memoria}}
-      - MASTER_KEY=${MEMORIA_MASTER_KEY:?Set MEMORIA_MASTER_KEY in .env (min 16 chars)}
+      - MASTER_KEY=${MEMORIA_MASTER_KEY:?Set MEMORIA_MASTER_KEY in .env (min 16 chars), start from cp .env.example .env}
       - EMBEDDING_PROVIDER=${MEMORIA_EMBEDDING_PROVIDER:-openai}
       - EMBEDDING_MODEL=${MEMORIA_EMBEDDING_MODEL:-BAAI/bge-m3}
       - EMBEDDING_DIM=${MEMORIA_EMBEDDING_DIM:-1024}
