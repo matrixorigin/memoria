@@ -130,12 +130,6 @@ fn classify_fulltext_error(error: &sqlx::Error) -> Option<FulltextFailure> {
         .and_then(|(number, message)| classify_fulltext_error_code(number, message))
 }
 
-/// True for the recognized FULLTEXT failures (empty pattern, unusable index) that a
-/// caller may degrade past instead of failing the whole request (#247).
-pub fn is_degradable_fulltext_error(error: &sqlx::Error) -> bool {
-    classify_fulltext_error(error).is_some()
-}
-
 /// Rows of a FULLTEXT query, or a signal that the index is unusable and the
 /// caller must answer the same scoped query through LIKE.
 #[derive(Debug)]
@@ -6913,25 +6907,14 @@ mod tests {
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex, OnceLock};
 
-    #[test]
-    fn only_recognized_fulltext_failures_are_degradable() {
-        // Errors that are not database errors never carry a FULLTEXT code, so they
-        // must keep propagating instead of being swallowed as an empty result.
-        assert!(!super::is_degradable_fulltext_error(
-            &sqlx::Error::RowNotFound
-        ));
-        assert!(!super::is_degradable_fulltext_error(
-            &sqlx::Error::PoolTimedOut
-        ));
-    }
-
-    /// `purge` finds its targets through `find_ids_by_topic`. With the FULLTEXT index
-    /// unusable (simulated, see `SIMULATE_UNAVAILABLE_FULLTEXT_INDEX`) it must answer
-    /// from the scoped LIKE scan instead of failing. The real 20301 failure cannot be
-    /// produced on demand, so this drives the degraded branch end to end. The test is
-    /// skipped without `DATABASE_URL`.
+    /// `purge` finds its targets through `find_ids_by_topic`. This breaks the FULLTEXT
+    /// index for real instead of simulating it: the hidden index table is replaced by
+    /// one without the `word` column, which is the unusable state of #247 and makes
+    /// MatrixOne answer `20301 column word does not exist`. The topic lookup must then
+    /// degrade to the scoped LIKE scan, while any other database error still surfaces.
+    /// The test works in its own database and is skipped without `DATABASE_URL`.
     #[tokio::test(flavor = "current_thread")]
-    async fn unavailable_fulltext_index_degrades_topic_lookup_to_like() {
+    async fn broken_fulltext_index_degrades_topic_lookup_and_other_errors_surface() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
             eprintln!("DATABASE_URL not set; skipping topic lookup fallback database test");
             return;
@@ -6940,13 +6923,22 @@ mod tests {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(1024);
-        let store = SqlMemoryStore::connect(&url, dim, uuid::Uuid::new_v4().to_string())
+        let admin = SqlMemoryStore::connect(&url, dim, uuid::Uuid::new_v4().to_string())
             .await
             .expect("connect");
+        let db = format!("memoria_ft_broken_{}", uuid::Uuid::new_v4().simple());
+        sqlx::raw_sql(&format!("CREATE DATABASE `{db}`"))
+            .execute(admin.pool())
+            .await
+            .expect("create isolated database");
+        let isolated_url = format!("{}/{db}", url.rsplit_once('/').expect("database url").0);
+        let store = SqlMemoryStore::connect(&isolated_url, dim, uuid::Uuid::new_v4().to_string())
+            .await
+            .expect("connect isolated database");
         store.migrate().await.expect("migrate");
-        let user = format!("topic_fallback_{}", uuid::Uuid::new_v4().simple());
-        let other = format!("{user}_other");
         let table = store.t("mem_memories");
+        let user = format!("topic_broken_{}", uuid::Uuid::new_v4().simple());
+        let other = format!("{user}_other");
         for (suffix, owner, content, active) in [
             ("hit", &user, "deploy checklist for staging", true),
             ("hit_again", &user, "Notes: deploy checklist v2", true),
@@ -6963,7 +6955,7 @@ mod tests {
             .bind(owner)
             .bind(content)
             .bind(active)
-            .execute(&store.pool)
+            .execute(store.pool())
             .await
             .expect("insert memory");
         }
@@ -6972,22 +6964,83 @@ mod tests {
             ids
         };
         let expected = vec![format!("{user}_hit"), format!("{user}_hit_again")];
+        assert_eq!(
+            sorted(
+                store
+                    .find_ids_by_topic("mem_memories", &user, "deploy checklist")
+                    .await
+                    .expect("fulltext fast path")
+            ),
+            expected
+        );
 
-        let normal = store
-            .find_ids_by_topic("mem_memories", &user, "deploy checklist")
+        // Replace the hidden FULLTEXT index table with one that has no `word` column.
+        let (index_table,): (String,) = sqlx::query_as(
+            "SELECT i.index_table_name FROM mo_catalog.mo_indexes i \
+             JOIN mo_catalog.mo_tables t ON t.rel_id = i.table_id \
+             WHERE t.reldatabase = ? AND t.relname = 'mem_memories' AND i.algo = 'fulltext'",
+        )
+        .bind(&db)
+        .fetch_one(store.pool())
+        .await
+        .expect("locate the FULLTEXT index table");
+        let result = async {
+            sqlx::raw_sql(&format!("DROP TABLE `{db}`.`{index_table}`"))
+                .execute(store.pool())
+                .await?;
+            sqlx::raw_sql(&format!(
+                "CREATE TABLE `{db}`.`{index_table}` (doc_id VARCHAR(64), pos INT, other INT)"
+            ))
+            .execute(store.pool())
+            .await?;
+            // The injected failure must be the recognized one, not an unrelated error.
+            let direct = sqlx::query(&format!(
+                "SELECT memory_id FROM {table} WHERE MATCH(content) AGAINST('+deploy' IN BOOLEAN MODE)"
+            ))
+            .fetch_all(store.pool())
             .await
-            .expect("fulltext fast path");
-        assert_eq!(sorted(normal), expected);
+            .expect_err("a table without `word` cannot answer FULLTEXT queries");
+            assert_eq!(
+                super::classify_fulltext_error(&direct),
+                Some(super::FulltextFailure::IndexUnavailable),
+                "{direct:?}"
+            );
+            let degraded = store
+                .find_ids_by_topic("mem_memories", &user, "deploy checklist")
+                .await;
 
-        super::SIMULATE_UNAVAILABLE_FULLTEXT_INDEX.with(|flag| flag.set(true));
-        let degraded = store
-            .find_ids_by_topic("mem_memories", &user, "deploy checklist")
-            .await;
-        super::SIMULATE_UNAVAILABLE_FULLTEXT_INDEX.with(|flag| flag.set(false));
+            // Without the index table at all the error is not a recognized FULLTEXT
+            // failure and must propagate instead of being treated as "no matches".
+            sqlx::raw_sql(&format!("DROP TABLE `{db}`.`{index_table}`"))
+                .execute(store.pool())
+                .await?;
+            let unrelated = store
+                .find_ids_by_topic("mem_memories", &user, "deploy checklist")
+                .await;
+
+            // MatrixOne still lists the index table in its catalog, so recreate a
+            // stand-in before dropping the database.
+            sqlx::raw_sql(&format!(
+                "CREATE TABLE `{db}`.`{index_table}` (doc_id VARCHAR(64))"
+            ))
+            .execute(store.pool())
+            .await?;
+            Ok::<_, sqlx::Error>((degraded, unrelated))
+        }
+        .await;
+        sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS `{db}`"))
+            .execute(admin.pool())
+            .await
+            .expect("drop isolated database");
+        let (degraded, unrelated) = result.expect("break the FULLTEXT index");
         assert_eq!(
             sorted(degraded.expect("degrades to LIKE instead of failing")),
             expected,
             "LIKE fallback must keep the owner and active-row scope"
+        );
+        assert!(
+            matches!(unrelated, Err(memoria_core::MemoriaError::Database(_))),
+            "unrecognized database errors must still propagate: {unrelated:?}"
         );
     }
 
