@@ -448,7 +448,37 @@ async fn info_schema_table_exists(pool: &MySqlPool, schema_name: &str, table_nam
 /// Bump whenever user-DB schema expectations change, including tables created
 /// by `bootstrap_user_schema()`, graph schema bootstrapping, or any compat
 /// migration handled by `apply_user_compat_migrations()`.
-pub const CURRENT_USER_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_USER_SCHEMA_VERSION: i64 = 3;
+
+#[path = "write_fence.rs"]
+mod write_fence;
+pub use write_fence::MemoryWriteFence;
+
+/// Opaque persisted-state revision. Timestamps alone can collide when an older
+/// writer uses NOW() at second precision. Exclude retrieval counters/scores.
+pub fn memory_revision(memory: &Memory) -> String {
+    use sha2::{Digest, Sha256};
+    let mut state = serde_json::json!([
+        memory.memory_id,
+        memory.user_id,
+        memory.subject_id,
+        memory.author_id,
+        memory.content,
+        memory.memory_type.to_string(),
+        memory.trust_tier.to_string(),
+        memory.initial_confidence,
+        memory.session_id,
+        memory.source_event_ids,
+        memory.extra_metadata,
+        memory.observed_at,
+        memory.created_at,
+        memory.updated_at,
+        memory.is_active,
+        memory.superseded_by,
+    ]);
+    state.sort_all_objects();
+    format!("{:x}", Sha256::digest(state.to_string().as_bytes()))
+}
 const USER_SCHEMA_META_KEY: &str = "user_schema";
 
 // MatrixOne's read-your-writes frontier belongs to a database session. Keep
@@ -2003,6 +2033,9 @@ impl SqlMemoryStore {
             dim = self.embedding_dim
         );
         sqlx::query(&sql).execute(pool).await.map_err(db_err)?;
+
+        sqlx::query(&format!("CREATE TABLE IF NOT EXISTS {} (range_key VARCHAR(64) PRIMARY KEY, user_id VARCHAR(64) NOT NULL, generation VARCHAR(32) NOT NULL, erasing TINYINT NOT NULL, INDEX idx_write_fence_owner (user_id))", self.t("mem_write_fences")))
+            .execute(pool).await.map_err(db_err)?;
 
         sqlx::query(&format!(
             r#"CREATE TABLE IF NOT EXISTS {user_state_table} (
@@ -5328,6 +5361,14 @@ impl SqlMemoryStore {
     ) -> Result<MemoryEraseReport, MemoriaError> {
         let (predicate, binds) = memory_erase_predicate(user_id, selector)?;
         let mut report = MemoryEraseReport::default();
+        let fence_key = Self::write_fence_erase_key(user_id, selector)?;
+        self.ensure_write_fence_row(user_id, &fence_key).await?;
+        let fence_generation = uuid::Uuid::new_v4().simple().to_string();
+        let (store, key, generation) = (self.clone(), fence_key.clone(), fence_generation.clone());
+        run_gated_erase_step(gate, async move {
+            store.begin_write_fence_erase(&key, &generation).await
+        })
+        .await?;
         if selector.is_full_scope() {
             let (dropped, retained) = self.drop_scope_snapshots(user_id, gate).await?;
             report.snapshots_dropped = dropped;
@@ -5496,6 +5537,13 @@ impl SqlMemoryStore {
                 "physical erase left memory rows in a new branch".into(),
             ));
         }
+        let store = self.clone();
+        run_gated_erase_step(gate, async move {
+            store
+                .finish_write_fence_erase(&fence_key, &fence_generation)
+                .await
+        })
+        .await?;
         Ok(report)
     }
 
@@ -7031,6 +7079,61 @@ impl SqlMemoryStore {
         Ok(())
     }
 
+    /// Merge only after locking the exact revision read by the caller. The
+    /// returned row is read in this transaction, not after another writer wins.
+    pub async fn patch_metadata_atomically(
+        &self,
+        table: &str,
+        expected: &Memory,
+        patch: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<Memory, MemoriaError> {
+        let _permit = self
+            .erase_barrier()
+            .try_enter(&expected.user_id)
+            .ok_or_else(|| {
+                MemoriaError::Blocked("memory erase is already running for this scope".into())
+            })?;
+        let mut transaction = self.pool.begin().await.map_err(db_err)?;
+        let row = sqlx::query(&format!(
+            "SELECT {FULLTEXT_MEMORY_COLUMNS} FROM {table} WHERE memory_id = ? AND user_id = ? FOR UPDATE"
+        )).bind(&expected.memory_id).bind(&expected.user_id)
+            .fetch_optional(&mut *transaction).await.map_err(db_err)?
+            .ok_or_else(|| MemoriaError::NotFound("memory".into()))?;
+        let mut current = row_to_memory(&row)?;
+        if !current.is_active || memory_revision(&current) != memory_revision(expected) {
+            return Err(MemoriaError::Conflict(
+                "memory changed before metadata update".into(),
+            ));
+        }
+        let values = current.extra_metadata.get_or_insert_with(Default::default);
+        for (key, value) in patch {
+            if value.is_null() {
+                values.remove(key);
+            } else {
+                values.insert(key.clone(), value.clone());
+            }
+        }
+        let updated = std::cmp::max(
+            Utc::now(),
+            expected.updated_at.unwrap_or_default() + chrono::Duration::microseconds(1),
+        );
+        sqlx::query(&format!("UPDATE {table} SET extra_metadata = ?, updated_at = ? WHERE memory_id = ? AND user_id = ?"))
+            .bind(serde_json::to_string(&current.extra_metadata)?).bind(updated.naive_utc())
+            .bind(&expected.memory_id).bind(&expected.user_id)
+            .execute(&mut *transaction).await.map_err(db_err)?;
+        let row = sqlx::query(&format!(
+            "SELECT {FULLTEXT_MEMORY_COLUMNS} FROM {table} WHERE memory_id = ? AND user_id = ?"
+        ))
+        .bind(&expected.memory_id)
+        .bind(&expected.user_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(db_err)?;
+        let result = row_to_memory(&row)?;
+        transaction.commit().await.map_err(db_err)?;
+        Ok(result)
+    }
+
     #[tracing::instrument(skip(self, memory), fields(memory_id = %memory.memory_id))]
     pub async fn insert_into(&self, table: &str, memory: &Memory) -> Result<(), MemoriaError> {
         let _permit = self
@@ -7157,13 +7260,7 @@ impl SqlMemoryStore {
         .map_err(db_err)?
         .ok_or_else(|| MemoriaError::NotFound("memory".into()))?;
         let current = row_to_memory(&row)?;
-        if !current.is_active
-            || current.subject_id != expected.subject_id
-            || current.content != expected.content
-            || current.memory_type != expected.memory_type
-            || current.extra_metadata != expected.extra_metadata
-            || current.updated_at != expected.updated_at
-        {
+        if !current.is_active || memory_revision(&current) != memory_revision(expected) {
             return Err(MemoriaError::Conflict(
                 "memory changed during correction".into(),
             ));

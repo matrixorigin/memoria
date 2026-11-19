@@ -215,6 +215,14 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/v1/memories/batch", post(routes::memory::batch_store))
         .route(
+            "/v1/memories/write-fence",
+            post(routes::memory::capture_write_fence),
+        )
+        .route(
+            "/v1/memories/fenced",
+            post(routes::memory::store_memory_fenced),
+        )
+        .route(
             "/v1/memories/correct",
             post(routes::memory::correct_by_query),
         )
@@ -230,6 +238,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/memories/:id/correct-attributed",
             put(routes::memory::correct_memory_attributed),
+        )
+        .route(
+            "/v1/memories/:id/metadata",
+            put(routes::memory::update_memory_metadata),
         )
         .route("/v1/memories/:id", delete(routes::memory::delete_memory))
         .route(

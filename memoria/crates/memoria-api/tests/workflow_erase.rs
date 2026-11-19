@@ -41,6 +41,204 @@ async fn key(server: &ApiTestServer, master: &str, owner: &str, write: bool) -> 
         .to_owned()
 }
 
+#[tokio::test]
+async fn suspended_write_fences_and_revision_cas_use_real_group_http_contracts() {
+    let master = "synthetic-revision-fence-master";
+    let server = support::multi_db::spawn_api_server(
+        "revision_fence",
+        4,
+        master.into(),
+        None,
+        None,
+        None,
+        true,
+    )
+    .await;
+    let owner = format!("fence_{}", uuid::Uuid::new_v4().simple());
+    let personal = key(&server, master, &owner, true).await;
+    store(&server, &personal, "register-owner", None, "control").await;
+    let response = server
+        .client
+        .post(format!("{}/v1/groups", server.base))
+        .bearer_auth(master)
+        .header("X-User-Id", &owner)
+        .json(&json!({"group_name":"synthetic-fence-group", "members":[owner]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    let group: Value = response.json().await.unwrap();
+    let group_id = group["group_id"].as_str().unwrap();
+    let mut scoped_keys = vec![];
+    for scopes in [
+        json!(["identity:read", "memory:read", "memory:write"]),
+        json!(["identity:read", "memory:read"]),
+    ] {
+        let created = call(
+            &server,
+            master,
+            Method::POST,
+            "/auth/keys",
+            json!({"user_id":owner, "group_id":group_id, "name":"synthetic", "scopes":scopes}),
+        )
+        .await;
+        scoped_keys.push(created["raw_key"].as_str().unwrap().to_owned());
+    }
+    let (writer, reader) = (&scoped_keys[0], &scoped_keys[1]);
+    let scope =
+        json!({"subject_id":"subject", "connector_id":"connector", "workflow_id":"workflow"});
+    let fence = call(
+        &server,
+        writer,
+        Method::POST,
+        "/v1/memories/write-fence",
+        scope.clone(),
+    )
+    .await;
+    let denied = server
+        .client
+        .post(format!("{}/v1/memories/write-fence", server.base))
+        .bearer_auth(reader)
+        .json(&scope)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403);
+    let memory = json!({"idempotency_key":"suspended-original", "content":"synthetic old body", "memory_type":"semantic", "subject_id":"subject", "session_id":"session-a", "branch":"main",
+        "initial_confidence":0.42, "extra_metadata":{"connector_id":"connector", "workflow_id":"workflow", "source_job_id":"run-a", "source_evidence":{"content_sha256":"old-body", "items":[{"quote":"old source"}]}}});
+    let original = call(
+        &server,
+        writer,
+        Method::POST,
+        "/v1/memories/fenced",
+        json!({"memory":memory, "fence":fence}),
+    )
+    .await;
+    let id = original["memory_id"].as_str().unwrap();
+    let old = call(
+        &server,
+        writer,
+        Method::GET,
+        &format!("/v1/memories/{id}?branch=main"),
+        json!(null),
+    )
+    .await;
+    assert_eq!(old["revision"].as_str().unwrap().len(), 64);
+    let patch = json!({"subject_id":"subject", "session_id":"session-a", "expected_updated_at":old["updated_at"], "expected_revision":old["revision"], "extra_metadata":{"result_freshness":"superseded"}});
+    let changed = call(
+        &server,
+        writer,
+        Method::PUT,
+        &format!("/v1/memories/{id}/metadata"),
+        patch.clone(),
+    )
+    .await;
+    assert_ne!(changed["revision"], old["revision"]);
+    assert_eq!(changed["content"], old["content"]);
+    assert_eq!(changed["initial_confidence"], old["initial_confidence"]);
+    let stale = server
+        .client
+        .put(format!("{}/v1/memories/{id}/metadata", server.base))
+        .bearer_auth(writer)
+        .json(&patch)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), 409);
+    let forbidden = server
+        .client
+        .put(format!("{}/v1/memories/{id}/metadata", server.base))
+        .bearer_auth(reader)
+        .json(&patch)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), 403);
+    let correction = json!({"new_content":"synthetic new body", "subject_id":"subject", "session_id":"session-b", "branch":"main", "expected_updated_at":changed["updated_at"], "expected_revision":changed["revision"], "initial_confidence":0.82,
+        "extra_metadata_patch":{"source_job_id":"run-b", "source_evidence":{"content_sha256":"new-body", "items":[{"quote":"new source"}]}, "source_feedback":null}});
+    let corrected = call(
+        &server,
+        writer,
+        Method::PUT,
+        &format!("/v1/memories/{id}/correct-attributed"),
+        correction,
+    )
+    .await;
+    let corrected_id = corrected["memory_id"].as_str().unwrap();
+    let persisted = call(
+        &server,
+        writer,
+        Method::GET,
+        &format!("/v1/memories/{corrected_id}?branch=main"),
+        json!(null),
+    )
+    .await;
+    assert!((persisted["initial_confidence"].as_f64().unwrap() - 0.82).abs() < 1e-6);
+    assert_eq!(
+        persisted["extra_metadata"]["source_evidence"]["content_sha256"],
+        "new-body"
+    );
+    assert_eq!(persisted["session_id"], "session-b");
+    let deleted = call(
+        &server,
+        writer,
+        Method::POST,
+        "/v1/memories/erase",
+        json!({"mode":"workflow", "workflow_id":"workflow"}),
+    )
+    .await;
+    assert_eq!(deleted["memories"], 2);
+    let refused = server
+        .client
+        .post(format!("{}/v1/memories/fenced", server.base))
+        .bearer_auth(writer)
+        .json(&json!({"memory":memory, "fence":fence}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 409);
+    assert_eq!(
+        refused.json::<Value>().await.unwrap()["code"],
+        "memory_write_fence_stale"
+    );
+    let absent = call(
+        &server,
+        writer,
+        Method::GET,
+        &format!("/v1/memories/{id}?branch=main"),
+        json!(null),
+    )
+    .await;
+    assert!(absent.is_null());
+    let fresh = call(
+        &server,
+        writer,
+        Method::POST,
+        "/v1/memories/write-fence",
+        scope,
+    )
+    .await;
+    let mut new_memory = memory.clone();
+    new_memory["idempotency_key"] = json!("new-explicit-request");
+    call(
+        &server,
+        writer,
+        Method::POST,
+        "/v1/memories/fenced",
+        json!({"memory":new_memory,"fence":fresh}),
+    )
+    .await;
+    let retained = call(
+        &server,
+        &personal,
+        Method::POST,
+        "/v1/memories/query",
+        json!({"subject_id":"control", "branch":"main", "limit":10}),
+    )
+    .await;
+    assert_eq!(retained["items"].as_array().unwrap().len(), 1);
+}
+
 async fn store(
     server: &ApiTestServer,
     key: &str,
@@ -96,6 +294,14 @@ async fn workflow_erase_preserves_other_workflows_scopes_and_corrected_provenanc
     )
     .await;
     let a_id = a["memory_id"].as_str().unwrap();
+    let a_revision = call(
+        &server,
+        &writer,
+        Method::GET,
+        &format!("/v1/memories/{a_id}?branch=main"),
+        json!(null),
+    )
+    .await;
     let corrected = call(
         &server,
         &writer,
@@ -103,6 +309,7 @@ async fn workflow_erase_preserves_other_workflows_scopes_and_corrected_provenanc
         &format!("/v1/memories/{a_id}/correct-attributed"),
         json!({
             "new_content":"Synthetic updated fact from workflow B", "session_id":"session-b",
+            "subject_id":"subject-a", "branch":"main", "expected_updated_at":a_revision["updated_at"], "expected_revision":a_revision["revision"],
             "extra_metadata_patch":{"workflow_id":"workflow-b","source_job_id":"run-b"}
         }),
     )
@@ -122,8 +329,16 @@ async fn workflow_erase_preserves_other_workflows_scopes_and_corrected_provenanc
 
     // A rejected source patch must leave the existing revision active.
     let b_id = b["memory_id"].as_str().unwrap();
+    let b_revision = call(
+        &server,
+        &writer,
+        Method::GET,
+        &format!("/v1/memories/{b_id}?branch=main"),
+        json!(null),
+    )
+    .await;
     let denied_patch = server.client.put(format!("{}/v1/memories/{b_id}/correct-attributed",server.base)).bearer_auth(&writer)
-        .json(&json!({"new_content":"must not be written","session_id":"same-session","extra_metadata_patch":{"_memoria_store_request_sha256":"forged"}})).send().await.unwrap();
+        .json(&json!({"new_content":"must not be written","session_id":"same-session","subject_id":"subject-a", "expected_updated_at":b_revision["updated_at"], "expected_revision":b_revision["revision"], "extra_metadata_patch":{"_memoria_store_request_sha256":"forged"}})).send().await.unwrap();
     assert_eq!(denied_patch.status(), 422);
     assert_eq!(
         call(

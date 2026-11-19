@@ -527,6 +527,8 @@ async fn test_attributed_correction_merges_metadata_and_rejects_reserved_patch()
             "source A",
             Some(&first),
             Some("session-a"),
+            None,
+            Some(0.73),
         )
         .await
         .unwrap();
@@ -542,6 +544,8 @@ async fn test_attributed_correction_merges_metadata_and_rejects_reserved_patch()
             "source B",
             Some(&patch),
             Some("session-b"),
+            None,
+            Some(0.42),
         )
         .await
         .unwrap();
@@ -550,6 +554,7 @@ async fn test_attributed_correction_merges_metadata_and_rejects_reserved_patch()
     assert_eq!(metadata["business_memory_type"], "factual_memory");
     assert!(!metadata.contains_key("workflow_label"));
     assert_eq!(b.session_id.as_deref(), Some("session-b"));
+    assert_eq!(b.initial_confidence, 0.42);
     let reserved = HashMap::from([(
         memoria_core::STORE_REQUEST_HASH_FIELD.into(),
         json!("forged"),
@@ -561,16 +566,37 @@ async fn test_attributed_correction_merges_metadata_and_rejects_reserved_patch()
             &b.memory_id,
             "must not commit",
             Some(&reserved),
+            None,
+            None,
             None
         )
         .await
         .is_err());
+    let unassessed = svc
+        .correct_with_metadata_on_branch(
+            "u1",
+            None,
+            &b.memory_id,
+            "new source without an assessment",
+            Some(&HashMap::new()),
+            Some("session-c"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        unassessed.initial_confidence,
+        TrustTier::T2Curated.initial_confidence()
+    );
+    assert_ne!(unassessed.initial_confidence, b.initial_confidence);
     let plain = svc
-        .correct("u1", &b.memory_id, "operator correction")
+        .correct("u1", &unassessed.memory_id, "operator correction")
         .await
         .unwrap();
     assert_eq!(plain.extra_metadata.unwrap()["workflow_id"], "workflow-b");
-    assert_eq!(plain.session_id.as_deref(), Some("session-b"));
+    assert_eq!(plain.session_id.as_deref(), Some("session-c"));
+    assert_eq!(plain.initial_confidence, unassessed.initial_confidence);
 }
 
 #[tokio::test]

@@ -1417,9 +1417,62 @@ impl MemoryService {
         initial_confidence: Option<f64>,
         author_id: Option<String>,
         subject_id: Option<String>,
-        mut extra_metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
+        extra_metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
         idempotency_key: Option<&str>,
     ) -> Result<Memory, MemoriaError> {
+        self.store_memory_with_write_fence(
+            user_id,
+            branch,
+            content,
+            memory_type,
+            session_id,
+            trust_tier,
+            observed_at,
+            initial_confidence,
+            author_id,
+            subject_id,
+            extra_metadata,
+            idempotency_key,
+            None,
+        )
+        .await
+    }
+
+    pub async fn capture_memory_write_fence(
+        &self,
+        user_id: &str,
+        subject: &str,
+        connector: &str,
+        workflow: &str,
+    ) -> Result<memoria_storage::MemoryWriteFence, MemoriaError> {
+        self.user_sql_store(user_id)
+            .await?
+            .capture_write_fence(user_id, subject, connector, workflow)
+            .await
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub async fn store_memory_with_write_fence(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        content: &str,
+        memory_type: MemoryType,
+        session_id: Option<String>,
+        trust_tier: Option<TrustTier>,
+        observed_at: Option<DateTime<Utc>>,
+        initial_confidence: Option<f64>,
+        author_id: Option<String>,
+        subject_id: Option<String>,
+        mut extra_metadata: Option<HashMap<String, serde_json::Value>>,
+        idempotency_key: Option<&str>,
+        fence: Option<&memoria_storage::MemoryWriteFence>,
+    ) -> Result<Memory, MemoriaError> {
+        if fence.is_some() && (idempotency_key.is_none() || branch.is_none()) {
+            return Err(MemoriaError::Validation(
+                "fenced writes require an explicit branch and idempotency key".into(),
+            ));
+        }
         validate_session_id_length(session_id.as_deref())?;
         if let Some(confidence) = initial_confidence {
             if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
@@ -1481,8 +1534,10 @@ impl MemoryService {
             let table = sql
                 .table_for_branch(user_id, Some(&resolved_branch))
                 .await?;
-            if let Some(existing) = sql.get_retry_receipt_from(&table, &id, user_id).await? {
-                return validate_idempotent_receipt(existing, user_id, &hash);
+            if fence.is_none() {
+                if let Some(existing) = sql.get_retry_receipt_from(&table, &id, user_id).await? {
+                    return validate_idempotent_receipt(existing, user_id, &hash);
+                }
             }
             extra_metadata
                 .get_or_insert_with(HashMap::new)
@@ -1536,7 +1591,15 @@ impl MemoryService {
         if let Some((id, hash, sql, table)) = idempotency {
             // INSERT's primary key arbitrates concurrent instances and lost
             // acknowledgments. Never resurrect an inactive/deleted receipt.
-            match sql.insert_into(&table, &memory).await {
+            let insertion = if let Some(fence) = fence {
+                match sql.insert_with_write_fence(&table, &memory, fence).await? {
+                    Some(existing) => return validate_idempotent_receipt(existing, user_id, &hash),
+                    None => Ok(()),
+                }
+            } else {
+                sql.insert_into(&table, &memory).await
+            };
+            match insertion {
                 Ok(()) => {
                     let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
                     self.send_edit_log(
@@ -2343,6 +2406,47 @@ impl MemoryService {
             .await
     }
 
+    pub async fn patch_memory_metadata(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        memory_id: &str,
+        subject_id: &str,
+        session_id: &str,
+        expected_updated_at: DateTime<Utc>,
+        expected_revision: &str,
+        patch: &HashMap<String, serde_json::Value>,
+    ) -> Result<Memory, MemoriaError> {
+        reject_reserved_metadata(Some(patch))?;
+        if subject_id.trim().is_empty()
+            || subject_id.len() > 128
+            || session_id.is_empty()
+            || session_id.len() > 64
+            || patch.is_empty()
+        {
+            return Err(MemoriaError::Validation("invalid metadata update".into()));
+        }
+        let sql = self.user_sql_store(user_id).await?;
+        let table = sql.table_for_branch(user_id, branch).await?;
+        let old = sql
+            .get_from(&table, memory_id)
+            .await?
+            .filter(|memory| {
+                memory.user_id == user_id
+                    && memory.subject_id.as_deref() == Some(subject_id)
+                    && memory.session_id.as_deref() == Some(session_id)
+            })
+            .ok_or_else(|| MemoriaError::NotFound("memory".into()))?;
+        if old.updated_at != Some(expected_updated_at)
+            || memoria_storage::memory_revision(&old) != expected_revision
+        {
+            return Err(MemoriaError::Conflict(
+                "memory changed before metadata update".into(),
+            ));
+        }
+        sql.patch_metadata_atomically(&table, &old, patch).await
+    }
+
     pub async fn correct_on_branch(
         &self,
         user_id: &str,
@@ -2350,8 +2454,17 @@ impl MemoryService {
         memory_id: &str,
         new_content: &str,
     ) -> Result<Memory, MemoriaError> {
-        self.correct_with_metadata_on_branch(user_id, branch, memory_id, new_content, None, None)
-            .await
+        self.correct_with_metadata_on_branch(
+            user_id,
+            branch,
+            memory_id,
+            new_content,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     /// The new content and its source attribution must be one atomic revision.
@@ -2363,8 +2476,22 @@ impl MemoryService {
         new_content: &str,
         extra_metadata: Option<&HashMap<String, serde_json::Value>>,
         session_id: Option<&str>,
+        expected_revision: Option<(&str, DateTime<Utc>, &str)>,
+        initial_confidence: Option<f64>,
     ) -> Result<Memory, MemoriaError> {
         reject_reserved_metadata(extra_metadata)?;
+        if expected_revision.is_some() && self.sql_store.is_none() {
+            return Err(MemoriaError::Validation(
+                "revision-conditional corrections require SQL storage".into(),
+            ));
+        }
+        if initial_confidence
+            .is_some_and(|score| !score.is_finite() || !(0.0..=1.0).contains(&score))
+        {
+            return Err(MemoriaError::Validation(
+                "invalid initial_confidence".into(),
+            ));
+        }
         if session_id.is_some_and(|id| id.is_empty() || id.len() > 64) {
             return Err(MemoriaError::Validation(
                 "invalid correction session_id".into(),
@@ -2380,6 +2507,8 @@ impl MemoryService {
             false,
             extra_metadata,
             session_id,
+            expected_revision,
+            initial_confidence,
         )
         .await
     }
@@ -2419,6 +2548,8 @@ impl MemoryService {
             omit_structured_content,
             None,
             None,
+            None,
+            None,
         )
         .await
     }
@@ -2434,6 +2565,8 @@ impl MemoryService {
         omit_structured_content: bool,
         extra_metadata: Option<&HashMap<String, serde_json::Value>>,
         session_id: Option<&str>,
+        expected_revision: Option<(&str, DateTime<Utc>, &str)>,
+        initial_confidence: Option<f64>,
     ) -> Result<Memory, MemoriaError> {
         let requested_content = new_content;
         if new_content.trim().is_empty() {
@@ -2500,6 +2633,18 @@ impl MemoryService {
                 }
                 return Err(MemoriaError::NotFound("memory".into()));
             };
+            if let Some((subject, updated_at, revision)) = expected_revision {
+                if old.subject_id.as_deref() != Some(subject) {
+                    return Err(MemoriaError::NotFound("memory".into()));
+                }
+                if old.updated_at != Some(updated_at)
+                    || memoria_storage::memory_revision(&old) != revision
+                {
+                    return Err(MemoriaError::Conflict(
+                        "memory changed before correction".into(),
+                    ));
+                }
+            }
 
             let new_id = receipt
                 .as_ref()
@@ -2518,7 +2663,11 @@ impl MemoryService {
                 content: new_content.to_string(),
                 memory_type: old.memory_type.clone(),
                 trust_tier: TrustTier::T2Curated,
-                initial_confidence: old.initial_confidence,
+                initial_confidence: if extra_metadata.is_some() {
+                    initial_confidence.unwrap_or_else(|| TrustTier::T2Curated.initial_confidence())
+                } else {
+                    old.initial_confidence
+                },
                 embedding: self.embed(new_content).await?,
                 session_id: session_id
                     .map(str::to_string)
@@ -2595,7 +2744,11 @@ impl MemoryService {
                 content: new_content.to_string(),
                 memory_type: old.memory_type.clone(),
                 trust_tier: TrustTier::T2Curated,
-                initial_confidence: old.initial_confidence,
+                initial_confidence: if extra_metadata.is_some() {
+                    initial_confidence.unwrap_or_else(|| TrustTier::T2Curated.initial_confidence())
+                } else {
+                    old.initial_confidence
+                },
                 embedding: self.embed(new_content).await?,
                 session_id: session_id
                     .map(str::to_string)

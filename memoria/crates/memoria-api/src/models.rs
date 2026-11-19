@@ -41,6 +41,21 @@ pub struct BatchStoreRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FencedStoreRequest {
+    pub memory: StoreRequest,
+    pub fence: memoria_storage::MemoryWriteFence,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriteFenceRequest {
+    pub subject_id: String,
+    pub connector_id: String,
+    pub workflow_id: String,
+}
+
+#[derive(Deserialize)]
 pub struct RetrieveRequest {
     pub query: String,
     #[serde(default = "default_top_k")]
@@ -364,6 +379,22 @@ pub struct AttributedCorrectRequest {
     /// Null removes a key; keys absent from the patch are preserved.
     pub extra_metadata_patch: HashMap<String, serde_json::Value>,
     pub session_id: String,
+    pub subject_id: String,
+    pub expected_updated_at: chrono::DateTime<chrono::Utc>,
+    pub expected_revision: String,
+    /// A new source assessment, never inherited from the replaced text.
+    pub initial_confidence: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryMetadataRequest {
+    pub subject_id: String,
+    pub session_id: String,
+    pub expected_updated_at: chrono::DateTime<chrono::Utc>,
+    pub expected_revision: String,
+    /// Top-level merge; JSON null removes a key. Content is not editable here.
+    pub extra_metadata: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -497,6 +528,8 @@ pub struct MemoryResponse {
     pub observed_at: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
     pub retrieval_score: Option<f64>,
     /// 业务元数据（如 scene/agent）从 memories.extra_metadata 原样透传回给调用方；结构化 query
     /// 可做精确过滤，但不参与相关性检索或打分。
@@ -506,6 +539,7 @@ pub struct MemoryResponse {
 
 impl From<Memory> for MemoryResponse {
     fn from(mut m: Memory) -> Self {
+        let revision = m.updated_at.map(|_| memoria_storage::memory_revision(&m));
         if let Some(metadata) = m.extra_metadata.as_mut() {
             metadata.retain(|key, _| !memoria_core::is_reserved_metadata_key(key));
         }
@@ -523,6 +557,7 @@ impl From<Memory> for MemoryResponse {
             observed_at: m.observed_at.map(|dt| dt.to_rfc3339()),
             created_at: m.created_at.map(|dt| dt.to_rfc3339()),
             updated_at: m.updated_at.map(|dt| dt.to_rfc3339()),
+            revision,
             retrieval_score: m.retrieval_score,
             // 空 map 在响应里归一为 None（省略），与读取侧「"{}" → None」一致：新写记录直接
             // 返回内存对象时也不会出现「POST 带 {} 而后续 list/get 无该字段」的不一致。
@@ -899,10 +934,28 @@ pub fn parse_trust_tier(s: &str) -> Result<TrustTier, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_fulltext_memory_types_opt, parse_memory_types_opt, EraseRequest, PurgeRequest,
-        PurgeSelector, StructuredQueryRequest,
+        parse_fulltext_memory_types_opt, parse_memory_types_opt, AttributedCorrectRequest,
+        EraseRequest, MemoryMetadataRequest, PurgeRequest, PurgeSelector, StructuredQueryRequest,
     };
     use memoria_core::MemoryType;
+
+    #[test]
+    fn attributed_and_metadata_mutations_require_complete_revision_conditions() {
+        let body = serde_json::json!({"new_content":"new", "session_id":"session", "subject_id":"subject",
+            "extra_metadata_patch":{}, "expected_updated_at":"2026-01-01T00:00:00Z", "expected_revision":"a".repeat(64), "initial_confidence":0.42});
+        let accepted: AttributedCorrectRequest = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(accepted.initial_confidence, Some(0.42));
+        for field in ["expected_revision", "expected_updated_at", "subject_id"] {
+            let mut missing = body.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<AttributedCorrectRequest>(missing).is_err());
+        }
+        let mut metadata = serde_json::json!({"subject_id":"subject", "session_id":"session", "extra_metadata":{"result_freshness":"superseded"},
+            "expected_updated_at":"2026-01-01T00:00:00Z", "expected_revision":"a".repeat(64)});
+        assert!(serde_json::from_value::<MemoryMetadataRequest>(metadata.clone()).is_ok());
+        metadata["content"] = serde_json::json!("forbidden body mutation");
+        assert!(serde_json::from_value::<MemoryMetadataRequest>(metadata).is_err());
+    }
 
     #[test]
     fn disabled_response_exposes_reason_without_internal_metadata() {

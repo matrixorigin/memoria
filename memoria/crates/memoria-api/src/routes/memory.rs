@@ -22,6 +22,12 @@ pub fn api_err(e: impl std::fmt::Display) -> (StatusCode, String) {
 /// Map MemoriaError to proper HTTP status codes.
 pub fn api_err_typed(e: memoria_core::MemoriaError) -> (StatusCode, String) {
     use memoria_core::MemoriaError::*;
+    if matches!(&e, Conflict(message) if message == "memory_write_fence_stale") {
+        return (
+            StatusCode::CONFLICT,
+            r#"{"code":"memory_write_fence_stale"}"#.into(),
+        );
+    }
     let status = match &e {
         NotFound(_) => StatusCode::NOT_FOUND,
         Conflict(_) => StatusCode::CONFLICT,
@@ -256,6 +262,42 @@ pub async fn store_memory(
     auth: AuthUser,
     Json(req): Json<StoreRequest>,
 ) -> Result<(StatusCode, Json<MemoryResponse>), (StatusCode, String)> {
+    store_with_fence(state, auth, req, None).await
+}
+
+pub async fn capture_write_fence(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<WriteFenceRequest>,
+) -> ApiResult<memoria_storage::MemoryWriteFence> {
+    Ok(Json(
+        state
+            .service
+            .capture_memory_write_fence(
+                auth.scope_id(),
+                &req.subject_id,
+                &req.connector_id,
+                &req.workflow_id,
+            )
+            .await
+            .map_err(api_err_typed)?,
+    ))
+}
+
+pub async fn store_memory_fenced(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<FencedStoreRequest>,
+) -> Result<(StatusCode, Json<MemoryResponse>), (StatusCode, String)> {
+    store_with_fence(state, auth, req.memory, Some(req.fence)).await
+}
+
+async fn store_with_fence(
+    state: AppState,
+    auth: AuthUser,
+    req: StoreRequest,
+    fence: Option<memoria_storage::MemoryWriteFence>,
+) -> Result<(StatusCode, Json<MemoryResponse>), (StatusCode, String)> {
     if req.content.is_empty() {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -285,7 +327,7 @@ pub async fn store_memory(
     };
     let m = state
         .service
-        .store_memory_with_metadata_and_key_on_branch(
+        .store_memory_with_write_fence(
             auth.scope_id(),
             branch_param(req.branch.as_deref()),
             &req.content,
@@ -298,6 +340,7 @@ pub async fn store_memory(
             req.subject_id,
             req.extra_metadata,
             req.idempotency_key.as_deref(),
+            fence.as_ref(),
         )
         .await
         .map_err(|e| {
@@ -705,7 +748,7 @@ pub async fn correct_memory(
     Path(id): Path<String>,
     Json(req): Json<CorrectRequest>,
 ) -> ApiResult<MemoryResponse> {
-    correct_memory_with_source(&state, auth, id, req, None, None).await
+    correct_memory_with_source(&state, auth, id, req, None, None, None, None).await
 }
 
 pub async fn correct_memory_attributed(
@@ -726,6 +769,12 @@ pub async fn correct_memory_attributed(
         request,
         Some(&req.extra_metadata_patch),
         Some(&req.session_id),
+        Some((
+            &req.subject_id,
+            req.expected_updated_at,
+            &req.expected_revision,
+        )),
+        req.initial_confidence,
     )
     .await
 }
@@ -737,6 +786,8 @@ async fn correct_memory_with_source(
     req: CorrectRequest,
     metadata: Option<&std::collections::HashMap<String, serde_json::Value>>,
     session_id: Option<&str>,
+    expected_revision: Option<(&str, chrono::DateTime<chrono::Utc>, &str)>,
+    initial_confidence: Option<f64>,
 ) -> ApiResult<MemoryResponse> {
     let effective_user_id = if auth.is_master {
         find_memory_any_user(&state, &id, branch_param(req.branch.as_deref()))
@@ -764,10 +815,35 @@ async fn correct_memory_with_source(
             &req.new_content,
             metadata,
             session_id,
+            expected_revision,
+            initial_confidence,
         )
         .await
         .map_err(api_err_typed)?;
     Ok(Json(m.into()))
+}
+
+pub async fn update_memory_metadata(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    Json(req): Json<MemoryMetadataRequest>,
+) -> ApiResult<MemoryResponse> {
+    let memory = state
+        .service
+        .patch_memory_metadata(
+            auth.scope_id(),
+            Some("main"),
+            &id,
+            &req.subject_id,
+            &req.session_id,
+            req.expected_updated_at,
+            &req.expected_revision,
+            &req.extra_metadata,
+        )
+        .await
+        .map_err(api_err_typed)?;
+    Ok(Json(memory.into()))
 }
 
 pub async fn correct_by_query(

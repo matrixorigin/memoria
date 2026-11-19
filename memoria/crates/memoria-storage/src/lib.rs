@@ -28,12 +28,12 @@ pub use pool_config::{
 };
 pub use router::{DbRouter, UserDatabaseRecord};
 pub use store::{
-    run_gated_erase_step, snapshot_extra_memory_count, snapshot_extra_with_memory_count,
-    validate_extra_metadata_filter, validate_fulltext_query, EraseLockConnection,
-    EraseStatementHold, EraseStepFuture, EraseStepGate, FeedbackStats, MemoryEraseReport,
-    MemoryEraseSelector, MemoryFeedback, OwnedEditLogEntry, PoolHealthLevel, PoolHealthSnapshot,
-    SqlMemoryStore, TierFeedback, UserRetrievalParams, ACTOR_USER_ID,
-    EXTRA_METADATA_FILTER_MAX_FIELDS, EXTRA_METADATA_FILTER_MAX_KEY_BYTES,
+    memory_revision, run_gated_erase_step, snapshot_extra_memory_count,
+    snapshot_extra_with_memory_count, validate_extra_metadata_filter, validate_fulltext_query,
+    EraseLockConnection, EraseStatementHold, EraseStepFuture, EraseStepGate, FeedbackStats,
+    MemoryEraseReport, MemoryEraseSelector, MemoryFeedback, MemoryWriteFence, OwnedEditLogEntry,
+    PoolHealthLevel, PoolHealthSnapshot, SqlMemoryStore, TierFeedback, UserRetrievalParams,
+    ACTOR_USER_ID, EXTRA_METADATA_FILTER_MAX_FIELDS, EXTRA_METADATA_FILTER_MAX_KEY_BYTES,
     EXTRA_METADATA_FILTER_MAX_VALUE_BYTES, FULLTEXT_QUERY_MAX_BYTES, FULLTEXT_SEARCH_DEFAULT_LIMIT,
     FULLTEXT_SEARCH_MAX_LIMIT,
 };

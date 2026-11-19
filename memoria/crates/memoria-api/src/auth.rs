@@ -431,6 +431,7 @@ pub async fn group_main_write_guard(
                             path,
                             "/v1/memories"
                                 | "/v1/memories/idempotent"
+                                | "/v1/memories/fenced"
                                 | "/v1/memories/batch"
                                 | "/v1/memories/correct"
                                 | "/v1/memories/purge"
@@ -442,6 +443,7 @@ pub async fn group_main_write_guard(
                             && [
                                 "/correct",
                                 "/correct-idempotent",
+                                "/correct-attributed",
                                 "/disable",
                                 "/restore",
                                 "/erase",
@@ -457,6 +459,7 @@ pub async fn group_main_write_guard(
                             )
                                 .into_response();
                         }
+                        let nested_memory_body = path == "/v1/memories/fenced";
                         let (parts, body) = req.into_parts();
                         let bytes = match to_bytes(body, 8 * 1024 * 1024).await {
                             Ok(bytes) => bytes,
@@ -472,7 +475,13 @@ pub async fn group_main_write_guard(
                             serde_json::from_slice::<serde_json::Value>(&bytes)
                                 .ok()
                                 .and_then(|body| {
-                                    body.get("branch")
+                                    let memory = if nested_memory_body {
+                                        body.get("memory")?
+                                    } else {
+                                        &body
+                                    };
+                                    memory
+                                        .get("branch")
                                         .and_then(|branch| branch.as_str())
                                         .map(str::to_string)
                                 })
