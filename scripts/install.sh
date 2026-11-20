@@ -17,7 +17,7 @@
 # Env:
 #   MEMORIA_REPO           GitHub repo (default: matrixorigin/Memoria)
 #   MEMORIA_VERSION        Version tag (default: latest)
-#   MEMORIA_GHPROXY        ghproxy base URL (default: https://ghfast.top, auto-detected)
+#   MEMORIA_GHPROXY        Optional HTTPS mirror for release tarballs (disabled by default)
 #   MEMORIA_NO_TELEMETRY   Set to 1 to disable install telemetry
 
 set -eu
@@ -215,10 +215,22 @@ fi
 ASSET="memoria-${TARGET}.tar.gz"
 GH_URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
 GH_SUM_URL="https://github.com/${REPO}/releases/download/${TAG}/SHA256SUMS.txt"
-GHPROXY="${MEMORIA_GHPROXY:-https://ghfast.top}"
+# Mirrors are explicitly opt-in and never trusted to supply verification data.
+GHPROXY="${MEMORIA_GHPROXY:-}"
+GHPROXY="${GHPROXY%/}"
+case "$GHPROXY" in
+  ''|https://*) ;;
+  *) error "MEMORIA_GHPROXY must be an HTTPS URL"; exit 1 ;;
+esac
 
 if [ "$DRY_RUN" = true ]; then
   echo "URL: $GH_URL"
+  if [ -n "$GHPROXY" ]; then
+    echo "Mirror fallback: $GHPROXY (opt-in, archive only)"
+  else
+    echo "Mirror fallback: disabled"
+  fi
+  echo "Checksum: $GH_SUM_URL (GitHub origin only)"
   exit 0
 fi
 
@@ -287,30 +299,36 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 info "Downloading ${BLUE}${GH_URL}${NC}"
-if ! curl -fL# --max-time 10 -o "$TMP/$ASSET" "$GH_URL" 2>/dev/null; then
-  warn "Direct download failed, retrying via proxy: ${GHPROXY}"
+# A connection timeout is not a total download deadline: slow valid release
+# downloads must not be forced onto a third-party mirror after ten seconds.
+if ! curl -fL# --connect-timeout 10 --retry 2 -o "$TMP/$ASSET" "$GH_URL" 2>/dev/null; then
+  if [ -z "$GHPROXY" ]; then
+    error "Direct download failed — optionally set MEMORIA_GHPROXY to an HTTPS mirror"
+    exit 1
+  fi
+  warn "Direct download failed, retrying archive via opt-in mirror: ${GHPROXY}"
   URL="${GHPROXY}/${GH_URL}"
-  SUM_URL="${GHPROXY}/${GH_SUM_URL}"
   info "Downloading ${BLUE}${URL}${NC}"
-  curl -fL# -o "$TMP/$ASSET" "$URL" || {
+  curl -fL# --connect-timeout 10 --retry 2 -o "$TMP/$ASSET" "$URL" || {
     error "Download failed — check that version '${TAG}' exists"
     info "Available releases: ${BLUE}https://github.com/${REPO}/releases${NC}"
     exit 1
   }
-else
-  URL="$GH_URL"
-  SUM_URL="$GH_SUM_URL"
 fi
 
 # ── Verify checksum ─────────────────────────────────────────────────
 
-if curl -sSLf -o "$TMP/SHA256SUMS.txt" "$SUM_URL" 2>/dev/null; then
-  if (cd "$TMP" && grep -F "$ASSET" SHA256SUMS.txt | (sha256sum -c 2>/dev/null || shasum -a 256 -c 2>/dev/null)); then
-    ok "Checksum verified"
-  else
-    error "Checksum verification failed"
-    exit 1
-  fi
+# A mirror cannot attest its own downloaded binary. Always retrieve the
+# checksum directly from GitHub; no checksum means no installation.
+if ! curl -sSLf --connect-timeout 10 --retry 2 -o "$TMP/SHA256SUMS.txt" "$GH_SUM_URL" 2>/dev/null; then
+  error "Could not download checksum from official GitHub release; refusing installation"
+  exit 1
+fi
+if (cd "$TMP" && grep -F "$ASSET" SHA256SUMS.txt | (sha256sum -c 2>/dev/null || shasum -a 256 -c 2>/dev/null)); then
+  ok "Checksum verified against GitHub release"
+else
+  error "Checksum verification failed"
+  exit 1
 fi
 
 # ── Install ─────────────────────────────────────────────────────────
