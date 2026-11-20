@@ -533,8 +533,10 @@ export class MemoriaHttpTransport {
     const lines = [`Snapshots (${snapshots.length}):`];
     for (const snap of snapshots) {
       const s = this.asRecord(snap);
-      if (!s) continue;
-      const name = s.name ?? s.snapshot_name ?? "";
+      const name = s?.name ?? s?.snapshot_name;
+      if (!s || typeof name !== "string" || !name.trim()) {
+        throw new Error("Memoria snapshot listing returned an invalid snapshot entry");
+      }
       const ts = s.timestamp ?? s.created_at ?? "";
       lines.push(`  ${name} (${ts})`);
     }
