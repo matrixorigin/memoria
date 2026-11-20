@@ -1,0 +1,29 @@
+name: Installer Security
+
+on:
+  pull_request:
+    paths:
+      - scripts/install.sh
+      - scripts/test-install-security.sh
+      - .github/workflows/install-security.yml
+  push:
+    branches: [main]
+    paths:
+      - scripts/install.sh
+      - scripts/test-install-security.sh
+      - .github/workflows/install-security.yml
+
+permissions:
+  contents: read
+
+jobs:
+  installer-security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax
+        run: |
+          sh -n scripts/install.sh
+          bash -n scripts/test-install-security.sh
+      - name: Simulate official and mirrored release downloads
+        run: bash scripts/test-install-security.sh scripts/install.sh
