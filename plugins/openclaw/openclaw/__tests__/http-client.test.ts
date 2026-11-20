@@ -396,3 +396,20 @@ describe("Group 3: Cloud API Communication", () => {
     });
   });
 });
+
+
+describe("snapshot list entry validation", () => {
+  it.each([null, "bad", {}, { name: 42 }, { name: "" }])(
+    "rejects invalid snapshot entry %j instead of silently omitting it", async (entry) => {
+      fetchMock.respondWith(200, { snapshots: [entry] });
+      await expect(transport.callTool("memory_snapshots", {}))
+        .rejects.toThrow(/invalid snapshot/i);
+    },
+  );
+
+  it("preserves the legacy snapshot_name field", async () => {
+    fetchMock.respondWith(200, { snapshots: [{ snapshot_name: "release", timestamp: "today" }] });
+    const result = await transport.callTool("memory_snapshots", {}) as any;
+    expect(result.content[0].text).toBe("Snapshots (1):\n  release (today)");
+  });
+});
