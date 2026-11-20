@@ -20,6 +20,19 @@ env:
   LLM_MODEL: ${{ vars.LLM_MODEL || '' }}
 
 jobs:
+  installer-security:
+    name: Installer Supply-Chain Regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Validate installer shell syntax
+        run: sh -n scripts/install.sh
+      - name: Installer security regression
+        run: python3 scripts/test_install_security.py -v
+
   check:
     name: Check & Clippy
     runs-on: ubuntu-latest
