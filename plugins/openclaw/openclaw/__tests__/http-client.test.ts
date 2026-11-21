@@ -396,3 +396,21 @@ describe("Group 3: Cloud API Communication", () => {
     });
   });
 });
+
+
+describe("purge response validation", () => {
+  it.each([null, "", {}, [], "gateway page", { purged: "3" }, { purged: -1 }, { purged: 1.5 }])(
+    "rejects malformed successful response %j", async (body) => {
+      fetchMock.respondWith(200, body);
+      await expect(transport.callTool("memory_purge", { topic: "old" }))
+        .rejects.toThrow(/invalid purge response/i);
+      expect(fetchMock.calls).toHaveLength(1);
+    },
+  );
+
+  it("preserves a legitimate zero result", async () => {
+    fetchMock.respondWith(200, { purged: 0 });
+    const result = await transport.callTool("memory_purge", { topic: "old" }) as any;
+    expect(result.content[0].text).toBe("Purged 0 memory(ies).");
+  });
+});
