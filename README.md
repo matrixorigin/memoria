@@ -169,6 +169,9 @@ memoria init -i   # Select "Remote" mode, paste your token
 # 1. Start MatrixOne + API
 git clone https://github.com/matrixorigin/Memoria.git
 cd Memoria
+cp .env.example .env
+# Edit .env: set MEMORIA_MASTER_KEY (min 16 chars, e.g. `openssl rand -hex 32`)
+# and your embedding provider settings
 docker compose up -d
 
 # 2. Install CLI

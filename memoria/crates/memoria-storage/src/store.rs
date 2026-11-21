@@ -5947,14 +5947,20 @@ impl SqlMemoryStore {
                    AND MATCH(content) AGAINST('{ft_terms}' IN BOOLEAN MODE) \
                    AND content LIKE ?"
             );
-            let rows: Vec<(String,)> = sqlx::query_as(&sql)
+            let result = sqlx::query(&sql)
                 .bind(user_id)
                 .bind(&like_pat)
                 .fetch_all(&mut *conn)
-                .await
-                .map_err(db_err)?;
-            if !rows.is_empty() {
-                return Ok(rows.into_iter().map(|r| r.0).collect());
+                .await;
+            // An unusable FULLTEXT index must fall through to the LIKE scan below,
+            // as every other read path does (#247). Other database errors surface.
+            if let FulltextRows::Rows(rows) = fulltext_rows_or_degraded(result)? {
+                if !rows.is_empty() {
+                    return rows
+                        .iter()
+                        .map(|row| row.try_get::<String, _>("memory_id").map_err(db_err))
+                        .collect();
+                }
             }
         }
 
@@ -6900,6 +6906,143 @@ mod tests {
     use sqlx::mysql::MySqlPoolOptions;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex, OnceLock};
+
+    /// `purge` finds its targets through `find_ids_by_topic`. This breaks the FULLTEXT
+    /// index for real instead of simulating it: the hidden index table is replaced by
+    /// one without the `word` column, which is the unusable state of #247 and makes
+    /// MatrixOne answer `20301 column word does not exist`. The topic lookup must then
+    /// degrade to the scoped LIKE scan, while any other database error still surfaces.
+    /// The test works in its own database and is skipped without `DATABASE_URL`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn broken_fulltext_index_degrades_topic_lookup_and_other_errors_surface() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("DATABASE_URL not set; skipping topic lookup fallback database test");
+            return;
+        };
+        let dim = std::env::var("EMBEDDING_DIM")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1024);
+        let admin = SqlMemoryStore::connect(&url, dim, uuid::Uuid::new_v4().to_string())
+            .await
+            .expect("connect");
+        let db = format!("memoria_ft_broken_{}", uuid::Uuid::new_v4().simple());
+        sqlx::raw_sql(&format!("CREATE DATABASE `{db}`"))
+            .execute(admin.pool())
+            .await
+            .expect("create isolated database");
+        let isolated_url = format!("{}/{db}", url.rsplit_once('/').expect("database url").0);
+        let store = SqlMemoryStore::connect(&isolated_url, dim, uuid::Uuid::new_v4().to_string())
+            .await
+            .expect("connect isolated database");
+        store.migrate().await.expect("migrate");
+        let table = store.t("mem_memories");
+        let user = format!("topic_broken_{}", uuid::Uuid::new_v4().simple());
+        let other = format!("{user}_other");
+        for (suffix, owner, content, active) in [
+            ("hit", &user, "deploy checklist for staging", true),
+            ("hit_again", &user, "Notes: deploy checklist v2", true),
+            ("inactive", &user, "deploy checklist retired", false),
+            ("miss", &user, "unrelated text", true),
+            ("owner", &other, "deploy checklist of another owner", true),
+        ] {
+            sqlx::query(&format!(
+                "INSERT INTO {table} (memory_id, user_id, memory_type, content, initial_confidence, \
+                 is_active, trust_tier, source_event_ids, observed_at, created_at, updated_at) \
+                 VALUES (?, ?, 'semantic', ?, 0.8, ?, 'T3', '[]', NOW(), NOW(), NOW())"
+            ))
+            .bind(format!("{user}_{suffix}"))
+            .bind(owner)
+            .bind(content)
+            .bind(active)
+            .execute(store.pool())
+            .await
+            .expect("insert memory");
+        }
+        let sorted = |mut ids: Vec<String>| {
+            ids.sort();
+            ids
+        };
+        let expected = vec![format!("{user}_hit"), format!("{user}_hit_again")];
+        assert_eq!(
+            sorted(
+                store
+                    .find_ids_by_topic("mem_memories", &user, "deploy checklist")
+                    .await
+                    .expect("fulltext fast path")
+            ),
+            expected
+        );
+
+        // Replace the hidden FULLTEXT index table with one that has no `word` column.
+        let (index_table,): (String,) = sqlx::query_as(
+            "SELECT i.index_table_name FROM mo_catalog.mo_indexes i \
+             JOIN mo_catalog.mo_tables t ON t.rel_id = i.table_id \
+             WHERE t.reldatabase = ? AND t.relname = 'mem_memories' AND i.algo = 'fulltext'",
+        )
+        .bind(&db)
+        .fetch_one(store.pool())
+        .await
+        .expect("locate the FULLTEXT index table");
+        let result = async {
+            sqlx::raw_sql(&format!("DROP TABLE `{db}`.`{index_table}`"))
+                .execute(store.pool())
+                .await?;
+            sqlx::raw_sql(&format!(
+                "CREATE TABLE `{db}`.`{index_table}` (doc_id VARCHAR(64), pos INT, other INT)"
+            ))
+            .execute(store.pool())
+            .await?;
+            // The injected failure must be the recognized one, not an unrelated error.
+            let direct = sqlx::query(&format!(
+                "SELECT memory_id FROM {table} WHERE MATCH(content) AGAINST('+deploy' IN BOOLEAN MODE)"
+            ))
+            .fetch_all(store.pool())
+            .await
+            .expect_err("a table without `word` cannot answer FULLTEXT queries");
+            assert_eq!(
+                super::classify_fulltext_error(&direct),
+                Some(super::FulltextFailure::IndexUnavailable),
+                "{direct:?}"
+            );
+            let degraded = store
+                .find_ids_by_topic("mem_memories", &user, "deploy checklist")
+                .await;
+
+            // Without the index table at all the error is not a recognized FULLTEXT
+            // failure and must propagate instead of being treated as "no matches".
+            sqlx::raw_sql(&format!("DROP TABLE `{db}`.`{index_table}`"))
+                .execute(store.pool())
+                .await?;
+            let unrelated = store
+                .find_ids_by_topic("mem_memories", &user, "deploy checklist")
+                .await;
+
+            // MatrixOne still lists the index table in its catalog, so recreate a
+            // stand-in before dropping the database.
+            sqlx::raw_sql(&format!(
+                "CREATE TABLE `{db}`.`{index_table}` (doc_id VARCHAR(64))"
+            ))
+            .execute(store.pool())
+            .await?;
+            Ok::<_, sqlx::Error>((degraded, unrelated))
+        }
+        .await;
+        sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS `{db}`"))
+            .execute(admin.pool())
+            .await
+            .expect("drop isolated database");
+        let (degraded, unrelated) = result.expect("break the FULLTEXT index");
+        assert_eq!(
+            sorted(degraded.expect("degrades to LIKE instead of failing")),
+            expected,
+            "LIKE fallback must keep the owner and active-row scope"
+        );
+        assert!(
+            matches!(unrelated, Err(memoria_core::MemoriaError::Database(_))),
+            "unrecognized database errors must still propagate: {unrelated:?}"
+        );
+    }
 
     #[test]
     fn broken_fulltext_index_requests_fallback_and_other_sql_errors_propagate() {
