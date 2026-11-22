@@ -395,6 +395,7 @@ pub async fn group_main_write_guard(
                                 | "/v1/memories/correct"
                                 | "/v1/memories/purge"
                                 | "/v1/observe"
+                                | "/v1/observe/standalone"
                                 | "/v1/observe/complete"
                                 | "/v1/observe/deduplicated"
                         ) || (path.starts_with("/v1/memories/")
@@ -1483,21 +1484,16 @@ mod tests {
 
     #[test]
     fn classifies_memory_read_and_write_routes() {
-        assert!(authorize_api_key_route(
-            &axum::http::Method::POST,
+        for path in [
             "/v1/observe/complete",
-            &parse_scopes("memory:read")
-        )
-        .is_err());
-        assert_eq!(
-            required_scope_for_request(&axum::http::Method::POST, "/v1/observe/deduplicated"),
-            Some(SCOPE_MEMORY_WRITE)
-        );
-        assert!(authorize_api_key_route(
-            &axum::http::Method::POST,
+            "/v1/observe/standalone",
             "/v1/observe/deduplicated",
-            &parse_scopes("memory:read")
-        ).is_err());
+        ] {
+            let method = &axum::http::Method::POST;
+            assert_eq!(required_scope_for_request(method, path), Some(SCOPE_MEMORY_WRITE));
+            assert!(authorize_api_key_route(method, path, &parse_scopes("memory:read")).is_err());
+            assert!(authorize_api_key_route(method, path, &parse_scopes("memory:write")).is_ok());
+        }
         assert_eq!(
             required_scope_for_request(&axum::http::Method::POST, "/v1/memories/retrieve"),
             Some(SCOPE_MEMORY_READ)

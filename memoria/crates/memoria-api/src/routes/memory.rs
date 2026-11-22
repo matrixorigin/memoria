@@ -879,6 +879,15 @@ pub async fn observe_turn_complete(
     observe_result_with_scope(&state, &auth, req, ObserveWindow::Complete).await
 }
 
+/// Require extraction from the isolated user message. Raw storage is ineligible.
+pub async fn observe_standalone_user(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<ObserveRequest>,
+) -> ApiResult<serde_json::Value> {
+    observe_result_with_scope(&state, &auth, req, ObserveWindow::StandaloneUser).await
+}
+
 async fn observe_result_with_scope(
     state: &AppState,
     auth: &AuthUser,
@@ -891,7 +900,18 @@ async fn observe_result_with_scope(
     observe_result(state, auth, req, window)
         .await
         .map_err(|err| match window {
-            ObserveWindow::Complete => api_err_typed(err),
+            ObserveWindow::StandaloneUser
+                if matches!(
+                    err,
+                    memoria_core::MemoriaError::ObserveExtractionUnavailable(_)
+                ) =>
+            {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "standalone memory extraction unavailable".into(),
+                )
+            }
+            ObserveWindow::Complete | ObserveWindow::StandaloneUser => api_err_typed(err),
             ObserveWindow::Recent => api_err(err),
         })
 }

@@ -14,3 +14,14 @@ need one fallback record should supply the exchange as a single message.
 
 Older servers do not implement this route. A client that requires complete
 evidence must not retry that request against the ordinary observe endpoint.
+
+## Isolated user guidance
+
+`POST /v1/observe/standalone` uses the same authorization and byte budget.
+Send one user message when earlier private context has been omitted. The
+extractor is asked to accept only a self-contained durable statement or return
+no candidates. The service requires an exact copy of the full user text before
+persisting an inferred memory. This prevents a paraphrase or omission of a
+negation from being stored as the user's own statement. Semantic eligibility
+is still a model judgment. Unavailable extraction returns HTTP 503. This
+route never falls back to persisting the raw message.

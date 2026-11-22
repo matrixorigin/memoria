@@ -611,6 +611,7 @@ struct EntityJob {
 pub enum ObserveWindow {
     Recent,
     Complete,
+    StandaloneUser,
 }
 
 impl MemoryService {
@@ -3243,7 +3244,24 @@ impl MemoryService {
         exclude_memory_ids: &[String],
         window: ObserveWindow,
     ) -> Result<(Vec<Memory>, bool), MemoriaError> {
-        let complete = if window == ObserveWindow::Complete {
+        let isolated_input = if window == ObserveWindow::StandaloneUser {
+            let [message] = messages else {
+                return Err(MemoriaError::Validation(
+                    "standalone observation requires one user message".into(),
+                ));
+            };
+            if message["role"] != "user" {
+                return Err(MemoriaError::Validation(
+                    "standalone observation requires user evidence".into(),
+                ));
+            }
+            Some(message["content"].as_str().ok_or_else(|| {
+                MemoriaError::Validation("standalone observation requires text".into())
+            })?)
+        } else {
+            None
+        };
+        let complete = if window != ObserveWindow::Recent {
             Some(Self::complete_observe_text(messages)?)
         } else {
             None
@@ -3260,6 +3278,11 @@ impl MemoryService {
             ));
         }
         let has_llm = self.llm.is_some();
+        if isolated_input.is_some() && !has_llm {
+            return Err(MemoriaError::ObserveExtractionUnavailable(
+                "standalone observation requires an extractor".into(),
+            ));
+        }
         let exclusion_mode = !exclude_memory_ids.is_empty();
         if exclude_memory_ids.len() > 100
             || exclude_memory_ids.iter().any(|id| {
@@ -3317,6 +3340,7 @@ impl MemoryService {
                     llm,
                     complete.unwrap_or_else(|| Self::recent_observe_text(messages)),
                     &excluded,
+                    isolated_input.is_some(),
                 )
                 .await
             {
@@ -3325,6 +3349,12 @@ impl MemoryService {
                     let items: Vec<_> = items
                         .into_iter()
                         .filter(|item| {
+                            if let Some(source) = isolated_input {
+                                let quote = item["content"].as_str().unwrap_or("").trim();
+                                if quote != source.trim() {
+                                    return false;
+                                }
+                            }
                             !excluded.iter().any(|content| {
                                 item["content"]
                                     .as_str()
@@ -3337,7 +3367,7 @@ impl MemoryService {
                         .await
                 }
                 Ok(_) => vec![],
-                Err(e) if exclusion_mode => {
+                Err(e) if exclusion_mode || isolated_input.is_some() => {
                     return Err(MemoriaError::ObserveExtractionUnavailable(e.to_string()));
                 }
                 Err(e) => {
@@ -3609,8 +3639,9 @@ impl MemoryService {
         llm: &LlmClient,
         conv_text: String,
         excluded: &[String],
+        standalone: bool,
     ) -> Result<Vec<serde_json::Value>, MemoriaError> {
-        let (prompt, input) = if excluded.is_empty() {
+        let (mut prompt, input) = if excluded.is_empty() {
             (OBSERVER_EXTRACTION_PROMPT.to_string(), conv_text)
         } else {
             (
@@ -3623,6 +3654,9 @@ impl MemoryService {
             )
         };
 
+        if standalone {
+            prompt.push_str("\nOnly retain explicit durable facts that stand on their own in this isolated user guidance. Previous conversation and tool results are unavailable. Do not resolve indirect references or confirmations. Return [] for ambiguous input. Return at most one item. Only accept the message when it stands alone in full; copy the complete original user text as content, including every negation and qualification.");
+        }
         let result = llm
             .chat(
                 &[

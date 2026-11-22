@@ -131,6 +131,7 @@ fn should_mark_metrics_dirty(
             | "/v1/memories/correct"
             | "/v1/memories/purge"
             | "/v1/observe"
+            | "/v1/observe/standalone"
             | "/v1/observe/complete"
             | "/v1/observe/deduplicated"
             | "/v1/pipeline/run" => Some(DirtyMask::MEMORY),
@@ -213,6 +214,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/v1/memories/:id", delete(routes::memory::delete_memory))
         .route("/v1/observe", post(routes::memory::observe_turn))
+        .route("/v1/observe/standalone", post(routes::memory::observe_standalone_user))
         .route("/v1/observe/complete", post(routes::memory::observe_turn_complete))
         .route("/v1/observe/deduplicated", post(routes::memory::observe_turn_deduplicated))
         .route(
