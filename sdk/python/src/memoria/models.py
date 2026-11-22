@@ -142,8 +142,11 @@ class PurgeResult:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> PurgeResult:
         d = _require_object(d, "purge")
+        count = d.get("purged")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise MemoriaResponseError("purged must be a non-negative integer")
         return cls(
-            purged=int(d.get("purged", 0)),
+            purged=count,
             snapshot_name=d.get("snapshot_name"),
             warning=d.get("warning"),
         )
