@@ -606,6 +606,13 @@ struct EntityJob {
     content: String,
 }
 
+/// Controls whether the observer can shorten the conversation for extraction.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ObserveWindow {
+    Recent,
+    Complete,
+}
+
 impl MemoryService {
     /// Production constructor — uses SqlMemoryStore for branch support
     pub async fn new_sql(
@@ -3213,6 +3220,34 @@ impl MemoryService {
         subject_id: Option<String>,
         exclude_memory_ids: &[String],
     ) -> Result<(Vec<Memory>, bool), MemoriaError> {
+        self.observe_turn_with_window(
+            user_id,
+            branch,
+            messages,
+            session_id,
+            subject_id,
+            exclude_memory_ids,
+            ObserveWindow::Recent,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn observe_turn_with_window(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        messages: &[serde_json::Value],
+        session_id: Option<String>,
+        subject_id: Option<String>,
+        exclude_memory_ids: &[String],
+        window: ObserveWindow,
+    ) -> Result<(Vec<Memory>, bool), MemoriaError> {
+        let complete = if window == ObserveWindow::Complete {
+            Some(Self::complete_observe_text(messages)?)
+        } else {
+            None
+        };
         // Normalize early so that stored subject_id always matches what retrieve
         // filters on (avoids trailing-space mismatches).
         let subject_id = normalize_opt_string(subject_id);
@@ -3277,7 +3312,14 @@ impl MemoryService {
         }
 
         let candidates = if let Some(llm) = &self.llm {
-            match self.extract_via_llm(llm, messages, &excluded).await {
+            match self
+                .extract_via_llm(
+                    llm,
+                    complete.unwrap_or_else(|| Self::recent_observe_text(messages)),
+                    &excluded,
+                )
+                .await
+            {
                 Ok(items) if !items.is_empty() => {
                     // Also reject exact repeats even if the model ignored the exclusion.
                     let items: Vec<_> = items
@@ -3502,14 +3544,40 @@ impl MemoryService {
     }
 
     const MAX_EXTRACT_MESSAGES: usize = 20;
-    const MAX_EXTRACT_CHARS: usize = 6000;
+    const MAX_EXTRACT_BYTES: usize = 6000;
 
-    async fn extract_via_llm(
-        &self,
-        llm: &LlmClient,
-        messages: &[serde_json::Value],
-        excluded: &[String],
-    ) -> Result<Vec<serde_json::Value>, MemoriaError> {
+    fn complete_observe_text(messages: &[serde_json::Value]) -> Result<String, MemoriaError> {
+        if messages.is_empty() || messages.len() > Self::MAX_EXTRACT_MESSAGES {
+            return Err(MemoriaError::Validation(
+                "complete observation requires 1 to 20 messages".into(),
+            ));
+        }
+        let mut text = String::new();
+        for message in messages {
+            let Some(role @ ("user" | "assistant")) = message["role"].as_str() else {
+                return Err(MemoriaError::Validation(
+                    "complete observation requires public conversation roles".into(),
+                ));
+            };
+            let content = message["content"].as_str().ok_or_else(|| {
+                MemoriaError::Validation("complete observation requires text".into())
+            })?;
+            if content.len() > Self::MAX_EXTRACT_BYTES
+                || text.len() + role.len() + content.len() + "[]: \n".len() > Self::MAX_EXTRACT_BYTES
+                || content.trim().is_empty()
+            {
+                return Err(MemoriaError::Validation("complete observation requires nonempty text within the 6000-byte extraction budget".into()));
+            }
+            text.push('[');
+            text.push_str(role);
+            text.push_str("]: ");
+            text.push_str(content);
+            text.push('\n');
+        }
+        Ok(text)
+    }
+
+    fn recent_observe_text(messages: &[serde_json::Value]) -> String {
         let recent = if messages.len() > Self::MAX_EXTRACT_MESSAGES {
             &messages[messages.len() - Self::MAX_EXTRACT_MESSAGES..]
         } else {
@@ -3524,15 +3592,24 @@ impl MemoryService {
                 conv_text.push_str(&format!("[{role}]: {truncated}\n"));
             }
         }
-        // Trim to last MAX_EXTRACT_CHARS
-        if conv_text.len() > Self::MAX_EXTRACT_CHARS {
-            let start = conv_text.len() - Self::MAX_EXTRACT_CHARS;
+        // Trim to last MAX_EXTRACT_BYTES
+        if conv_text.len() > Self::MAX_EXTRACT_BYTES {
+            let start = conv_text.len() - Self::MAX_EXTRACT_BYTES;
             let start = (start..conv_text.len())
                 .find(|&i| conv_text.is_char_boundary(i))
                 .unwrap_or(conv_text.len());
             conv_text = conv_text[start..].to_string();
         }
 
+        conv_text
+    }
+
+    async fn extract_via_llm(
+        &self,
+        llm: &LlmClient,
+        conv_text: String,
+        excluded: &[String],
+    ) -> Result<Vec<serde_json::Value>, MemoriaError> {
         let (prompt, input) = if excluded.is_empty() {
             (OBSERVER_EXTRACTION_PROMPT.to_string(), conv_text)
         } else {
