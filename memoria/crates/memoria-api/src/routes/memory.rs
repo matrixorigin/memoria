@@ -4,6 +4,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use memoria_service::service::ObserveWindow;
 use serde::Deserialize;
 use sqlx::Row;
 
@@ -866,26 +867,71 @@ pub async fn observe_turn(
     auth: AuthUser,
     Json(req): Json<ObserveRequest>,
 ) -> ApiResult<serde_json::Value> {
+    observe_result_with_scope(&state, &auth, req, ObserveWindow::Recent).await
+}
+
+/// Reject a request before writing if the complete public exchange cannot fit.
+pub async fn observe_turn_complete(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<ObserveRequest>,
+) -> ApiResult<serde_json::Value> {
+    observe_result_with_scope(&state, &auth, req, ObserveWindow::Complete).await
+}
+
+/// Require extraction from the isolated user message. Raw storage is ineligible.
+pub async fn observe_standalone_user(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<ObserveRequest>,
+) -> ApiResult<serde_json::Value> {
+    observe_result_with_scope(&state, &auth, req, ObserveWindow::StandaloneUser).await
+}
+
+async fn observe_result_with_scope(
+    state: &AppState,
+    auth: &AuthUser,
+    req: ObserveRequest,
+    window: ObserveWindow,
+) -> ApiResult<serde_json::Value> {
     if !req.exclude_memory_ids.is_empty() {
         auth.require_scope(crate::auth::SCOPE_MEMORY_READ)?;
     }
-    observe_result(&state, &auth, req).await.map_err(api_err)
+    observe_result(state, auth, req, window)
+        .await
+        .map_err(|err| match window {
+            ObserveWindow::StandaloneUser
+                if matches!(
+                    err,
+                    memoria_core::MemoriaError::ObserveExtractionUnavailable(_)
+                ) =>
+            {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "standalone memory extraction unavailable".into(),
+                )
+            }
+            ObserveWindow::Complete | ObserveWindow::StandaloneUser => api_err_typed(err),
+            ObserveWindow::Recent => api_err(err),
+        })
 }
 
 async fn observe_result(
     state: &AppState,
     auth: &AuthUser,
     req: ObserveRequest,
+    window: ObserveWindow,
 ) -> Result<Json<serde_json::Value>, memoria_core::MemoriaError> {
     let (memories, has_llm) = state
         .service
-        .observe_turn_excluding_on_branch(
+        .observe_turn_with_window(
             auth.scope_id(),
             branch_param(req.branch.as_deref()),
             &req.messages,
             req.session_id,
             req.subject_id,
             &req.exclude_memory_ids,
+            window,
         )
         .await?;
 
@@ -926,7 +972,7 @@ pub async fn observe_turn_deduplicated(
     if let Err(error) = auth.require_scope(crate::auth::SCOPE_MEMORY_READ) {
         return deduplicated_response(error.into_response());
     }
-    let response = match observe_result(&state, &auth, req).await {
+    let response = match observe_result(&state, &auth, req, ObserveWindow::Recent).await {
         Ok(result) => result.into_response(),
         Err(memoria_core::MemoriaError::ObserveExtractionUnavailable(error)) => {
             tracing::warn!(error, "observe extraction failed before persistence");

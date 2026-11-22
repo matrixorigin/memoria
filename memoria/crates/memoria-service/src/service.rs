@@ -606,6 +606,14 @@ struct EntityJob {
     content: String,
 }
 
+/// Controls whether the observer can shorten the conversation for extraction.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ObserveWindow {
+    Recent,
+    Complete,
+    StandaloneUser,
+}
+
 impl MemoryService {
     /// Production constructor — uses SqlMemoryStore for branch support
     pub async fn new_sql(
@@ -3213,6 +3221,51 @@ impl MemoryService {
         subject_id: Option<String>,
         exclude_memory_ids: &[String],
     ) -> Result<(Vec<Memory>, bool), MemoriaError> {
+        self.observe_turn_with_window(
+            user_id,
+            branch,
+            messages,
+            session_id,
+            subject_id,
+            exclude_memory_ids,
+            ObserveWindow::Recent,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn observe_turn_with_window(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        messages: &[serde_json::Value],
+        session_id: Option<String>,
+        subject_id: Option<String>,
+        exclude_memory_ids: &[String],
+        window: ObserveWindow,
+    ) -> Result<(Vec<Memory>, bool), MemoriaError> {
+        let isolated_input = if window == ObserveWindow::StandaloneUser {
+            let [message] = messages else {
+                return Err(MemoriaError::Validation(
+                    "standalone observation requires one user message".into(),
+                ));
+            };
+            if message["role"] != "user" {
+                return Err(MemoriaError::Validation(
+                    "standalone observation requires user evidence".into(),
+                ));
+            }
+            Some(message["content"].as_str().ok_or_else(|| {
+                MemoriaError::Validation("standalone observation requires text".into())
+            })?)
+        } else {
+            None
+        };
+        let complete = if window != ObserveWindow::Recent {
+            Some(Self::complete_observe_text(messages)?)
+        } else {
+            None
+        };
         // Normalize early so that stored subject_id always matches what retrieve
         // filters on (avoids trailing-space mismatches).
         let subject_id = normalize_opt_string(subject_id);
@@ -3225,6 +3278,11 @@ impl MemoryService {
             ));
         }
         let has_llm = self.llm.is_some();
+        if isolated_input.is_some() && !has_llm {
+            return Err(MemoriaError::ObserveExtractionUnavailable(
+                "standalone observation requires an extractor".into(),
+            ));
+        }
         let exclusion_mode = !exclude_memory_ids.is_empty();
         if exclude_memory_ids.len() > 100
             || exclude_memory_ids.iter().any(|id| {
@@ -3277,12 +3335,26 @@ impl MemoryService {
         }
 
         let candidates = if let Some(llm) = &self.llm {
-            match self.extract_via_llm(llm, messages, &excluded).await {
+            match self
+                .extract_via_llm(
+                    llm,
+                    complete.unwrap_or_else(|| Self::recent_observe_text(messages)),
+                    &excluded,
+                    isolated_input.is_some(),
+                )
+                .await
+            {
                 Ok(items) if !items.is_empty() => {
                     // Also reject exact repeats even if the model ignored the exclusion.
                     let items: Vec<_> = items
                         .into_iter()
                         .filter(|item| {
+                            if let Some(source) = isolated_input {
+                                let quote = item["content"].as_str().unwrap_or("").trim();
+                                if quote != source.trim() {
+                                    return false;
+                                }
+                            }
                             !excluded.iter().any(|content| {
                                 item["content"]
                                     .as_str()
@@ -3295,7 +3367,7 @@ impl MemoryService {
                         .await
                 }
                 Ok(_) => vec![],
-                Err(e) if exclusion_mode => {
+                Err(e) if exclusion_mode || isolated_input.is_some() => {
                     return Err(MemoriaError::ObserveExtractionUnavailable(e.to_string()));
                 }
                 Err(e) => {
@@ -3502,14 +3574,40 @@ impl MemoryService {
     }
 
     const MAX_EXTRACT_MESSAGES: usize = 20;
-    const MAX_EXTRACT_CHARS: usize = 6000;
+    const MAX_EXTRACT_BYTES: usize = 6000;
 
-    async fn extract_via_llm(
-        &self,
-        llm: &LlmClient,
-        messages: &[serde_json::Value],
-        excluded: &[String],
-    ) -> Result<Vec<serde_json::Value>, MemoriaError> {
+    fn complete_observe_text(messages: &[serde_json::Value]) -> Result<String, MemoriaError> {
+        if messages.is_empty() || messages.len() > Self::MAX_EXTRACT_MESSAGES {
+            return Err(MemoriaError::Validation(
+                "complete observation requires 1 to 20 messages".into(),
+            ));
+        }
+        let mut text = String::new();
+        for message in messages {
+            let Some(role @ ("user" | "assistant")) = message["role"].as_str() else {
+                return Err(MemoriaError::Validation(
+                    "complete observation requires public conversation roles".into(),
+                ));
+            };
+            let content = message["content"].as_str().ok_or_else(|| {
+                MemoriaError::Validation("complete observation requires text".into())
+            })?;
+            if content.len() > Self::MAX_EXTRACT_BYTES
+                || text.len() + role.len() + content.len() + "[]: \n".len() > Self::MAX_EXTRACT_BYTES
+                || content.trim().is_empty()
+            {
+                return Err(MemoriaError::Validation("complete observation requires nonempty text within the 6000-byte extraction budget".into()));
+            }
+            text.push('[');
+            text.push_str(role);
+            text.push_str("]: ");
+            text.push_str(content);
+            text.push('\n');
+        }
+        Ok(text)
+    }
+
+    fn recent_observe_text(messages: &[serde_json::Value]) -> String {
         let recent = if messages.len() > Self::MAX_EXTRACT_MESSAGES {
             &messages[messages.len() - Self::MAX_EXTRACT_MESSAGES..]
         } else {
@@ -3524,16 +3622,26 @@ impl MemoryService {
                 conv_text.push_str(&format!("[{role}]: {truncated}\n"));
             }
         }
-        // Trim to last MAX_EXTRACT_CHARS
-        if conv_text.len() > Self::MAX_EXTRACT_CHARS {
-            let start = conv_text.len() - Self::MAX_EXTRACT_CHARS;
+        // Trim to last MAX_EXTRACT_BYTES
+        if conv_text.len() > Self::MAX_EXTRACT_BYTES {
+            let start = conv_text.len() - Self::MAX_EXTRACT_BYTES;
             let start = (start..conv_text.len())
                 .find(|&i| conv_text.is_char_boundary(i))
                 .unwrap_or(conv_text.len());
             conv_text = conv_text[start..].to_string();
         }
 
-        let (prompt, input) = if excluded.is_empty() {
+        conv_text
+    }
+
+    async fn extract_via_llm(
+        &self,
+        llm: &LlmClient,
+        conv_text: String,
+        excluded: &[String],
+        standalone: bool,
+    ) -> Result<Vec<serde_json::Value>, MemoriaError> {
+        let (mut prompt, input) = if excluded.is_empty() {
             (OBSERVER_EXTRACTION_PROMPT.to_string(), conv_text)
         } else {
             (
@@ -3546,6 +3654,9 @@ impl MemoryService {
             )
         };
 
+        if standalone {
+            prompt.push_str("\nOnly retain explicit durable facts that stand on their own in this isolated user guidance. Previous conversation and tool results are unavailable. Do not resolve indirect references or confirmations. Return [] for ambiguous input. Return at most one item. Only accept the message when it stands alone in full; copy the complete original user text as content, including every negation and qualification.");
+        }
         let result = llm
             .chat(
                 &[
