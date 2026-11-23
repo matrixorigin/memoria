@@ -37,7 +37,9 @@ async fn setup() -> (
 }
 
 async fn tc(name: &str, args: Value, svc: &Arc<MemoryService>, uid: &str) -> Value {
-    memoria_mcp::tools::call(name, args, svc, uid)
+    // Keep the dispatch future off this long scenario's stack. In debug builds,
+    // nesting it inline overflows the default Rust test-thread stack.
+    Box::pin(memoria_mcp::tools::call(name, args, svc, uid))
         .await
         .expect(name)
 }
@@ -48,7 +50,8 @@ async fn gc(
     svc: &Arc<MemoryService>,
     uid: &str,
 ) -> Value {
-    memoria_mcp::git_tools::call(name, args, git, svc, uid)
+    // Match the regular tool helper's bounded async state for git dispatch.
+    Box::pin(memoria_mcp::git_tools::call(name, args, git, svc, uid))
         .await
         .expect(name)
 }
@@ -126,8 +129,19 @@ fn extract_mid(store_response: &str) -> String {
         .to_string()
 }
 
+#[test]
+fn full_stack_future_stays_bounded() {
+    let future = full_stack_all_fields();
+    let size = std::mem::size_of_val(&future);
+    assert!(size <= 16 * 1024, "full-stack future uses {size} bytes");
+}
+
 #[tokio::test]
 async fn test_full_stack_all_fields() {
+    full_stack_all_fields().await;
+}
+
+async fn full_stack_all_fields() {
     let (svc, git, uid, ctx) = setup().await;
     let pool = ctx.user_db_pool(&uid).await;
     let before = Utc::now();
