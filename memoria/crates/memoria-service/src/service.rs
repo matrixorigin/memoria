@@ -1452,6 +1452,8 @@ impl MemoryService {
     }
 
     #[tracing::instrument(skip_all)]
+    // Keep the established store entry-point contract while adding its fence.
+    #[allow(clippy::too_many_arguments)]
     pub async fn store_memory_with_write_fence(
         &self,
         user_id: &str,
@@ -2406,6 +2408,8 @@ impl MemoryService {
             .await
     }
 
+    // The revision preconditions are distinct from the patch and scope fields.
+    #[allow(clippy::too_many_arguments)]
     pub async fn patch_memory_metadata(
         &self,
         user_id: &str,
@@ -2468,6 +2472,8 @@ impl MemoryService {
     }
 
     /// The new content and its source attribution must be one atomic revision.
+    // Match the existing correction API, including attribution and confidence.
+    #[allow(clippy::too_many_arguments)]
     pub async fn correct_with_metadata_on_branch(
         &self,
         user_id: &str,
@@ -2516,6 +2522,7 @@ impl MemoryService {
     /// A correction receipt is bound to authenticated owner, explicit branch,
     /// original memory, subject and request payload. Replays cannot insert twice.
     #[tracing::instrument(skip_all)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn correct_with_key_on_branch(
         &self,
         user_id: &str,
@@ -2554,6 +2561,7 @@ impl MemoryService {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn correct_inner(
         &self,
         user_id: &str,

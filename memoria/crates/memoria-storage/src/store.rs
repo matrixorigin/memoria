@@ -8674,7 +8674,7 @@ mod tests {
         ConnectionAnomalyKind, OwnedEditLogEntry, PoolHealthLevel, PoolHealthSnapshot,
         SqlMemoryStore, FULLTEXT_QUERY_MAX_BYTES,
     };
-    use memoria_core::{Memory, MemoryType, TrustTier};
+    use memoria_core::{Memory, MemoryFilter, MemoryType, TrustTier};
     use sqlx::mysql::MySqlPoolOptions;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex, OnceLock};
@@ -9062,6 +9062,7 @@ mod tests {
                 Some("s1"),
                 Some("me"),
                 Some(&semantic),
+                &MemoryFilter::default(),
             )
             .await;
         let limited = store
@@ -9073,6 +9074,7 @@ mod tests {
                 Some("s1"),
                 Some("me"),
                 Some(&semantic),
+                &MemoryFilter::default(),
             )
             .await;
         // Structured retrieval: strict session, trust tier and metadata filters.
@@ -9088,6 +9090,39 @@ mod tests {
                 Some("T3"),
                 Some("me"),
                 &filter,
+                &MemoryFilter::default(),
+            )
+            .await;
+        // A degraded index must not bypass the shared filters introduced by
+        // the retrieval API. All seeded candidates have confidence 0.8.
+        let confidence_filter = MemoryFilter {
+            min_initial_confidence: Some(0.9),
+            ..Default::default()
+        };
+        let filtered = store
+            .search_fulltext_from_scoped(
+                &table,
+                &user,
+                "rust borrow",
+                10,
+                Some("s1"),
+                Some("me"),
+                Some(&semantic),
+                &confidence_filter,
+            )
+            .await;
+        let structured_filtered = store
+            .search_fulltext_structured_lite(
+                "mem_memories",
+                &user,
+                "rust borrow",
+                10,
+                Some(&semantic),
+                Some("s1"),
+                Some("T3"),
+                Some("me"),
+                &filter,
+                &confidence_filter,
             )
             .await;
         // Graph retrieval keeps its owner scope and limit as well.
@@ -9151,6 +9186,8 @@ mod tests {
                 ("one".to_string(), Some(1.0))
             ]
         );
+        assert!(filtered.expect("filtered fallback").is_empty());
+        assert!(structured_filtered.expect("structured filtered fallback").is_empty());
         let nodes = nodes.expect("graph fallback");
         assert_eq!(
             nodes

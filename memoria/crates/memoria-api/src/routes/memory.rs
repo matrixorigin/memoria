@@ -352,8 +352,8 @@ async fn store_with_fence(
     Ok((StatusCode::CREATED, Json(m.into())))
 }
 
-// Batch writes currently cannot preserve per-item time or confidence. Reject
-// these fields rather than silently importing historical facts as new ones.
+// Batch writes preserve per-item confidence, but cannot preserve historical
+// timestamps or per-item idempotency. Reject only the unsupported fields.
 fn validate_batch_write_fields(memories: &[StoreRequest]) -> Result<(), (StatusCode, String)> {
     if memories.iter().any(|memory| memory.idempotency_key.is_some()) {
         return Err((
@@ -365,15 +365,6 @@ fn validate_batch_write_fields(memories: &[StoreRequest]) -> Result<(), (StatusC
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             "observed_at requires the single-memory store endpoint".into(),
-        ));
-    }
-    if memories
-        .iter()
-        .any(|memory| memory.initial_confidence.is_some())
-    {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "initial_confidence requires the single-memory store endpoint".into(),
         ));
     }
     Ok(())
@@ -779,6 +770,7 @@ pub async fn correct_memory_attributed(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn correct_memory_with_source(
     state: &AppState,
     auth: AuthUser,
@@ -790,7 +782,7 @@ async fn correct_memory_with_source(
     initial_confidence: Option<f64>,
 ) -> ApiResult<MemoryResponse> {
     let effective_user_id = if auth.is_master {
-        find_memory_any_user(&state, &id, branch_param(req.branch.as_deref()))
+        find_memory_any_user(state, &id, branch_param(req.branch.as_deref()))
             .await?
             .map(|(owner_id, _)| owner_id)
             .unwrap_or_else(|| auth.scope_id().to_string())
@@ -1911,14 +1903,12 @@ mod batch_write_field_tests {
     }
 
     #[test]
-    fn batch_rejects_explicit_confidence_including_zero() {
+    fn batch_accepts_supported_confidence_including_zero() {
         for confidence in [0.0, 0.5, 1.0] {
-            let error = validate_payload(serde_json::json!({
+            validate_payload(serde_json::json!({
                 "memories": [{"content": "imported", "initial_confidence": confidence}]
             }))
-            .unwrap_err();
-            assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
-            assert!(error.1.contains("initial_confidence"));
+            .unwrap();
         }
     }
 

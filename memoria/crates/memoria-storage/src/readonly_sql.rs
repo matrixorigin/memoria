@@ -219,9 +219,7 @@ fn validate_query(
         Some(Expr::Value(Value::Number(n, false)))
             if n.parse::<usize>()
                 .is_ok_and(|v| v > 0 && v <= MEMORY_SQL_MAX_ROWS) =>
-        {
-            ()
-        }
+        {}
         _ => return Err(MemorySqlError::Invalid),
     }
     let SetExpr::Select(select) = query.body.as_mut() else {
@@ -262,9 +260,7 @@ fn validate_query(
             && name.0[0].value == "memories"
             && with_hints.is_empty()
             && partitions.is_empty() =>
-        {
-            ()
-        }
+        {}
         _ => return Err(MemorySqlError::Unsupported),
     }
     for item in &mut select.projection {
@@ -312,9 +308,7 @@ impl Validator {
                 if name.quote_style.is_none()
                     && (COLUMNS.contains(&name.value.as_str())
                         || allow_alias && self.aliases.contains(&name.value)) =>
-            {
-                ()
-            }
+            {}
             Expr::Value(Value::Placeholder(marker)) if marker == "?" => {
                 self.bindings.push(Binding::Caller(self.parameters));
                 self.parameters += 1;
@@ -346,9 +340,9 @@ impl Validator {
                 op: UnaryOperator::Not | UnaryOperator::Minus | UnaryOperator::Plus,
                 expr,
             } => self.expression(expr, redact, allow_alias)?,
-            Expr::BinaryOp { left, op, right }
-                if matches!(
-                    op,
+            Expr::BinaryOp {
+                left,
+                op:
                     BinaryOperator::Eq
                         | BinaryOperator::NotEq
                         | BinaryOperator::Gt
@@ -360,9 +354,9 @@ impl Validator {
                         | BinaryOperator::Plus
                         | BinaryOperator::Minus
                         | BinaryOperator::Multiply
-                        | BinaryOperator::Divide
-                ) =>
-            {
+                        | BinaryOperator::Divide,
+                right,
+            } => {
                 self.expression(left, redact, allow_alias)?;
                 self.expression(right, redact, allow_alias)?;
             }
@@ -407,9 +401,7 @@ impl Validator {
                             && modifiers[0]
                                 .parse::<usize>()
                                 .is_ok_and(|n| n > 0 && n <= 16384) =>
-                    {
-                        ()
-                    }
+                    {}
                     _ => return Err(MemorySqlError::Unsupported),
                 }
                 self.expression(expr, redact, allow_alias)?;
@@ -464,9 +456,7 @@ impl Validator {
                         match expr {
                             Expr::Value(Value::SingleQuotedString(path))
                                 if valid_json_path(path) =>
-                            {
-                                ()
-                            }
+                            {}
                             Expr::Value(Value::Placeholder(marker)) if marker == "?" => {
                                 path_parameter = true
                             }
