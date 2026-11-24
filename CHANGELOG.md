@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.3] - 2026-11-24
+
+### Added
+
+- Add atomic, owner-scoped idempotency receipts for memory writes (#310).
+- Add cached-only snapshot listing controls and a complete structured MCP capability catalog (#342, #325).
+- Support configurable content filtering for trusted owner requests (#372).
+- Preserve complete conversations within the observe extraction budget (#512).
+- Add a Hermes memory provider plugin, distributed separately from the Rust binaries (#279, #280, #284, #302).
+
+### Fixed
+
+- Keep full-text scores separate from vector scores, apply feedback to graph retrieval, and preserve long-query retrieval (#260, #305, #262).
+- Fall back to the existing LIKE query when MatrixOne reports a known unusable FULLTEXT index; preserve literal topic matches and avoid truncated purge results (#451, #506, #298, #319).
+- Preserve routed database session consistency, coordinate scope initialization and invalidation, and discard connections after interrupted statement preparation (#322, #324, #328, #331).
+- Repair call-log columns in versioned user databases (#283).
+- Enforce scoped memory ownership, preserve correction metadata, and validate content and scope lengths consistently (#401, #318, #290, #316, #399, #458).
+- Avoid treating transient query results as durable observations or creating safety snapshots for no-op purges (#288, #291).
+- Improve credential and PII filtering while preserving ordinary prose and numeric identifiers; redact credential URLs and mask Unicode API keys safely (#278, #306, #394, #397, #404, #457, #504).
+- Validate embedding responses and vectors, recover truncated responses, reject non-finite values, and keep mock embeddings distinct (#277, #304, #491).
+- Return MCP tool failures as `isError` results, handle control notifications without error accounting, and validate JSON-RPC versions and request IDs while preserving stdio recovery (#257, #258, #389, #393, #460).
+- Keep remote MCP resource identifiers within one REST path segment and reject invalid memory types (#407, #309).
+- Validate snapshot pagination, preserve UTF-8 previews and literal deletion selectors, and reject blank deletion prefixes and query cursors (#315, #365, #369, #370, #414).
+- Validate batch import fields, personal user IDs, admin pagination and group deletion; redact credentials in admin URLs (#335, #418, #459).
+- Preserve unreadable MCP configuration files, derive shared database settings from `--db-url`, and propagate benchmark failures (#293, #303, #294).
+
+### Compatibility and Release Scope
+
+- Invalid inputs that were previously accepted or silently ignored now fail explicitly, including blank memory content, overlong scope identifiers, `grp_`-prefixed personal user IDs, blank snapshot deletion prefixes, and unsupported batch import fields.
+- The `v0.5.3` tag publishes Rust binaries and Docker images. OpenClaw npm and Python SDK packages retain their own versions and require their separate release workflows; fixes in their source trees are not automatically published to npm or PyPI.
+- Existing MatrixOne upgrade and legacy snapshot considerations remain documented in the [compatibility notes](docs/legacy-snapshot-compatibility.md).
+
 ## [0.5.2] - 2026-09-11
 
 ### 🐛 Bug Fixes
