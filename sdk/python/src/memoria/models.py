@@ -187,7 +187,7 @@ class Branch:
 
 def _parse_apply_ids(data: dict[str, Any], field_name: str) -> list[str]:
     """Parse a branch apply receipt without coercing malformed JSON to IDs."""
-    value = data.get(field_name, [])
+    value = data.get(field_name)
     if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
         raise MemoriaResponseError(
             f"Invalid branch apply response: {field_name} must be an array of strings"
