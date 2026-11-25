@@ -24,18 +24,31 @@ _FIELDS = (
     ["memory-123", {"memory-123": True}, [123], [None], None, True, 12],
 )
 def test_apply_receipt_rejects_malformed_id_arrays(field_name: str, invalid: object) -> None:
+    receipt = {name: [] for name in _FIELDS}
+    receipt[field_name] = invalid
     with pytest.raises(MemoriaResponseError, match=field_name):
-        ApplyResult.from_dict({field_name: invalid})
+        ApplyResult.from_dict(receipt)
 
 
 @pytest.mark.parametrize("field_name", _FIELDS)
 def test_apply_receipt_preserves_id_arrays_without_aliasing(field_name: str) -> None:
     values = ["memory-1", "memory-2"]
-    result = ApplyResult.from_dict({field_name: values})
+    receipt = {name: [] for name in _FIELDS}
+    receipt[field_name] = values
+    result = ApplyResult.from_dict(receipt)
     assert getattr(result, field_name) == values
     assert getattr(result, field_name) is not values
 
 
-def test_apply_receipt_keeps_missing_fields_empty() -> None:
-    result = ApplyResult.from_dict({})
+@pytest.mark.parametrize("field_name", _FIELDS)
+def test_apply_receipt_requires_every_result_array(field_name: str) -> None:
+    receipt = {name: [] for name in _FIELDS}
+    del receipt[field_name]
+    with pytest.raises(MemoriaResponseError, match=field_name):
+        ApplyResult.from_dict(receipt)
+
+
+def test_apply_receipt_accepts_complete_empty_result() -> None:
+    receipt = {name: [] for name in _FIELDS}
+    result = ApplyResult.from_dict(receipt)
     assert all(getattr(result, field_name) == [] for field_name in _FIELDS)
