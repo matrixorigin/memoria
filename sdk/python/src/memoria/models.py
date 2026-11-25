@@ -185,6 +185,16 @@ class Branch:
         )
 
 
+def _parse_apply_ids(data: dict[str, Any], field_name: str) -> list[str]:
+    """Parse a branch apply receipt without coercing malformed JSON to IDs."""
+    value = data.get(field_name, [])
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise MemoriaResponseError(
+            f"Invalid branch apply response: {field_name} must be an array of strings"
+        )
+    return value.copy()
+
+
 @dataclass
 class ApplyResult:
     """Result of branches.apply — which entries were applied vs skipped."""
@@ -202,14 +212,14 @@ class ApplyResult:
     def from_dict(cls, d: dict[str, Any]) -> ApplyResult:
         d = _require_object(d, "branch apply")
         return cls(
-            applied_adds=list(d.get("applied_adds", [])),
-            applied_updates=list(d.get("applied_updates", [])),
-            applied_removes=list(d.get("applied_removes", [])),
-            applied_conflicts=list(d.get("applied_conflicts", [])),
-            skipped_adds=list(d.get("skipped_adds", [])),
-            skipped_updates=list(d.get("skipped_updates", [])),
-            skipped_removes=list(d.get("skipped_removes", [])),
-            skipped_conflicts=list(d.get("skipped_conflicts", [])),
+            applied_adds=_parse_apply_ids(d, "applied_adds"),
+            applied_updates=_parse_apply_ids(d, "applied_updates"),
+            applied_removes=_parse_apply_ids(d, "applied_removes"),
+            applied_conflicts=_parse_apply_ids(d, "applied_conflicts"),
+            skipped_adds=_parse_apply_ids(d, "skipped_adds"),
+            skipped_updates=_parse_apply_ids(d, "skipped_updates"),
+            skipped_removes=_parse_apply_ids(d, "skipped_removes"),
+            skipped_conflicts=_parse_apply_ids(d, "skipped_conflicts"),
         )
 
 
