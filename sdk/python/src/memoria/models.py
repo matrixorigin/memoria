@@ -107,8 +107,15 @@ class MemoryPage:
             raise MemoriaResponseError(
                 "Invalid memory page: expected an object with an items array"
             )
+        next_cursor = d.get("next_cursor")
+        if next_cursor is not None and (
+            not isinstance(next_cursor, str) or not next_cursor
+        ):
+            raise MemoriaResponseError(
+                "Invalid memory page: next_cursor must be a non-empty string or null"
+            )
         items = [Memory.from_dict(m) for m in d["items"]]
-        return cls(items=items, next_cursor=d.get("next_cursor"))
+        return cls(items=items, next_cursor=next_cursor)
 
 
 @dataclass

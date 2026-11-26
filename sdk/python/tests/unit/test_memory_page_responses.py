@@ -6,6 +6,10 @@ from memoria import MemoriaResponseError
 from tests.conftest import MEMORY_STUB
 
 INVALID_PAGES = [{}, {"items": {}}, {"items": ""}, {"items": None}, [], "oops", 42]
+INVALID_PAGES += [
+    {"items": [MEMORY_STUB], "next_cursor": cursor}
+    for cursor in [False, True, 0, 1, 1.5, [], {}, ""]
+]
 
 
 @pytest.mark.parametrize("payload", INVALID_PAGES)
