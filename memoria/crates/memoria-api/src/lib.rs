@@ -130,6 +130,7 @@ fn should_mark_metrics_dirty(
             | "/v1/memories/batch"
             | "/v1/memories/correct"
             | "/v1/memories/purge"
+            | "/v1/memories/erase"
             | "/v1/observe"
             | "/v1/observe/standalone"
             | "/v1/observe/complete"
@@ -146,6 +147,13 @@ fn should_mark_metrics_dirty(
                 // Dynamic path patterns
                 if path.starts_with("/v1/memories/") && path.ends_with("/feedback") {
                     Some(DirtyMask::FEEDBACK)
+                } else if path.starts_with("/v1/memories/")
+                    && (path.ends_with("/disable")
+                        || path.ends_with("/restore")
+                        || path.ends_with("/erase")
+                        || path.ends_with("/cleanup-confidence"))
+                {
+                    Some(DirtyMask::MEMORY)
                 } else if path.starts_with("/v1/snapshots/") && path.ends_with("/rollback")
                     || path.starts_with("/v1/branches/") && path.ends_with("/checkout")
                     || path.starts_with("/v1/branches/") && path.ends_with("/merge")
@@ -175,7 +183,10 @@ fn should_mark_metrics_dirty(
         }
     }
 
-    if method == "PUT" && path.starts_with("/v1/memories/") && path.ends_with("/correct") {
+    if method == "PUT"
+        && path.starts_with("/v1/memories/")
+        && (path.ends_with("/correct") || path.ends_with("/correct-idempotent"))
+    {
         return Some(DirtyMask::MEMORY);
     }
 
@@ -204,6 +215,14 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/v1/memories/batch", post(routes::memory::batch_store))
         .route(
+            "/v1/memories/write-fence",
+            post(routes::memory::capture_write_fence),
+        )
+        .route(
+            "/v1/memories/fenced",
+            post(routes::memory::store_memory_fenced),
+        )
+        .route(
             "/v1/memories/correct",
             post(routes::memory::correct_by_query),
         )
@@ -212,7 +231,36 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/memories/:id/correct",
             put(routes::memory::correct_memory),
         )
+        .route(
+            "/v1/memories/:id/correct-idempotent",
+            put(routes::memory::correct_memory_idempotent),
+        )
+        .route(
+            "/v1/memories/:id/correct-attributed",
+            put(routes::memory::correct_memory_attributed),
+        )
+        .route(
+            "/v1/memories/:id/metadata",
+            put(routes::memory::update_memory_metadata),
+        )
         .route("/v1/memories/:id", delete(routes::memory::delete_memory))
+        .route(
+            "/v1/memories/:id/retire-extracted",
+            post(routes::memory::retire_extracted_memory),
+        )
+        .route(
+            "/v1/memories/:id/disable",
+            post(routes::memory::disable_memory),
+        )
+        .route(
+            "/v1/memories/:id/restore",
+            post(routes::memory::restore_memory),
+        )
+        .route("/v1/memories/:id/erase", post(routes::memory::erase_memory))
+        .route(
+            "/v1/memories/:id/cleanup-confidence",
+            post(routes::memory::cleanup_confidence_inactive),
+        )
         .route("/v1/observe", post(routes::memory::observe_turn))
         .route("/v1/observe/standalone", post(routes::memory::observe_standalone_user))
         .route("/v1/observe/complete", post(routes::memory::observe_turn_complete))
@@ -250,12 +298,22 @@ pub fn build_router(state: AppState) -> Router {
         // Memory reads
         .route("/v1/memories", get(routes::memory::list_memories))
         .route("/v1/memories/query", post(routes::memory::query_memories))
+        .route("/v1/memories/sql-query", post(routes::memory_sql::query))
         .route(
             "/v1/memories/fulltext-search",
             post(routes::memory::fulltext_search_memories),
         )
         .route("/v1/memories/retrieve", post(routes::memory::retrieve))
         .route("/v1/memories/search", post(routes::memory::search))
+        .route("/v1/memories/erase", post(routes::memory::erase_memories))
+        .route(
+            "/v1/memories/vector-search",
+            post(routes::memory::vector_search),
+        )
+        .route(
+            "/v1/memories/disabled",
+            get(routes::memory::list_disabled_memories),
+        )
         .route("/v1/memories/:id", get(routes::memory::get_memory))
         .route(
             "/v1/memories/:id/history",
@@ -289,6 +347,15 @@ pub fn build_router(state: AppState) -> Router {
         )
         // Governance
         .route("/v1/governance", post(routes::governance::governance))
+        .route(
+            "/v1/governance/confidence-policy",
+            get(routes::governance::get_confidence_policy)
+                .put(routes::governance::set_confidence_policy),
+        )
+        .route(
+            "/v1/memories/confidence-inactive",
+            get(routes::governance::list_confidence_inactive),
+        )
         .route("/v1/consolidate", post(routes::governance::consolidate))
         .route("/v1/reflect", post(routes::governance::reflect))
         .route(
@@ -530,6 +597,9 @@ mod tests {
         assert!(should_mark_metrics_dirty("POST", "/v1/snapshots/demo/rollback", 200).is_some());
         assert!(should_mark_metrics_dirty("DELETE", "/v1/branches/demo", 204).is_some());
         assert!(should_mark_metrics_dirty("POST", "/v1/sessions/abc/summary", 200).is_some());
+        assert!(
+            should_mark_metrics_dirty("PUT", "/v1/memories/abc/correct-idempotent", 200).is_some()
+        );
     }
 
     #[test]

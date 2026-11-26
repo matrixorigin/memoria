@@ -932,7 +932,7 @@ async fn test_batch_store_rejects_silently_ignored_fields_verify_db() {
     let err = r.text().await.unwrap();
     assert!(err.contains("observed_at"), "expected observed_at error, got: {err}");
 
-    // explicit initial_confidence, including an explicit 0.0, is equally unsupported
+    // Confidence is now supported and must survive both HTTP and persistence.
     for confidence in [0.7, 0.0] {
         let r = client.post(format!("{base}/v1/memories/batch"))
             .header("X-User-Id", &uid)
@@ -940,9 +940,13 @@ async fn test_batch_store_rejects_silently_ignored_fields_verify_db() {
                 {"content": "imported fact", "initial_confidence": confidence},
             ]}))
             .send().await.unwrap();
-        assert_eq!(r.status(), 422);
-        let err = r.text().await.unwrap();
-        assert!(err.contains("initial_confidence"), "expected initial_confidence error, got: {err}");
+        assert_eq!(r.status(), 201);
+        let body: Vec<Value> = r.json().await.unwrap();
+        assert_eq!(body.len(), 1);
+        assert_eq!(body[0]["initial_confidence"], confidence);
+        let row = db_get_memory(&server, &uid, body[0]["memory_id"].as_str().unwrap()).await;
+        let stored: f32 = row.get("initial_confidence");
+        assert!((f64::from(stored) - confidence).abs() < 0.000_001);
     }
 
     // existing idempotency_key guard still holds at the HTTP level
@@ -965,7 +969,7 @@ async fn test_batch_store_rejects_silently_ignored_fields_verify_db() {
         ]}))
         .send().await.unwrap();
     assert_eq!(r.status(), 422);
-    assert_eq!(db_count_active(&server, &uid).await, 2, "rejected batch must not write rows");
+    assert_eq!(db_count_active(&server, &uid).await, 4, "rejected batch must not write rows");
 
     println!("✅ batch store: ignored import fields rejected, no partial write, nulls accepted");
 }

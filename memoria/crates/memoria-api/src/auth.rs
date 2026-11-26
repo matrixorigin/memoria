@@ -24,6 +24,8 @@ use crate::state::{AppState, CachedApiKeyPrincipal};
 pub const SCOPE_IDENTITY_READ: &str = "identity:read";
 pub const SCOPE_MEMORY_READ: &str = "memory:read";
 pub const SCOPE_MEMORY_WRITE: &str = "memory:write";
+// Privileged SQL is explicitly issued; never part of default read/write scopes.
+pub const SCOPE_MEMORY_SQL: &str = "memory:sql";
 pub const SCOPE_KEYS_MANAGE: &str = "keys:manage";
 pub const DEFAULT_API_KEY_SCOPES: &str = "identity:read,memory:read,memory:write,keys:manage";
 const OWNER_SCOPED_MASTER_SCOPES: &[&str] =
@@ -130,6 +132,9 @@ pub(crate) fn request_tool_name(headers: &axum::http::HeaderMap) -> Option<Strin
 }
 
 fn required_scope_for_request(method: &axum::http::Method, path: &str) -> Option<&'static str> {
+    if method == axum::http::Method::POST && path == "/v1/memories/sql-query" {
+        return Some(SCOPE_MEMORY_SQL);
+    }
     let under = |prefix: &str| path == prefix || path.starts_with(&format!("{prefix}/"));
     if (path == "/auth/whoami" && method == axum::http::Method::GET)
         || (path == "/mcp" && method == axum::http::Method::POST)
@@ -176,6 +181,7 @@ fn required_scope_for_request(method: &axum::http::Method, path: &str) -> Option
                     | "/v1/memories/fulltext-search"
                     | "/v1/memories/retrieve"
                     | "/v1/memories/search"
+                    | "/v1/memories/vector-search"
             ))
     {
         Some(SCOPE_MEMORY_READ)
@@ -311,6 +317,40 @@ pub(crate) async fn group_main_write_allowed_for_solo_owner(
     owner_user_id == user_id && active_member_count == 1
 }
 
+/// Group erase is allowed only for the active group's owner. A member key with
+/// `memory:write` is not enough, and a lookup failure stays closed.
+pub(crate) async fn group_erase_allowed(state: &AppState, group_id: &str, user_id: &str) -> bool {
+    let Some(pool) = state
+        .auth_pool
+        .as_ref()
+        .or_else(|| state.service.sql_store.as_ref().map(|s| s.pool()))
+    else {
+        return false;
+    };
+
+    let row = match sqlx::query(
+        "SELECT owner_user_id FROM mem_groups WHERE group_id = ? AND status = 'active' LIMIT 1",
+    )
+    .bind(group_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            warn!("group_erase_allowed: DB query failed: {e}");
+            return false;
+        }
+    };
+
+    let Some(row) = row else {
+        return false;
+    };
+    let Ok(owner_user_id) = row.try_get::<String, _>("owner_user_id") else {
+        return false;
+    };
+    !owner_user_id.is_empty() && owner_user_id == user_id
+}
+
 // ── Group main-write guard (middleware) ──────────────────────────────────────
 
 /// Axum middleware that rejects write requests to `main` in group mode.
@@ -391,6 +431,7 @@ pub async fn group_main_write_guard(
                             path,
                             "/v1/memories"
                                 | "/v1/memories/idempotent"
+                                | "/v1/memories/fenced"
                                 | "/v1/memories/batch"
                                 | "/v1/memories/correct"
                                 | "/v1/memories/purge"
@@ -399,7 +440,16 @@ pub async fn group_main_write_guard(
                                 | "/v1/observe/complete"
                                 | "/v1/observe/deduplicated"
                         ) || (path.starts_with("/v1/memories/")
-                            && path.ends_with("/correct"));
+                            && [
+                                "/correct",
+                                "/correct-idempotent",
+                                "/correct-attributed",
+                                "/disable",
+                                "/restore",
+                                "/erase",
+                            ]
+                            .iter()
+                            .any(|suffix| path.ends_with(suffix)));
                         if !branch_aware_body_route {
                             return (
                                 StatusCode::FORBIDDEN,
@@ -409,6 +459,7 @@ pub async fn group_main_write_guard(
                             )
                                 .into_response();
                         }
+                        let nested_memory_body = path == "/v1/memories/fenced";
                         let (parts, body) = req.into_parts();
                         let bytes = match to_bytes(body, 8 * 1024 * 1024).await {
                             Ok(bytes) => bytes,
@@ -424,7 +475,13 @@ pub async fn group_main_write_guard(
                             serde_json::from_slice::<serde_json::Value>(&bytes)
                                 .ok()
                                 .and_then(|body| {
-                                    body.get("branch")
+                                    let memory = if nested_memory_body {
+                                        body.get("memory")?
+                                    } else {
+                                        &body
+                                    };
+                                    memory
+                                        .get("branch")
                                         .and_then(|branch| branch.as_str())
                                         .map(str::to_string)
                                 })
@@ -1483,6 +1540,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn manual_governance_requires_memory_scopes() {
+        use axum::http::Method;
+        let read_only = parse_scopes(SCOPE_MEMORY_READ);
+        assert!(authorize_api_key_route(&Method::GET, "/v1/memories/disabled", &read_only).is_ok());
+        for action in ["disable", "restore", "erase"] {
+            let path = format!("/v1/memories/synthetic/{action}");
+            assert_eq!(
+                required_scope_for_request(&Method::POST, &path),
+                Some(SCOPE_MEMORY_WRITE)
+            );
+            assert_eq!(
+                authorize_api_key_route(&Method::POST, &path, &read_only)
+                    .unwrap_err()
+                    .0,
+                StatusCode::FORBIDDEN
+            );
+        }
+    }
+
+    #[test]
     fn classifies_memory_read_and_write_routes() {
         for path in [
             "/v1/observe/complete",
@@ -1668,10 +1745,7 @@ mod tests {
         assert_eq!(resolve_personal_user_id(&headers, None).unwrap(), "alice");
 
         let headers = axum::http::HeaderMap::new();
-        assert_eq!(
-            resolve_personal_user_id(&headers, None).unwrap(),
-            "default"
-        );
+        assert_eq!(resolve_personal_user_id(&headers, None).unwrap(), "default");
     }
 
     #[test]

@@ -22,8 +22,15 @@ pub fn api_err(e: impl std::fmt::Display) -> (StatusCode, String) {
 /// Map MemoriaError to proper HTTP status codes.
 pub fn api_err_typed(e: memoria_core::MemoriaError) -> (StatusCode, String) {
     use memoria_core::MemoriaError::*;
+    if matches!(&e, Conflict(message) if message == "memory_write_fence_stale") {
+        return (
+            StatusCode::CONFLICT,
+            r#"{"code":"memory_write_fence_stale"}"#.into(),
+        );
+    }
     let status = match &e {
         NotFound(_) => StatusCode::NOT_FOUND,
+        Conflict(_) => StatusCode::CONFLICT,
         Validation(_) | InvalidMemoryType(_) | InvalidTrustTier(_) => {
             StatusCode::UNPROCESSABLE_ENTITY
         }
@@ -255,6 +262,42 @@ pub async fn store_memory(
     auth: AuthUser,
     Json(req): Json<StoreRequest>,
 ) -> Result<(StatusCode, Json<MemoryResponse>), (StatusCode, String)> {
+    store_with_fence(state, auth, req, None).await
+}
+
+pub async fn capture_write_fence(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<WriteFenceRequest>,
+) -> ApiResult<memoria_storage::MemoryWriteFence> {
+    Ok(Json(
+        state
+            .service
+            .capture_memory_write_fence(
+                auth.scope_id(),
+                &req.subject_id,
+                &req.connector_id,
+                &req.workflow_id,
+            )
+            .await
+            .map_err(api_err_typed)?,
+    ))
+}
+
+pub async fn store_memory_fenced(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<FencedStoreRequest>,
+) -> Result<(StatusCode, Json<MemoryResponse>), (StatusCode, String)> {
+    store_with_fence(state, auth, req.memory, Some(req.fence)).await
+}
+
+async fn store_with_fence(
+    state: AppState,
+    auth: AuthUser,
+    req: StoreRequest,
+    fence: Option<memoria_storage::MemoryWriteFence>,
+) -> Result<(StatusCode, Json<MemoryResponse>), (StatusCode, String)> {
     if req.content.is_empty() {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -284,7 +327,7 @@ pub async fn store_memory(
     };
     let m = state
         .service
-        .store_memory_with_metadata_and_key_on_branch(
+        .store_memory_with_write_fence(
             auth.scope_id(),
             branch_param(req.branch.as_deref()),
             &req.content,
@@ -297,6 +340,7 @@ pub async fn store_memory(
             req.subject_id,
             req.extra_metadata,
             req.idempotency_key.as_deref(),
+            fence.as_ref(),
         )
         .await
         .map_err(|e| {
@@ -308,8 +352,8 @@ pub async fn store_memory(
     Ok((StatusCode::CREATED, Json(m.into())))
 }
 
-// Batch writes currently cannot preserve per-item time or confidence. Reject
-// these fields rather than silently importing historical facts as new ones.
+// Batch writes preserve per-item confidence, but cannot preserve historical
+// timestamps or per-item idempotency. Reject only the unsupported fields.
 fn validate_batch_write_fields(memories: &[StoreRequest]) -> Result<(), (StatusCode, String)> {
     if memories.iter().any(|memory| memory.idempotency_key.is_some()) {
         return Err((
@@ -321,15 +365,6 @@ fn validate_batch_write_fields(memories: &[StoreRequest]) -> Result<(), (StatusC
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             "observed_at requires the single-memory store endpoint".into(),
-        ));
-    }
-    if memories
-        .iter()
-        .any(|memory| memory.initial_confidence.is_some())
-    {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "initial_confidence requires the single-memory store endpoint".into(),
         ));
     }
     Ok(())
@@ -380,16 +415,36 @@ pub async fn batch_store(
                 top_branch.clone(),
                 subject_id,
                 r.extra_metadata,
+                r.initial_confidence,
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
     // Validate all types upfront
     let mut validated = Vec::with_capacity(items.len());
-    for (content, mt_result, tier_result, session_id, branch, subject_id, extra_metadata) in items {
+    for (
+        content,
+        mt_result,
+        tier_result,
+        session_id,
+        branch,
+        subject_id,
+        extra_metadata,
+        initial_confidence,
+    ) in items
+    {
         let mt = mt_result?;
         let tier = tier_result?;
-        validated.push((content, mt, session_id, tier, branch, subject_id, extra_metadata));
+        validated.push((
+            content,
+            mt,
+            session_id,
+            tier,
+            branch,
+            subject_id,
+            extra_metadata,
+            initial_confidence,
+        ));
     }
 
     let author = if auth.group_id.is_some() {
@@ -399,9 +454,28 @@ pub async fn batch_store(
     };
     let batch_items = validated
         .into_iter()
-        .map(|(content, mt, session_id, tier, _branch, subject_id, extra_metadata)| {
-            (content, mt, session_id, tier, subject_id, extra_metadata)
-        })
+        .map(
+            |(
+                content,
+                mt,
+                session_id,
+                tier,
+                _branch,
+                subject_id,
+                extra_metadata,
+                initial_confidence,
+            )| {
+                (
+                    content,
+                    mt,
+                    session_id,
+                    tier,
+                    subject_id,
+                    extra_metadata,
+                    initial_confidence,
+                )
+            },
+        )
         .collect();
     let results = state
         .service
@@ -514,6 +588,61 @@ pub async fn search(
     }
 }
 
+pub async fn vector_search(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    request: Result<Json<VectorSearchRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<Vec<MemoryResponse>>, (StatusCode, Json<serde_json::Value>)> {
+    let Json(req) = request.map_err(|_| {
+        vector_query_error(memoria_core::MemoriaError::Validation(
+            "invalid query body".into(),
+        ))
+    })?;
+    let memory_types = parse_memory_types_opt(req.memory_types.as_ref()).map_err(|_| {
+        vector_query_error(memoria_core::MemoriaError::Validation(
+            "invalid memory type".into(),
+        ))
+    })?;
+    let results = state
+        .service
+        .search_query_vector_on_branch(
+            auth.scope_id(),
+            branch_param(req.branch.as_deref()),
+            &req.query_vector,
+            req.top_k,
+            req.subject_id.as_deref(),
+            memory_types.as_deref(),
+            &req.filter,
+        )
+        .await
+        .map_err(vector_query_error)?;
+    Ok(Json(results.into_iter().map(Into::into).collect()))
+}
+
+// Reuse the owner's existing status classification, but do not expose database
+// diagnostics on the new public query primitive.
+fn vector_query_error(error: memoria_core::MemoriaError) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, _) = api_err_typed(error);
+    let (code, message) = match status {
+        StatusCode::UNPROCESSABLE_ENTITY => {
+            ("memory_query_invalid", "The memory query is invalid.")
+        }
+        StatusCode::NOT_FOUND => (
+            "memory_resource_not_found",
+            "The requested memory resource was not found.",
+        ),
+        StatusCode::FORBIDDEN => ("memory_query_denied", "The memory query is not permitted."),
+        _ => (
+            "memory_query_unavailable",
+            "The memory query could not be completed.",
+        ),
+    };
+    (
+        status,
+        Json(serde_json::json!({"code": code, "message": message})),
+    )
+}
+
 pub async fn get_memory(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -545,14 +674,115 @@ pub async fn get_memory(
     Ok(Json(None))
 }
 
+/// A separate protocol cannot be mistaken for the old non-idempotent endpoint
+/// when a caller reaches an older Memoria instance during an upgrade.
+pub async fn correct_memory_idempotent(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    request: Result<Json<IdempotentCorrectRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<MemoryResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let Json(request) = request.map_err(|_| {
+        memory_record_error(memoria_core::MemoriaError::Validation(
+            "invalid body".into(),
+        ))
+    })?;
+    let memory = state
+        .service
+        .correct_with_key_on_branch(
+            auth.scope_id(),
+            &request.branch,
+            &id,
+            &request.subject_id,
+            &request.new_content,
+            &request.idempotency_key,
+            request.omit_structured_content,
+        )
+        .await
+        .map_err(memory_record_error)?;
+    Ok(Json(memory.into()))
+}
+
+fn memory_record_error(error: memoria_core::MemoriaError) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, _) = api_err_typed(error);
+    let (code, message) = match status {
+        StatusCode::UNPROCESSABLE_ENTITY => (
+            "memory_record_invalid",
+            "The memory data request is invalid.",
+        ),
+        StatusCode::CONFLICT => (
+            "memory_record_conflict",
+            "The request conflicts with the stored memory state.",
+        ),
+        StatusCode::NOT_FOUND => (
+            "memory_resource_not_found",
+            "The requested memory resource was not found.",
+        ),
+        StatusCode::FORBIDDEN => (
+            "memory_record_denied",
+            "The memory data request is not permitted.",
+        ),
+        _ => (
+            "memory_record_unavailable",
+            "The memory data request could not be completed.",
+        ),
+    };
+    (
+        status,
+        Json(serde_json::json!({"code": code, "message": message})),
+    )
+}
+
 pub async fn correct_memory(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(id): Path<String>,
     Json(req): Json<CorrectRequest>,
 ) -> ApiResult<MemoryResponse> {
+    correct_memory_with_source(&state, auth, id, req, None, None, None, None).await
+}
+
+pub async fn correct_memory_attributed(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    Json(req): Json<AttributedCorrectRequest>,
+) -> ApiResult<MemoryResponse> {
+    let request = CorrectRequest {
+        new_content: req.new_content,
+        reason: req.reason,
+        branch: req.branch,
+    };
+    correct_memory_with_source(
+        &state,
+        auth,
+        id,
+        request,
+        Some(&req.extra_metadata_patch),
+        Some(&req.session_id),
+        Some((
+            &req.subject_id,
+            req.expected_updated_at,
+            &req.expected_revision,
+        )),
+        req.initial_confidence,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn correct_memory_with_source(
+    state: &AppState,
+    auth: AuthUser,
+    id: String,
+    req: CorrectRequest,
+    metadata: Option<&std::collections::HashMap<String, serde_json::Value>>,
+    session_id: Option<&str>,
+    expected_revision: Option<(&str, chrono::DateTime<chrono::Utc>, &str)>,
+    initial_confidence: Option<f64>,
+) -> ApiResult<MemoryResponse> {
     let effective_user_id = if auth.is_master {
-        find_memory_any_user(&state, &id, branch_param(req.branch.as_deref()))
+        find_memory_any_user(state, &id, branch_param(req.branch.as_deref()))
             .await?
             .map(|(owner_id, _)| owner_id)
             .unwrap_or_else(|| auth.scope_id().to_string())
@@ -570,15 +800,42 @@ pub async fn correct_memory(
     };
     let m = state
         .service
-        .correct_on_branch(
+        .correct_with_metadata_on_branch(
             &effective_user_id,
             branch_param(req.branch.as_deref()),
             &id,
             &req.new_content,
+            metadata,
+            session_id,
+            expected_revision,
+            initial_confidence,
         )
         .await
         .map_err(api_err_typed)?;
     Ok(Json(m.into()))
+}
+
+pub async fn update_memory_metadata(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    Json(req): Json<MemoryMetadataRequest>,
+) -> ApiResult<MemoryResponse> {
+    let memory = state
+        .service
+        .patch_memory_metadata(
+            auth.scope_id(),
+            Some("main"),
+            &id,
+            &req.subject_id,
+            &req.session_id,
+            req.expected_updated_at,
+            &req.expected_revision,
+            &req.extra_metadata,
+        )
+        .await
+        .map_err(api_err_typed)?;
+    Ok(Json(memory.into()))
 }
 
 pub async fn correct_by_query(
@@ -663,6 +920,212 @@ pub async fn delete_memory(
     Ok(StatusCode::NO_CONTENT)
 }
 
+const DISABLE_REASON_MAX_CHARS: usize = 512;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetireExtractedRequest {
+    subject_id: String,
+    session_id: String,
+    expected_updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Compare-and-swap cleanup for derived memories. A changed record is retained.
+/// The separate route prevents clients from sending ignored preconditions to purge.
+pub async fn retire_extracted_memory(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    request: Result<Json<RetireExtractedRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let Json(request) = request.map_err(|_| {
+        memory_record_error(memoria_core::MemoriaError::Validation(
+            "invalid cleanup request".into(),
+        ))
+    })?;
+    let deleted = state
+        .service
+        .retire_extracted_memory(
+            auth.scope_id(),
+            &request.subject_id,
+            &request.session_id,
+            &id,
+            request.expected_updated_at,
+        )
+        .await
+        .map_err(memory_record_error)?;
+    Ok(Json(serde_json::json!({"deleted": deleted})))
+}
+
+const DISABLED_LIST_DEFAULT_LIMIT: i64 = 100;
+const DISABLED_LIST_MAX_LIMIT: i64 = 500;
+
+fn governance_subject(subject_id: Option<&str>) -> Result<Option<&str>, (StatusCode, String)> {
+    match subject_id.map(str::trim) {
+        Some("") => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subject_id must not be blank".into(),
+        )),
+        subject => Ok(subject),
+    }
+}
+
+/// Resolve once and pin the write to that branch. The middleware's active-branch
+/// shortcut is not sufficient when a group member explicitly targets main.
+async fn governance_branch(
+    state: &AppState,
+    auth: &AuthUser,
+    branch: Option<&str>,
+) -> Result<String, (StatusCode, String)> {
+    let sql = state
+        .service
+        .user_sql_store(auth.scope_id())
+        .await
+        .map_err(api_err_typed)?;
+    let branch = match branch_param(branch) {
+        Some(branch) => branch.to_owned(),
+        None => memoria_storage::ACTOR_USER_ID
+            .scope(
+                auth.user_id.clone(),
+                sql.active_branch_name(auth.scope_id()),
+            )
+            .await
+            .map_err(api_err_typed)?,
+    };
+    let table = sql
+        .table_for_branch(auth.scope_id(), Some(&branch))
+        .await
+        .map_err(api_err_typed)?;
+    if let Some(group_id) = auth.group_id.as_deref() {
+        if table == sql.t("mem_memories")
+            && !crate::auth::group_main_write_allowed_for_solo_owner(state, group_id, &auth.user_id)
+                .await
+        {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "main is read-only in group mode".into(),
+            ));
+        }
+    }
+    Ok(branch)
+}
+
+/// Operator disable: the memory leaves retrieval but stays restorable.
+pub async fn disable_memory(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    Json(req): Json<MemoryGovernanceRequest>,
+) -> ApiResult<DisabledMemoryResponse> {
+    let subject = governance_subject(req.subject_id.as_deref())?;
+    let branch = governance_branch(&state, &auth, req.branch.as_deref()).await?;
+    if req.reason.chars().count() > DISABLE_REASON_MAX_CHARS {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("reason must be at most {DISABLE_REASON_MAX_CHARS} characters"),
+        ));
+    }
+    let memory = state
+        .service
+        .disable_on_branch(
+            auth.scope_id(),
+            Some(&branch),
+            subject,
+            &id,
+            req.reason.trim(),
+        )
+        .await
+        .map_err(api_err_typed)?;
+    Ok(Json(memory.into()))
+}
+
+pub async fn restore_memory(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    Json(req): Json<MemoryLifecycleRequest>,
+) -> ApiResult<MemoryResponse> {
+    let subject = governance_subject(req.subject_id.as_deref())?;
+    let branch = governance_branch(&state, &auth, req.branch.as_deref()).await?;
+    let memory = state
+        .service
+        .restore_on_branch(auth.scope_id(), Some(&branch), subject, &id)
+        .await
+        .map_err(api_err_typed)?;
+    Ok(Json(memory.into()))
+}
+
+/// Remove one non-superseded memory, retaining only an idempotency tombstone when needed.
+pub async fn erase_memory(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    Json(req): Json<MemoryLifecycleRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let subject = governance_subject(req.subject_id.as_deref())?;
+    let branch = governance_branch(&state, &auth, req.branch.as_deref()).await?;
+    state
+        .service
+        .erase_on_branch(auth.scope_id(), Some(&branch), subject, &id)
+        .await
+        .map_err(api_err_typed)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn cleanup_confidence_inactive(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    Json(req): Json<MemoryLifecycleRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let subject = governance_subject(req.subject_id.as_deref())?.ok_or((
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "subject_id is required".into(),
+    ))?;
+    if req.branch.as_deref().is_some_and(|branch| branch != "main") {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "confidence lifecycle applies to main".into(),
+        ));
+    }
+    governance_branch(&state, &auth, Some("main")).await?;
+    state
+        .service
+        .erase_confidence_inactive(auth.scope_id(), subject, &id)
+        .await
+        .map_err(api_err_typed)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn list_disabled_memories(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Query(q): Query<DisabledMemoriesQuery>,
+) -> ApiResult<crate::models::DisabledMemoriesResponse> {
+    let limit = q.limit.unwrap_or(DISABLED_LIST_DEFAULT_LIMIT);
+    if !(1..=DISABLED_LIST_MAX_LIMIT).contains(&limit) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("limit must be between 1 and {DISABLED_LIST_MAX_LIMIT}"),
+        ));
+    }
+    let (memories, next_cursor) = state
+        .service
+        .list_disabled_on_branch(
+            auth.scope_id(),
+            branch_param(q.branch.as_deref()),
+            governance_subject(q.subject_id.as_deref())?,
+            limit,
+            q.cursor.as_deref(),
+        )
+        .await
+        .map_err(api_err_typed)?;
+    Ok(Json(crate::models::DisabledMemoriesResponse {
+        items: memories.into_iter().map(Into::into).collect(),
+        next_cursor,
+    }))
+}
+
 pub async fn purge_memories(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -734,6 +1197,83 @@ pub async fn purge_memories(
     }))
 }
 
+pub async fn erase_memories(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<EraseRequest>,
+) -> Result<Json<EraseResponse>, (StatusCode, String)> {
+    if auth.is_master {
+        return Err((
+            StatusCode::FORBIDDEN,
+            r#"{"code":"memory_erase_forbidden"}"#.to_string(),
+        ));
+    }
+    if let Some(group_id) = auth.group_id.as_deref() {
+        if !crate::auth::group_erase_allowed(&state, group_id, &auth.user_id).await {
+            return Err((
+                StatusCode::FORBIDDEN,
+                r#"{"code":"memory_erase_forbidden"}"#.to_string(),
+            ));
+        }
+    }
+    let selector = req.selector().map_err(|_| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            r#"{"code":"memory_erase_invalid"}"#.to_string(),
+        )
+    })?;
+    match state
+        .service
+        .erase_memories(auth.scope_id(), &selector)
+        .await
+    {
+        Ok(report) => Ok(Json(EraseResponse {
+            memories: report.memories,
+            branch_memories: report.branch_memories,
+            graph_nodes: report.graph_nodes,
+            graph_edges: report.graph_edges,
+            entity_links: report.entity_links,
+            memory_entity_links: report.memory_entity_links,
+            entities: report.entities,
+            stats: report.stats,
+            edit_log: report.edit_log,
+            feedback: report.feedback,
+            snapshots_dropped: report.snapshots_dropped,
+            snapshots_retained: report.snapshots_retained,
+        })),
+        Err(error) => Err(erase_failure(error)),
+    }
+}
+
+fn erase_failure(error: memoria_core::MemoriaError) -> (StatusCode, String) {
+    use memoria_core::MemoriaError::*;
+    match error {
+        Validation(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            r#"{"code":"memory_erase_invalid"}"#.to_string(),
+        ),
+        Blocked(_) => (
+            StatusCode::CONFLICT,
+            r#"{"code":"memory_erase_busy"}"#.to_string(),
+        ),
+        Internal(message)
+            if message.contains("left memory rows")
+                || message.contains("snapshot")
+                || message.contains("lock") =>
+        {
+            tracing::error!(error = %message, "physical erase incomplete");
+            (
+                StatusCode::BAD_GATEWAY,
+                r#"{"code":"memory_erase_incomplete"}"#.to_string(),
+            )
+        }
+        other => {
+            let (status, _) = api_err_typed(other);
+            (status, r#"{"code":"memory_erase_incomplete"}"#.to_string())
+        }
+    }
+}
+
 pub async fn get_profile(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -783,10 +1323,7 @@ pub async fn get_profile(
         )
         .await
         .map_err(api_err)?;
-    let profile: Vec<_> = memories
-        .iter()
-        .map(|m| m.content.as_str())
-        .collect();
+    let profile: Vec<_> = memories.iter().map(|m| m.content.as_str()).collect();
 
     // Stats enrichment follows the same subject_id scope as the profile query.
     let stats_rows = if let Some(sid) = subject_id {
@@ -796,7 +1333,11 @@ pub async fn get_profile(
              MIN(observed_at) as oldest, MAX(observed_at) as newest \
              FROM {table} WHERE user_id = ? AND subject_id = ? AND is_active = 1 GROUP BY memory_type"
         );
-        sqlx::query(&q).bind(&resolved).bind(sid).fetch_all(sql.pool()).await
+        sqlx::query(&q)
+            .bind(&resolved)
+            .bind(sid)
+            .fetch_all(sql.pool())
+            .await
     } else {
         let q = format!(
             "SELECT memory_type, COUNT(*) as cnt, \
@@ -1362,14 +1903,12 @@ mod batch_write_field_tests {
     }
 
     #[test]
-    fn batch_rejects_explicit_confidence_including_zero() {
+    fn batch_accepts_supported_confidence_including_zero() {
         for confidence in [0.0, 0.5, 1.0] {
-            let error = validate_payload(serde_json::json!({
+            validate_payload(serde_json::json!({
                 "memories": [{"content": "imported", "initial_confidence": confidence}]
             }))
-            .unwrap_err();
-            assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
-            assert!(error.1.contains("initial_confidence"));
+            .unwrap();
         }
     }
 

@@ -94,6 +94,38 @@ class Memory:
 
 
 @dataclass
+class DisabledMemory:
+    """A memory an operator disabled: out of retrieval, restorable."""
+
+    memory: Memory
+    disabled_at: datetime | None = None
+    disabled_reason: str | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> DisabledMemory:
+        return cls(
+            memory=Memory.from_dict(d),
+            disabled_at=_parse_dt(d.get("disabled_at")),
+            disabled_reason=d.get("disabled_reason"),
+        )
+
+
+@dataclass
+class DisabledMemoryPage:
+    """A bounded page of disabled records; pass next_cursor to continue."""
+
+    items: list[DisabledMemory]
+    next_cursor: str | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> DisabledMemoryPage:
+        return cls(
+            items=[DisabledMemory.from_dict(item) for item in d["items"]],
+            next_cursor=d.get("next_cursor"),
+        )
+
+
+@dataclass
 class MemoryPage:
     """Paginated list of memories."""
 
@@ -128,6 +160,41 @@ class RetrieveResult:
         return cls(
             items=[Memory.from_dict(m) for m in results],
             explain=d.get("explain"),
+        )
+
+
+@dataclass
+class EraseResult:
+    """Result of a physical memory erase. Counts are removed rows, not soft-deleted rows."""
+
+    memories: int = 0
+    branch_memories: int = 0
+    graph_nodes: int = 0
+    graph_edges: int = 0
+    entity_links: int = 0
+    memory_entity_links: int = 0
+    entities: int = 0
+    stats: int = 0
+    edit_log: int = 0
+    feedback: int = 0
+    snapshots_dropped: int = 0
+    snapshots_retained: bool = False
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> EraseResult:
+        return cls(
+            memories=int(d.get("memories", 0)),
+            branch_memories=int(d.get("branch_memories", 0)),
+            graph_nodes=int(d.get("graph_nodes", 0)),
+            graph_edges=int(d.get("graph_edges", 0)),
+            entity_links=int(d.get("entity_links", 0)),
+            memory_entity_links=int(d.get("memory_entity_links", 0)),
+            entities=int(d.get("entities", 0)),
+            stats=int(d.get("stats", 0)),
+            edit_log=int(d.get("edit_log", 0)),
+            feedback=int(d.get("feedback", 0)),
+            snapshots_dropped=int(d.get("snapshots_dropped", 0)),
+            snapshots_retained=bool(d.get("snapshots_retained", False)),
         )
 
 

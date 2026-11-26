@@ -9,7 +9,15 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 from ..exceptions import MemoriaResponseError, MemoriaValidationError
-from ..models import Memory, MemoryPage, PurgeResult, RetrieveResult
+from ..models import (
+    DisabledMemory,
+    DisabledMemoryPage,
+    EraseResult,
+    Memory,
+    MemoryPage,
+    PurgeResult,
+    RetrieveResult,
+)
 
 if TYPE_CHECKING:
     from .._http import _HttpTransport
@@ -23,6 +31,46 @@ _FULLTEXT_QUERY_MAX_BYTES = 4096
 _FULLTEXT_SEARCH_DEFAULT_LIMIT = 20
 _FULLTEXT_SEARCH_MAX_LIMIT = 100
 _MEMORY_CURSOR_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_ERASE_MODES = frozenset({"group", "subject", "subject_connector", "workflow"})
+
+
+def _erase_body(
+    mode: str,
+    subject_id: str | None,
+    connector_id: str | None,
+    workflow_id: str | None = None,
+) -> dict[str, str]:
+    if mode not in _ERASE_MODES:
+        raise MemoriaValidationError(
+            "erase: mode must be group, subject, subject_connector, or workflow"
+        )
+    if mode == "group" and (subject_id is not None or connector_id is not None):
+        raise MemoriaValidationError("erase: group mode does not accept identifiers")
+    if mode == "subject" and (not subject_id or connector_id is not None):
+        raise MemoriaValidationError("erase: subject mode requires subject_id only")
+    if mode == "subject_connector" and (not subject_id or not connector_id):
+        raise MemoriaValidationError(
+            "erase: subject_connector mode requires subject_id and connector_id"
+        )
+    if mode != "workflow" and workflow_id is not None:
+        raise MemoriaValidationError("erase: workflow_id requires workflow mode")
+    if mode == "workflow" and (
+        not isinstance(workflow_id, str) or not workflow_id
+        or workflow_id.strip() != workflow_id or len(workflow_id.encode()) > 128
+        or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in workflow_id)
+        or subject_id is not None or connector_id is not None
+    ):
+        raise MemoriaValidationError(
+            "erase: workflow mode requires workflow_id only (up to 128 bytes)"
+        )
+    body = {"mode": mode}
+    if subject_id is not None:
+        body["subject_id"] = subject_id
+    if connector_id is not None:
+        body["connector_id"] = connector_id
+    if workflow_id is not None:
+        body["workflow_id"] = workflow_id
+    return body
 
 _MEMORY_TYPE_NAMES = {
     "semantic",
@@ -638,6 +686,66 @@ class MemoriesResource:
         params = _strip_none({"reason": reason, "branch": branch})
         self._client._request("DELETE", _memory_path(id), params=params, idempotent=False)
 
+    # Operator governance. ``subject_id`` fences the target: a memory of another
+    # subject is reported as not found.
+    def disable(
+        self,
+        id: str,
+        *,
+        subject_id: str | None = None,
+        reason: str | None = None,
+        branch: str | None = None,
+    ) -> DisabledMemory:
+        """Take a memory out of retrieval while keeping it restorable."""
+        body = _strip_none({"subject_id": subject_id, "reason": reason, "branch": branch})
+        data = self._client._request(
+            "POST", _memory_path(id, "/disable"), json=body, idempotent=False
+        )
+        return DisabledMemory.from_dict(data)
+
+    def restore(
+        self,
+        id: str,
+        *,
+        subject_id: str | None = None,
+        branch: str | None = None,
+    ) -> Memory:
+        """Reactivate a memory disabled with :meth:`disable`."""
+        body = _strip_none({"subject_id": subject_id, "branch": branch})
+        data = self._client._request(
+            "POST", _memory_path(id, "/restore"), json=body, idempotent=False
+        )
+        return Memory.from_dict(data)
+
+    def erase_one(
+        self,
+        id: str,
+        *,
+        subject_id: str | None = None,
+        branch: str | None = None,
+    ) -> None:
+        """Erase a non-superseded row's content, retaining an idempotency receipt if needed.
+
+        This is not deletion across graph data, edit logs, history, branches or backups.
+        """
+        body = _strip_none({"subject_id": subject_id, "branch": branch})
+        self._client._request("POST", _memory_path(id, "/erase"), json=body, idempotent=False)
+
+    def list_disabled(
+        self,
+        *,
+        subject_id: str | None = None,
+        limit: int | None = None,
+        branch: str | None = None,
+        cursor: str | None = None,
+    ) -> DisabledMemoryPage:
+        """Disabled memories, most recently disabled first."""
+        params = _strip_none(
+            {"subject_id": subject_id, "limit": limit, "branch": branch, "cursor": cursor}
+        )
+        data = self._client._request("GET", "/v1/memories/disabled", params=params)
+        return DisabledMemoryPage.from_dict(data)
+
     def purge(
         self,
         *,
@@ -677,6 +785,18 @@ class MemoriesResource:
         )
         data = self._client._request("POST", "/v1/memories/purge", json=body)
         return PurgeResult.from_dict(data)
+
+    def erase(
+        self,
+        *,
+        mode: str,
+        subject_id: str | None = None,
+        connector_id: str | None = None,
+        workflow_id: str | None = None,
+    ) -> EraseResult:
+        body = _erase_body(mode, subject_id, connector_id, workflow_id)
+        data = self._client._request("POST", "/v1/memories/erase", json=body)
+        return EraseResult.from_dict(data)
 
     def feedback(
         self,
@@ -978,6 +1098,60 @@ class AsyncMemoriesResource:
             "DELETE", _memory_path(id), params=params, idempotent=False
         )
 
+    async def disable(
+        self,
+        id: str,
+        *,
+        subject_id: str | None = None,
+        reason: str | None = None,
+        branch: str | None = None,
+    ) -> DisabledMemory:
+        body = _strip_none({"subject_id": subject_id, "reason": reason, "branch": branch})
+        data = await self._client._arequest(
+            "POST", _memory_path(id, "/disable"), json=body, idempotent=False
+        )
+        return DisabledMemory.from_dict(data)
+
+    async def restore(
+        self,
+        id: str,
+        *,
+        subject_id: str | None = None,
+        branch: str | None = None,
+    ) -> Memory:
+        body = _strip_none({"subject_id": subject_id, "branch": branch})
+        data = await self._client._arequest(
+            "POST", _memory_path(id, "/restore"), json=body, idempotent=False
+        )
+        return Memory.from_dict(data)
+
+    async def erase_one(
+        self,
+        id: str,
+        *,
+        subject_id: str | None = None,
+        branch: str | None = None,
+    ) -> None:
+        """Erase row content (retaining an idempotency receipt), not all historical copies."""
+        body = _strip_none({"subject_id": subject_id, "branch": branch})
+        await self._client._arequest(
+            "POST", _memory_path(id, "/erase"), json=body, idempotent=False
+        )
+
+    async def list_disabled(
+        self,
+        *,
+        subject_id: str | None = None,
+        limit: int | None = None,
+        branch: str | None = None,
+        cursor: str | None = None,
+    ) -> DisabledMemoryPage:
+        params = _strip_none(
+            {"subject_id": subject_id, "limit": limit, "branch": branch, "cursor": cursor}
+        )
+        data = await self._client._arequest("GET", "/v1/memories/disabled", params=params)
+        return DisabledMemoryPage.from_dict(data)
+
     async def purge(
         self,
         *,
@@ -1017,6 +1191,18 @@ class AsyncMemoriesResource:
         )
         data = await self._client._arequest("POST", "/v1/memories/purge", json=body)
         return PurgeResult.from_dict(data)
+
+    async def erase(
+        self,
+        *,
+        mode: str,
+        subject_id: str | None = None,
+        connector_id: str | None = None,
+        workflow_id: str | None = None,
+    ) -> EraseResult:
+        body = _erase_body(mode, subject_id, connector_id, workflow_id)
+        data = await self._client._arequest("POST", "/v1/memories/erase", json=body)
+        return EraseResult.from_dict(data)
 
     async def feedback(
         self,

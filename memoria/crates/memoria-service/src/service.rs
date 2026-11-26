@@ -2,11 +2,14 @@ use crate::content_filter::check_content_sensitivity;
 use chrono::{DateTime, Utc};
 use memoria_core::{
     interfaces::{EmbeddingProvider, MemoryStore},
-    MemoriaError, Memory, MemoryType, TrustTier,
+    MemoriaError, Memory, MemoryFilter, MemoryType, TrustTier,
 };
 use memoria_embedding::llm::ChatMessage;
 use memoria_embedding::LlmClient;
-use memoria_storage::{DbRouter, OwnedEditLogEntry, SqlMemoryStore};
+use memoria_storage::{
+    DbRouter, EraseStepGate, MemoryEraseReport, MemoryEraseSelector, OwnedEditLogEntry,
+    SqlMemoryStore,
+};
 use moka::sync::Cache;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -112,7 +115,7 @@ fn validate_observed_at(observed_at: Option<DateTime<Utc>>) -> Result<(), Memori
 }
 
 /// Extra retrieval controls that must be threaded through the full retrieval pipeline.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RetrieveOptions {
     session_id: Option<String>,
     session_scope: SessionScope,
@@ -120,6 +123,7 @@ pub struct RetrieveOptions {
     subject_id: Option<String>,
     /// Restrict results to these memory types. Empty/None means no type filter.
     memory_types: Option<Vec<MemoryType>>,
+    filter: MemoryFilter,
 }
 
 impl RetrieveOptions {
@@ -132,6 +136,7 @@ impl RetrieveOptions {
             session_scope: session_scope.unwrap_or(SessionScope::Prefer),
             subject_id: None,
             memory_types: None,
+            filter: MemoryFilter::default(),
         }
     }
 
@@ -143,6 +148,15 @@ impl RetrieveOptions {
     pub fn with_memory_types(mut self, memory_types: Option<Vec<MemoryType>>) -> Self {
         self.memory_types = memory_types.filter(|v| !v.is_empty());
         self
+    }
+
+    pub fn with_filter(mut self, filter: MemoryFilter) -> Self {
+        self.filter = filter;
+        self
+    }
+
+    pub fn filter(&self) -> &MemoryFilter {
+        &self.filter
     }
 
     pub fn session_id(&self) -> Option<&str> {
@@ -186,6 +200,7 @@ pub struct ListActiveOptions<'a> {
 /// keyword, graph, or relevance-scoring work.
 #[derive(Debug, Clone)]
 pub struct StructuredQueryOptions {
+    pub filter: MemoryFilter,
     pub limit: i64,
     pub memory_types: Option<Vec<MemoryType>>,
     pub session_id: Option<String>,
@@ -200,6 +215,7 @@ pub struct StructuredQueryOptions {
 /// unscoped memories.
 #[derive(Debug, Clone)]
 pub struct FulltextSearchOptions {
+    pub filter: MemoryFilter,
     pub limit: i64,
     pub memory_types: Option<Vec<MemoryType>>,
     pub session_id: Option<String>,
@@ -559,7 +575,10 @@ pub type BatchStoreItem = (
 );
 
 /// Metadata-aware item for batch memory storage.
-/// Tuple fields: `(content, memory_type, session_id, trust_tier, subject_id, extra_metadata)`.
+/// Tuple fields: `(content, memory_type, session_id, trust_tier, subject_id, extra_metadata, initial_confidence)`.
+/// `initial_confidence` is an optional source-support score. `None`, or a value
+/// that is not a finite number in `0..=1`, keeps the tier default. One illegal
+/// score does not reject the rest of the batch.
 pub type MetadataBatchStoreItem = (
     String,
     MemoryType,
@@ -567,7 +586,15 @@ pub type MetadataBatchStoreItem = (
     Option<TrustTier>,
     Option<String>,
     Option<std::collections::HashMap<String, serde_json::Value>>,
+    Option<f64>,
 );
+
+fn resolved_batch_confidence(requested: Option<f64>, tier: &TrustTier) -> f64 {
+    match requested {
+        Some(value) if value.is_finite() && (0.0..=1.0).contains(&value) => value,
+        _ => tier.initial_confidence(),
+    }
+}
 
 pub struct MemoryService {
     /// Trait-based store for generic ops (used by tests with MockStore)
@@ -640,6 +667,9 @@ impl MemoryService {
         embedder: Option<Arc<dyn EmbeddingProvider>>,
         llm: Option<Arc<LlmClient>>,
     ) -> Self {
+        if let Some(router) = &db_router {
+            store.set_erase_barrier(router.erase_barrier());
+        }
         // Create edit-log buffer early so background stores inherit the sender
         let edit_log = EditLogBuffer::new(store.clone());
         store.set_edit_log_tx(edit_log.entry_sender());
@@ -937,6 +967,13 @@ impl MemoryService {
         reason: &str,
         snapshot_before: Option<&str>,
     ) {
+        let _permit = match &self.sql_store {
+            Some(sql) => match sql.erase_barrier().try_enter(user_id) {
+                Some(permit) => Some(permit),
+                None => return,
+            },
+            None => None,
+        };
         if let Some(buf) = self.edit_log.lock().unwrap().as_ref() {
             buf.send(
                 user_id,
@@ -1095,6 +1132,13 @@ impl MemoryService {
             );
             return;
         }
+        let Some(_permit) = store.erase_barrier().try_enter(&user_id) else {
+            tracing::info!(
+                user_id,
+                "skipping entity batch because memory erase is running"
+            );
+            return;
+        };
         let user_store = if let Some(router) = store.db_router() {
             match router.routed_store_for_user(&user_id) {
                 Ok(user_store) => Some(user_store),
@@ -1373,9 +1417,64 @@ impl MemoryService {
         initial_confidence: Option<f64>,
         author_id: Option<String>,
         subject_id: Option<String>,
-        mut extra_metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
+        extra_metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
         idempotency_key: Option<&str>,
     ) -> Result<Memory, MemoriaError> {
+        self.store_memory_with_write_fence(
+            user_id,
+            branch,
+            content,
+            memory_type,
+            session_id,
+            trust_tier,
+            observed_at,
+            initial_confidence,
+            author_id,
+            subject_id,
+            extra_metadata,
+            idempotency_key,
+            None,
+        )
+        .await
+    }
+
+    pub async fn capture_memory_write_fence(
+        &self,
+        user_id: &str,
+        subject: &str,
+        connector: &str,
+        workflow: &str,
+    ) -> Result<memoria_storage::MemoryWriteFence, MemoriaError> {
+        self.user_sql_store(user_id)
+            .await?
+            .capture_write_fence(user_id, subject, connector, workflow)
+            .await
+    }
+
+    #[tracing::instrument(skip_all)]
+    // Keep the established store entry-point contract while adding its fence.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_memory_with_write_fence(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        content: &str,
+        memory_type: MemoryType,
+        session_id: Option<String>,
+        trust_tier: Option<TrustTier>,
+        observed_at: Option<DateTime<Utc>>,
+        initial_confidence: Option<f64>,
+        author_id: Option<String>,
+        subject_id: Option<String>,
+        mut extra_metadata: Option<HashMap<String, serde_json::Value>>,
+        idempotency_key: Option<&str>,
+        fence: Option<&memoria_storage::MemoryWriteFence>,
+    ) -> Result<Memory, MemoriaError> {
+        if fence.is_some() && (idempotency_key.is_none() || branch.is_none()) {
+            return Err(MemoriaError::Validation(
+                "fenced writes require an explicit branch and idempotency key".into(),
+            ));
+        }
         validate_session_id_length(session_id.as_deref())?;
         if let Some(confidence) = initial_confidence {
             if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
@@ -1394,9 +1493,7 @@ impl MemoryService {
             }
         }
         if content.trim().is_empty() {
-            return Err(MemoriaError::Validation(
-                "content must not be empty".into(),
-            ));
+            return Err(MemoriaError::Validation("content must not be empty".into()));
         }
         if content.len() > MAX_MEMORY_CONTENT_BYTES {
             return Err(MemoriaError::Validation(
@@ -1439,8 +1536,10 @@ impl MemoryService {
             let table = sql
                 .table_for_branch(user_id, Some(&resolved_branch))
                 .await?;
-            if let Some(existing) = sql.get_from(&table, &id).await? {
-                return validate_idempotent_receipt(existing, user_id, &hash);
+            if fence.is_none() {
+                if let Some(existing) = sql.get_retry_receipt_from(&table, &id, user_id).await? {
+                    return validate_idempotent_receipt(existing, user_id, &hash);
+                }
             }
             extra_metadata
                 .get_or_insert_with(HashMap::new)
@@ -1494,7 +1593,15 @@ impl MemoryService {
         if let Some((id, hash, sql, table)) = idempotency {
             // INSERT's primary key arbitrates concurrent instances and lost
             // acknowledgments. Never resurrect an inactive/deleted receipt.
-            match sql.insert_into(&table, &memory).await {
+            let insertion = if let Some(fence) = fence {
+                match sql.insert_with_write_fence(&table, &memory, fence).await? {
+                    Some(existing) => return validate_idempotent_receipt(existing, user_id, &hash),
+                    None => Ok(()),
+                }
+            } else {
+                sql.insert_into(&table, &memory).await
+            };
+            match insertion {
                 Ok(()) => {
                     let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
                     self.send_edit_log(
@@ -1515,7 +1622,8 @@ impl MemoryService {
                     return Ok(memory);
                 }
                 Err(error) => {
-                    if let Some(existing) = sql.get_from(&table, &id).await? {
+                    if let Some(existing) = sql.get_retry_receipt_from(&table, &id, user_id).await?
+                    {
                         return validate_idempotent_receipt(existing, user_id, &hash);
                     }
                     return Err(error);
@@ -1740,6 +1848,9 @@ impl MemoryService {
         }
 
         let branch = format!("mem_sandbox_{}", &Uuid::new_v4().simple().to_string()[..16]);
+        let Some(_permit) = sql.erase_barrier().try_enter(user_id) else {
+            return true;
+        };
 
         // Create branch (zero-copy of mem_memories)
         if git.create_branch(&branch, "mem_memories").await.is_err() {
@@ -1904,7 +2015,7 @@ impl MemoryService {
         }
     }
 
-    #[tracing::instrument(skip(self), fields(user_id, top_k))]
+    #[tracing::instrument(skip(self, query, options), fields(user_id, top_k))]
     async fn retrieve_inner(
         &self,
         user_id: &str,
@@ -1914,6 +2025,12 @@ impl MemoryService {
         level: ExplainLevel,
         options: &RetrieveOptions,
     ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
+        options.filter.validate()?;
+        if self.sql_store.is_none() && !options.filter.is_empty() {
+            return Err(MemoriaError::Validation(
+                "structured retrieval filters require SQL storage".into(),
+            ));
+        }
         let total_start = std::time::Instant::now();
         let mut explain = RetrievalExplain {
             level,
@@ -1944,6 +2061,7 @@ impl MemoryService {
             if strict_session_id.is_none()
                 && subject_id.is_none()
                 && memory_types.is_none()
+                && options.filter.is_empty()
                 && table == main_table
             {
                 if let Some(ref embedding) = emb {
@@ -2042,6 +2160,7 @@ impl MemoryService {
                                     None,
                                     subject_id,
                                     memory_types,
+                                    &options.filter,
                                 )
                                 .await?;
                             explain.vector_ms = vs_start.elapsed().as_secs_f64() * 1000.0;
@@ -2119,6 +2238,7 @@ impl MemoryService {
                         strict_session_id,
                         subject_id,
                         memory_types,
+                        &options.filter,
                     )
                     .await?;
                 explain.vector_ms = vs_start.elapsed().as_secs_f64() * 1000.0;
@@ -2158,6 +2278,7 @@ impl MemoryService {
                     strict_session_id,
                     subject_id,
                     memory_types,
+                    &options.filter,
                 )
                 .await?;
             explain.fulltext_ms = ft_start.elapsed().as_secs_f64() * 1000.0;
@@ -2277,8 +2398,6 @@ impl MemoryService {
         .await
     }
 
-    // TODO(concurrency): concurrent correct on same memory_id can create duplicate
-    // new memories. Consider SELECT FOR UPDATE or optimistic locking.
     pub async fn correct(
         &self,
         user_id: &str,
@@ -2289,6 +2408,49 @@ impl MemoryService {
             .await
     }
 
+    // The revision preconditions are distinct from the patch and scope fields.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn patch_memory_metadata(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        memory_id: &str,
+        subject_id: &str,
+        session_id: &str,
+        expected_updated_at: DateTime<Utc>,
+        expected_revision: &str,
+        patch: &HashMap<String, serde_json::Value>,
+    ) -> Result<Memory, MemoriaError> {
+        reject_reserved_metadata(Some(patch))?;
+        if subject_id.trim().is_empty()
+            || subject_id.len() > 128
+            || session_id.is_empty()
+            || session_id.len() > 64
+            || patch.is_empty()
+        {
+            return Err(MemoriaError::Validation("invalid metadata update".into()));
+        }
+        let sql = self.user_sql_store(user_id).await?;
+        let table = sql.table_for_branch(user_id, branch).await?;
+        let old = sql
+            .get_from(&table, memory_id)
+            .await?
+            .filter(|memory| {
+                memory.user_id == user_id
+                    && memory.subject_id.as_deref() == Some(subject_id)
+                    && memory.session_id.as_deref() == Some(session_id)
+            })
+            .ok_or_else(|| MemoriaError::NotFound("memory".into()))?;
+        if old.updated_at != Some(expected_updated_at)
+            || memoria_storage::memory_revision(&old) != expected_revision
+        {
+            return Err(MemoriaError::Conflict(
+                "memory changed before metadata update".into(),
+            ));
+        }
+        sql.patch_metadata_atomically(&table, &old, patch).await
+    }
+
     pub async fn correct_on_branch(
         &self,
         user_id: &str,
@@ -2296,6 +2458,128 @@ impl MemoryService {
         memory_id: &str,
         new_content: &str,
     ) -> Result<Memory, MemoriaError> {
+        self.correct_with_metadata_on_branch(
+            user_id,
+            branch,
+            memory_id,
+            new_content,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// The new content and its source attribution must be one atomic revision.
+    // Match the existing correction API, including attribution and confidence.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn correct_with_metadata_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        memory_id: &str,
+        new_content: &str,
+        extra_metadata: Option<&HashMap<String, serde_json::Value>>,
+        session_id: Option<&str>,
+        expected_revision: Option<(&str, DateTime<Utc>, &str)>,
+        initial_confidence: Option<f64>,
+    ) -> Result<Memory, MemoriaError> {
+        reject_reserved_metadata(extra_metadata)?;
+        if expected_revision.is_some() && self.sql_store.is_none() {
+            return Err(MemoriaError::Validation(
+                "revision-conditional corrections require SQL storage".into(),
+            ));
+        }
+        if initial_confidence
+            .is_some_and(|score| !score.is_finite() || !(0.0..=1.0).contains(&score))
+        {
+            return Err(MemoriaError::Validation(
+                "invalid initial_confidence".into(),
+            ));
+        }
+        if session_id.is_some_and(|id| id.is_empty() || id.len() > 64) {
+            return Err(MemoriaError::Validation(
+                "invalid correction session_id".into(),
+            ));
+        }
+        self.correct_inner(
+            user_id,
+            branch,
+            memory_id,
+            new_content,
+            None,
+            None,
+            false,
+            extra_metadata,
+            session_id,
+            expected_revision,
+            initial_confidence,
+        )
+        .await
+    }
+
+    /// A correction receipt is bound to authenticated owner, explicit branch,
+    /// original memory, subject and request payload. Replays cannot insert twice.
+    #[tracing::instrument(skip_all)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn correct_with_key_on_branch(
+        &self,
+        user_id: &str,
+        branch: &str,
+        memory_id: &str,
+        subject_id: &str,
+        new_content: &str,
+        key: &str,
+        omit_structured_content: bool,
+    ) -> Result<Memory, MemoriaError> {
+        if branch.trim().is_empty()
+            || branch.trim() != branch
+            || subject_id.trim().is_empty()
+            || subject_id.trim() != subject_id
+            || self.sql_store.is_none()
+        {
+            return Err(MemoriaError::Validation(
+                "an explicit branch, subject and SQL storage are required".into(),
+            ));
+        }
+        // Reject malformed retry identities before resolving/provisioning storage.
+        idempotent_memory_id(user_id, Some(branch), key)?;
+        self.correct_inner(
+            user_id,
+            Some(branch),
+            memory_id,
+            new_content,
+            Some(subject_id),
+            Some(key),
+            omit_structured_content,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn correct_inner(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        memory_id: &str,
+        new_content: &str,
+        subject_id: Option<&str>,
+        key: Option<&str>,
+        omit_structured_content: bool,
+        extra_metadata: Option<&HashMap<String, serde_json::Value>>,
+        session_id: Option<&str>,
+        expected_revision: Option<(&str, DateTime<Utc>, &str)>,
+        initial_confidence: Option<f64>,
+    ) -> Result<Memory, MemoriaError> {
+        let requested_content = new_content;
+        if new_content.trim().is_empty() {
+            return Err(MemoriaError::Validation("content must not be empty".into()));
+        }
         if new_content.len() > MAX_MEMORY_CONTENT_BYTES {
             return Err(MemoriaError::Validation(
                 "content exceeds 32 KiB limit".into(),
@@ -2318,24 +2602,86 @@ impl MemoryService {
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
             let table = sql.table_for_branch(user_id, branch).await?;
-            let old = sql
-                .get_from(&table, memory_id)
-                .await?
-                .filter(|memory| memory.user_id == user_id)
-                .ok_or_else(|| MemoriaError::NotFound(memory_id.to_string()))?;
+            let receipt = key
+                .map(|key| {
+                    correction_receipt(
+                        user_id,
+                        branch.expect("receipt requires explicit branch"),
+                        memory_id,
+                        subject_id.expect("receipt requires subject"),
+                        requested_content,
+                        key,
+                        omit_structured_content,
+                    )
+                })
+                .transpose()?;
+            if let Some((id, hash)) = &receipt {
+                if let Some(existing) = sql.get_retry_receipt_from(&table, id, user_id).await? {
+                    if existing.subject_id.as_deref() != subject_id {
+                        return Err(MemoriaError::NotFound("memory".into()));
+                    }
+                    return validate_idempotent_receipt(existing, user_id, hash);
+                }
+            }
+            let old = sql.get_from(&table, memory_id).await?.filter(|memory| {
+                memory.user_id == user_id
+                    && subject_id
+                        .is_none_or(|subject| memory.subject_id.as_deref() == Some(subject))
+            });
+            let Some(old) = old else {
+                // A concurrent request can commit between the receipt and old
+                // lookups. Confirm the same durable result, never invent a retry.
+                if let Some((id, hash)) = &receipt {
+                    if let Some(existing) = sql.get_retry_receipt_from(&table, id, user_id).await? {
+                        if existing.subject_id.as_deref() != subject_id {
+                            return Err(MemoriaError::NotFound("memory".into()));
+                        }
+                        return validate_idempotent_receipt(existing, user_id, hash);
+                    }
+                }
+                return Err(MemoriaError::NotFound("memory".into()));
+            };
+            if let Some((subject, updated_at, revision)) = expected_revision {
+                if old.subject_id.as_deref() != Some(subject) {
+                    return Err(MemoriaError::NotFound("memory".into()));
+                }
+                if old.updated_at != Some(updated_at)
+                    || memoria_storage::memory_revision(&old) != revision
+                {
+                    return Err(MemoriaError::Conflict(
+                        "memory changed before correction".into(),
+                    ));
+                }
+            }
 
-            let new_id = Uuid::now_v7().simple().to_string();
+            let new_id = receipt
+                .as_ref()
+                .map(|(id, _)| id.clone())
+                .unwrap_or_else(|| Uuid::now_v7().simple().to_string());
+            let mut metadata = patched_correction_metadata(&old, extra_metadata);
+            if let Some((_, hash)) = &receipt {
+                metadata
+                    .get_or_insert_with(HashMap::new)
+                    .insert(STORE_REQUEST_HASH_FIELD.into(), serde_json::json!(hash));
+            }
+            let metadata = without_structured_content(metadata, omit_structured_content);
             let new_mem = Memory {
                 memory_id: new_id,
                 user_id: old.user_id.clone(),
                 content: new_content.to_string(),
                 memory_type: old.memory_type.clone(),
                 trust_tier: TrustTier::T2Curated,
-                initial_confidence: old.initial_confidence,
+                initial_confidence: if extra_metadata.is_some() {
+                    initial_confidence.unwrap_or_else(|| TrustTier::T2Curated.initial_confidence())
+                } else {
+                    old.initial_confidence
+                },
                 embedding: self.embed(new_content).await?,
-                session_id: old.session_id.clone(),
+                session_id: session_id
+                    .map(str::to_string)
+                    .or_else(|| old.session_id.clone()),
                 source_event_ids: vec![format!("correct:{}", memory_id)],
-                extra_metadata: correction_metadata(&old),
+                extra_metadata: metadata,
                 observed_at: Some(Utc::now()),
                 created_at: Some(Utc::now()),
                 updated_at: None,
@@ -2347,13 +2693,19 @@ impl MemoryService {
                 subject_id: old.subject_id.clone(),
             };
 
-            sql.insert_into(&table, &new_mem).await?;
-            // Supersede + cleanup are independent — run in parallel
-            let (sup_res, _) = tokio::join!(
-                sql.supersede_memory(&table, memory_id, &new_mem.memory_id),
-                Self::cleanup_entity_data_for_memory(sql.as_ref(), memory_id, "correct"),
-            );
-            sup_res?;
+            if let Err(error) = sql.replace_memory_atomically(&table, &old, &new_mem).await {
+                // This also confirms an uncertain COMMIT acknowledgement when
+                // the exact durable receipt is already visible.
+                if let Some((id, hash)) = &receipt {
+                    if let Some(existing) = sql.get_retry_receipt_from(&table, id, user_id).await? {
+                        if existing.subject_id.as_deref() != subject_id {
+                            return Err(MemoriaError::NotFound("memory".into()));
+                        }
+                        return validate_idempotent_receipt(existing, user_id, hash);
+                    }
+                }
+                return Err(error);
+            }
 
             self.report(StatsEvent::MemoryStored {
                 user_id: user_id.to_string(),
@@ -2378,8 +2730,10 @@ impl MemoryService {
                 None,
             );
 
-            self.enqueue_entity_extraction(user_id, &new_mem.memory_id, new_content)
-                .await;
+            if table == sql.t("mem_memories") {
+                self.enqueue_entity_extraction(user_id, &new_mem.memory_id, new_content)
+                    .await;
+            }
 
             Ok(new_mem)
         } else {
@@ -2398,11 +2752,20 @@ impl MemoryService {
                 content: new_content.to_string(),
                 memory_type: old.memory_type.clone(),
                 trust_tier: TrustTier::T2Curated,
-                initial_confidence: old.initial_confidence,
+                initial_confidence: if extra_metadata.is_some() {
+                    initial_confidence.unwrap_or_else(|| TrustTier::T2Curated.initial_confidence())
+                } else {
+                    old.initial_confidence
+                },
                 embedding: self.embed(new_content).await?,
-                session_id: old.session_id.clone(),
+                session_id: session_id
+                    .map(str::to_string)
+                    .or_else(|| old.session_id.clone()),
                 source_event_ids: vec![format!("correct:{}", memory_id)],
-                extra_metadata: correction_metadata(&old),
+                extra_metadata: without_structured_content(
+                    patched_correction_metadata(&old, extra_metadata),
+                    omit_structured_content,
+                ),
                 observed_at: Some(Utc::now()),
                 created_at: Some(Utc::now()),
                 updated_at: None,
@@ -2421,6 +2784,67 @@ impl MemoryService {
             old_updated.superseded_by = Some(new_mem.memory_id.clone());
             self.store.update(&old_updated).await?;
             Ok(new_mem)
+        }
+    }
+
+    /// Physically erase memory data in the authenticated scope. This operation
+    /// holds the lock until the statement already sent to the database returns.
+    /// A lost lock stops later steps and is never reported as success.
+    pub async fn erase_memories(
+        &self,
+        scope_id: &str,
+        selector: &MemoryEraseSelector,
+    ) -> Result<MemoryEraseReport, MemoriaError> {
+        let shared = self.shared_sql_store()?;
+        let key = format!("memory-erase:{scope_id}");
+        if shared.database_url().is_some() {
+            let connection =
+                memoria_storage::EraseLockConnection::connect((*shared).clone()).await?;
+            let session =
+                crate::erase_guard::EraseSession::start(std::sync::Arc::new(connection), key)
+                    .await?;
+            return self.finish_erase(session, scope_id, selector).await;
+        }
+        let session = crate::erase_guard::EraseSession::start(shared, key).await?;
+        self.finish_erase(session, scope_id, selector).await
+    }
+
+    async fn finish_erase<L: crate::erase_guard::EraseLock + 'static>(
+        &self,
+        session: crate::erase_guard::EraseSession<L>,
+        scope_id: &str,
+        selector: &MemoryEraseSelector,
+    ) -> Result<MemoryEraseReport, MemoriaError> {
+        let store = match self.user_sql_store(scope_id).await {
+            Ok(store) => store,
+            Err(error) => {
+                if let Err(release_error) = session.finish().await {
+                    error!(%release_error, scope_id, "failed to release memory erase lock");
+                }
+                return Err(error);
+            }
+        };
+        let barrier = store.erase_barrier();
+        let seal = memoria_storage::erase_barrier::SealGuard::acquire(barrier, scope_id).await;
+        self.flush_edit_log().await;
+        let (cancel, lease, gate) = session.handoff();
+        let scope = scope_id.to_string();
+        let selector = selector.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            // Caller cancellation stops future steps, but must not reopen
+            // writes or snapshots while the current statement is in flight.
+            let _seal = seal;
+            let mut steps = EraseStepGate::new(gate.clone());
+            let result = store.erase_memories(&scope, &selector, &mut steps).await;
+            let result = crate::erase_guard::conclude_erase(result, &gate).await;
+            lease.shutdown_renew();
+            let _ = tx.send(result);
+        });
+        let _cancel = cancel;
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err(crate::erase_guard::lock_lost_error()),
         }
     }
 
@@ -2462,6 +2886,291 @@ impl MemoryService {
                 warning: None,
             })
         }
+    }
+
+    /// An owned memory in any state, fenced to `subject_id` when the caller names one.
+    async fn owned_governance_target(
+        sql: &SqlMemoryStore,
+        table: &str,
+        user_id: &str,
+        subject_id: Option<&str>,
+        memory_id: &str,
+    ) -> Result<Memory, MemoriaError> {
+        sql.get_owned_from(table, memory_id, user_id)
+            .await?
+            .filter(|memory| {
+                !memory
+                    .extra_metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.contains_key(memoria_core::ERASED_FIELD))
+            })
+            .filter(|memory| subject_id.is_none() || memory.subject_id.as_deref() == subject_id)
+            .ok_or_else(|| MemoriaError::NotFound(memory_id.to_string()))
+    }
+
+    /// Operator disable: the memory leaves retrieval but stays restorable, unlike a purge.
+    /// Its marker lets an extraction pipeline recognise the content as rejected.
+    pub async fn disable_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        subject_id: Option<&str>,
+        memory_id: &str,
+        reason: &str,
+    ) -> Result<Memory, MemoriaError> {
+        if self.sql_store.is_none() {
+            return Err(MemoriaError::Internal(
+                "memory governance requires a SQL-backed memory store".to_string(),
+            ));
+        }
+        let sql = self.user_sql_store(user_id).await?;
+        let table = sql.table_for_branch(user_id, branch).await?;
+        let mut memory =
+            Self::owned_governance_target(&sql, &table, user_id, subject_id, memory_id).await?;
+        if !memory.is_active {
+            return Err(MemoriaError::Conflict(format!(
+                "memory {memory_id} is not active"
+            )));
+        }
+        let mut metadata = memory.extra_metadata.take().unwrap_or_default();
+        metadata.insert(
+            DISABLED_FIELD.into(),
+            serde_json::json!({"at": Utc::now().to_rfc3339(), "reason": reason}),
+        );
+        if sql.disable_in(&table, &memory, &metadata).await? == 0 {
+            return Err(MemoriaError::Conflict(format!(
+                "memory {memory_id} state or revision changed; refetch before retrying"
+            )));
+        }
+        self.send_edit_log(user_id, "disable", Some(memory_id), None, reason, None);
+        if table == sql.t("mem_memories") {
+            self.report(StatsEvent::MemoryDeactivated {
+                user_id: user_id.to_string(),
+            });
+        }
+        Self::owned_governance_target(&sql, &table, user_id, subject_id, memory_id).await
+    }
+
+    /// Reactivate an operator-disabled memory.
+    pub async fn restore_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        subject_id: Option<&str>,
+        memory_id: &str,
+    ) -> Result<Memory, MemoriaError> {
+        if self.sql_store.is_none() {
+            return Err(MemoriaError::Internal(
+                "memory governance requires a SQL-backed memory store".to_string(),
+            ));
+        }
+        let sql = self.user_sql_store(user_id).await?;
+        let table = sql.table_for_branch(user_id, branch).await?;
+        let mut memory =
+            Self::owned_governance_target(&sql, &table, user_id, subject_id, memory_id).await?;
+        let mut metadata = memory.extra_metadata.take().unwrap_or_default();
+        if memory.is_active || metadata.remove(DISABLED_FIELD).is_none() {
+            return Err(MemoriaError::Conflict(format!(
+                "memory {memory_id} is not disabled"
+            )));
+        }
+        if sql.restore_in(&table, &memory, &metadata).await? == 0 {
+            return Err(MemoriaError::Conflict(format!(
+                "memory {memory_id} state or revision changed; refetch before retrying"
+            )));
+        }
+        self.send_edit_log(user_id, "restore", Some(memory_id), None, "", None);
+        if table == sql.t("mem_memories") {
+            sql.graph_store().reactivate_by_memory_id(memory_id).await?;
+            self.report(StatsEvent::MemoryActivated {
+                user_id: user_id.to_string(),
+            });
+            self.enqueue_entity_extraction(user_id, memory_id, &memory.content)
+                .await;
+        }
+        Self::owned_governance_target(&sql, &table, user_id, subject_id, memory_id).await
+    }
+
+    /// Permanently remove one active or disabled memory. Superseded revisions belong to the
+    /// history of their successor and are not erased one by one.
+    pub async fn erase_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        subject_id: Option<&str>,
+        memory_id: &str,
+    ) -> Result<(), MemoriaError> {
+        self.erase_governance_target(user_id, branch, subject_id, memory_id, false)
+            .await
+    }
+
+    /// Retire only the exact active derived revision inspected by the caller.
+    pub async fn retire_extracted_memory(
+        &self,
+        user_id: &str,
+        subject_id: &str,
+        session_id: &str,
+        memory_id: &str,
+        expected_updated_at: DateTime<Utc>,
+    ) -> Result<bool, MemoriaError> {
+        if subject_id.trim().is_empty() || session_id.trim().is_empty() {
+            return Err(MemoriaError::Validation("cleanup scope is required".into()));
+        }
+        if self.sql_store.is_none() {
+            return Err(MemoriaError::Internal(
+                "cleanup requires SQL storage".into(),
+            ));
+        }
+        let sql = self.user_sql_store(user_id).await?;
+        let table = sql.table_for_branch(user_id, Some("main")).await?;
+        let Some(memory) = sql.get_owned_from(&table, memory_id, user_id).await? else {
+            return Ok(false);
+        };
+        if memory.subject_id.as_deref() != Some(subject_id)
+            || memory.session_id.as_deref() != Some(session_id)
+        {
+            return Err(MemoriaError::NotFound(memory_id.into()));
+        }
+        let derived = memory.extra_metadata.as_ref().is_some_and(|metadata| {
+            ["source_job_id", "connector_id"].iter().all(|key| {
+                metadata
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+            })
+        });
+        if !derived
+            || !memory.is_active
+            || memory.updated_at != Some(expected_updated_at)
+            || memory
+                .superseded_by
+                .as_deref()
+                .is_some_and(|id| !id.is_empty())
+        {
+            return Ok(false);
+        }
+        // erase_from compares the exact persisted revision again in its DML.
+        // Concurrent disable/restore/correction therefore cannot be overwritten.
+        if sql.erase_from(&table, &memory).await? == 0 {
+            return Ok(false);
+        }
+        self.send_edit_log(
+            user_id,
+            "erase",
+            Some(memory_id),
+            None,
+            "extraction cleanup",
+            None,
+        );
+        self.report(StatsEvent::MemoryDeactivated {
+            user_id: user_id.into(),
+        });
+        Self::cleanup_entity_data_for_memory(sql.as_ref(), memory_id, "erase").await;
+        Ok(true)
+    }
+
+    /// Explicit cleanup of a confidence-expired main memory, never an active record.
+    pub async fn erase_confidence_inactive(
+        &self,
+        user_id: &str,
+        subject_id: &str,
+        memory_id: &str,
+    ) -> Result<(), MemoriaError> {
+        self.erase_governance_target(user_id, Some("main"), Some(subject_id), memory_id, true)
+            .await
+    }
+
+    async fn erase_governance_target(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        subject_id: Option<&str>,
+        memory_id: &str,
+        confidence_inactive_only: bool,
+    ) -> Result<(), MemoriaError> {
+        if self.sql_store.is_none() {
+            return Err(MemoriaError::Internal(
+                "memory governance requires a SQL-backed memory store".to_string(),
+            ));
+        }
+        let sql = self.user_sql_store(user_id).await?;
+        let table = sql.table_for_branch(user_id, branch).await?;
+        let memory =
+            Self::owned_governance_target(&sql, &table, user_id, subject_id, memory_id).await?;
+        if confidence_inactive_only
+            && (memory.is_active
+                || !memory.extra_metadata.as_ref().is_some_and(|metadata| {
+                    metadata.contains_key(memoria_core::CONFIDENCE_INACTIVE_FIELD)
+                }))
+        {
+            return Err(MemoriaError::Conflict(
+                "memory is not confidence-inactive".into(),
+            ));
+        }
+        if memory
+            .superseded_by
+            .as_deref()
+            .is_some_and(|next| !next.is_empty())
+        {
+            return Err(MemoriaError::Conflict(format!(
+                "memory {memory_id} is a superseded revision"
+            )));
+        }
+        if sql.erase_from(&table, &memory).await? != 1 {
+            return Err(MemoriaError::Conflict("memory changed during erase".into()));
+        }
+        self.send_edit_log(user_id, "erase", Some(memory_id), None, "", None);
+        if memory.is_active && table == sql.t("mem_memories") {
+            self.report(StatsEvent::MemoryDeactivated {
+                user_id: user_id.to_string(),
+            });
+        }
+        if table == sql.t("mem_memories") {
+            Self::cleanup_entity_data_for_memory(sql.as_ref(), memory_id, "erase").await;
+        }
+        Ok(())
+    }
+
+    /// Operator-disabled memories, most recently disabled first.
+    pub async fn list_disabled_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        subject_id: Option<&str>,
+        limit: i64,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<Memory>, Option<String>), MemoriaError> {
+        if !(1..=500).contains(&limit) {
+            return Err(MemoriaError::Validation(
+                "disabled memory limit must be between 1 and 500".into(),
+            ));
+        }
+        if self.sql_store.is_none() {
+            return Err(MemoriaError::Internal(
+                "memory governance requires a SQL-backed memory store".to_string(),
+            ));
+        }
+        let sql = self.user_sql_store(user_id).await?;
+        let table = sql.table_for_branch(user_id, branch).await?;
+        let mut memories = sql
+            .list_disabled_from(&table, user_id, subject_id, limit + 1, cursor)
+            .await?;
+        let has_more = memories.len() > limit as usize;
+        memories.truncate(limit as usize);
+        let next_cursor = if has_more {
+            let last = memories
+                .last()
+                .ok_or_else(|| MemoriaError::Internal("missing disabled page boundary".into()))?;
+            Some(serde_json::to_string(&(
+                last.updated_at.ok_or_else(|| {
+                    MemoriaError::Internal("missing disabled memory timestamp".into())
+                })?,
+                &last.memory_id,
+            ))?)
+        } else {
+            None
+        };
+        Ok((memories, next_cursor))
     }
 
     /// Purge multiple memories by IDs with a single audit log entry.
@@ -2818,10 +3527,10 @@ impl MemoryService {
         // Normalize all string filters once at the boundary so that both the SQL
         // path and the fallback path treat "  alice  " and "" identically.
         let memory_type = options.memory_type.map(str::trim).filter(|s| !s.is_empty());
-        let session_id  = options.session_id.map(str::trim).filter(|s| !s.is_empty());
-        let trust_tier  = options.trust_tier.map(str::trim).filter(|s| !s.is_empty());
-        let subject_id  = options.subject_id.map(str::trim).filter(|s| !s.is_empty());
-        let cursor      = options.cursor.map(str::trim).filter(|s| !s.is_empty());
+        let session_id = options.session_id.map(str::trim).filter(|s| !s.is_empty());
+        let trust_tier = options.trust_tier.map(str::trim).filter(|s| !s.is_empty());
+        let subject_id = options.subject_id.map(str::trim).filter(|s| !s.is_empty());
+        let cursor = options.cursor.map(str::trim).filter(|s| !s.is_empty());
 
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
@@ -2885,6 +3594,7 @@ impl MemoryService {
                     options.cursor.as_deref(),
                     options.subject_id.as_deref(),
                     &options.extra_metadata_filter,
+                    &options.filter,
                 )
                 .await;
         }
@@ -2924,6 +3634,47 @@ impl MemoryService {
             trust_tier.as_deref(),
             options.subject_id.as_deref(),
             &options.extra_metadata_filter,
+            &options.filter,
+        )
+        .await
+    }
+
+    /// Search an externally produced query vector without embedding, fusion,
+    /// graph expansion, confidence weighting, or feedback mutations.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_query_vector_on_branch(
+        &self,
+        user_id: &str,
+        branch: Option<&str>,
+        query_vector: &[f32],
+        top_k: i64,
+        subject_id: Option<&str>,
+        memory_types: Option<&[MemoryType]>,
+        filter: &MemoryFilter,
+    ) -> Result<Vec<Memory>, MemoriaError> {
+        if !(1..=100).contains(&top_k) {
+            return Err(MemoriaError::Validation(
+                "top_k must be between 1 and 100".into(),
+            ));
+        }
+        filter.validate()?;
+        if self.sql_store.is_none() {
+            return Err(MemoriaError::Validation(
+                "query vector search requires SQL storage".into(),
+            ));
+        }
+        let sql = self.user_sql_store(user_id).await?;
+        let table = sql.table_for_branch(user_id, branch).await?;
+        sql.search_vector_from_filtered_scoped(
+            &table,
+            user_id,
+            query_vector,
+            top_k,
+            None,
+            None,
+            subject_id,
+            memory_types,
+            filter,
         )
         .await
     }
@@ -3048,7 +3799,7 @@ impl MemoryService {
             items
                 .into_iter()
                 .map(|(content, mt, session_id, tier, subject_id)| {
-                    (content, mt, session_id, tier, subject_id, None)
+                    (content, mt, session_id, tier, subject_id, None, None)
                 })
                 .collect(),
             author_id,
@@ -3072,7 +3823,8 @@ impl MemoryService {
         // Sensitivity check + collect contents
         let mut contents = Vec::with_capacity(items.len());
         let mut checked_items = Vec::with_capacity(items.len());
-        for (content, mt, session_id, tier, subject_id, extra_metadata) in items {
+        for (content, mt, session_id, tier, subject_id, extra_metadata, initial_confidence) in items
+        {
             reject_reserved_metadata(extra_metadata.as_ref())?;
             validate_session_id_length(session_id.as_deref())?;
             let subject_id = normalize_opt_string(subject_id);
@@ -3084,9 +3836,7 @@ impl MemoryService {
                 }
             }
             if content.trim().is_empty() {
-                return Err(MemoriaError::Validation(
-                    "content must not be empty".into(),
-                ));
+                return Err(MemoriaError::Validation("content must not be empty".into()));
             }
             if content.len() > MAX_MEMORY_CONTENT_BYTES {
                 return Err(MemoriaError::Validation(
@@ -3109,6 +3859,7 @@ impl MemoryService {
                 tier,
                 subject_id,
                 extra_metadata,
+                initial_confidence,
             ));
         }
 
@@ -3116,7 +3867,7 @@ impl MemoryService {
         let embeddings = self.embed_batch(&contents).await?;
 
         let mut results = Vec::with_capacity(checked_items.len());
-        for (i, (content, mt, session_id, tier, subject_id, extra_metadata)) in
+        for (i, (content, mt, session_id, tier, subject_id, extra_metadata, initial_confidence)) in
             checked_items.into_iter().enumerate()
         {
             let effective_tier = tier.unwrap_or(TrustTier::T1Verified);
@@ -3128,7 +3879,7 @@ impl MemoryService {
                 subject_id,
                 memory_type: mt,
                 content,
-                initial_confidence: effective_tier.initial_confidence(),
+                initial_confidence: resolved_batch_confidence(initial_confidence, &effective_tier),
                 embedding,
                 source_event_ids: vec![],
                 superseded_by: None,
@@ -3746,8 +4497,8 @@ mod tests {
 
     #[test]
     fn retrieve_options_with_subject_id_empty_becomes_none() {
-        let opts = RetrieveOptions::from_session_scope(None, None)
-            .with_subject_id(Some("  ".to_string()));
+        let opts =
+            RetrieveOptions::from_session_scope(None, None).with_subject_id(Some("  ".to_string()));
         assert_eq!(opts.subject_id(), None);
     }
 
@@ -3779,7 +4530,11 @@ mod tests {
         let pool = MySqlPoolOptions::new()
             .connect_lazy("mysql://root:root@localhost:3306/memoria")
             .expect("lazy mysql pool");
-        let store = Arc::new(SqlMemoryStore::new(pool, 1024, "blank-validation".to_string()));
+        let store = Arc::new(SqlMemoryStore::new(
+            pool,
+            1024,
+            "blank-validation".to_string(),
+        ));
         let service = MemoryService::new_sql_with_llm(store, None, None).await;
 
         for content in ["", "  ", "\t\n", "\u{2003}"] {
@@ -3811,6 +4566,7 @@ mod tests {
                     vec![(
                         content.to_string(),
                         MemoryType::Semantic,
+                        None,
                         None,
                         None,
                         None,
@@ -3913,14 +4669,48 @@ impl MemoryService {
     }
 }
 
-use memoria_core::STORE_REQUEST_HASH_FIELD;
+use memoria_core::{is_reserved_metadata_key, DISABLED_FIELD, STORE_REQUEST_HASH_FIELD};
 
 // Business metadata belongs to the memory across content revisions. The store
-// request fingerprint certifies only the original write, not this replacement.
+// request fingerprint certifies only the original write, not this replacement,
+// and a revision is never born disabled.
 fn correction_metadata(memory: &Memory) -> Option<HashMap<String, serde_json::Value>> {
     memory.extra_metadata.as_ref().map(|metadata| {
         let mut metadata = metadata.clone();
-        metadata.remove(STORE_REQUEST_HASH_FIELD);
+        metadata.retain(|key, _| !is_reserved_metadata_key(key));
+        metadata
+    })
+}
+
+fn patched_correction_metadata(
+    memory: &Memory,
+    patch: Option<&HashMap<String, serde_json::Value>>,
+) -> Option<HashMap<String, serde_json::Value>> {
+    let mut metadata = correction_metadata(memory);
+    if let Some(patch) = patch {
+        let values = metadata.get_or_insert_with(HashMap::new);
+        for (key, value) in patch {
+            if value.is_null() {
+                values.remove(key);
+            } else {
+                values.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    metadata
+}
+
+/// Drops only the business JSON copy. Identity, source and type stay on the
+/// same metadata map that the atomic replacement writes.
+fn without_structured_content(
+    metadata: Option<HashMap<String, serde_json::Value>>,
+    omit: bool,
+) -> Option<HashMap<String, serde_json::Value>> {
+    if !omit {
+        return metadata;
+    }
+    metadata.map(|mut metadata| {
+        metadata.remove("structured_content");
         metadata
     })
 }
@@ -3928,10 +4718,8 @@ fn correction_metadata(memory: &Memory) -> Option<HashMap<String, serde_json::Va
 fn reject_reserved_metadata(
     metadata: Option<&HashMap<String, serde_json::Value>>,
 ) -> Result<(), MemoriaError> {
-    if metadata.is_some_and(|metadata| metadata.contains_key(STORE_REQUEST_HASH_FIELD)) {
-        return Err(MemoriaError::Validation(
-            "reserved idempotency metadata field".into(),
-        ));
+    if metadata.is_some_and(|metadata| metadata.keys().any(|key| is_reserved_metadata_key(key))) {
+        return Err(MemoriaError::Validation("reserved metadata field".into()));
     }
     Ok(())
 }
@@ -3963,8 +4751,12 @@ fn validate_idempotent_receipt(
     owner: &str,
     request_hash: &str,
 ) -> Result<Memory, MemoriaError> {
+    if !memory.is_active {
+        return Err(MemoriaError::Conflict(
+            "idempotency_key belongs to an inactive or erased receipt".into(),
+        ));
+    }
     if memory.user_id != owner
-        || !memory.is_active
         || memory
             .extra_metadata
             .as_ref()
@@ -3972,11 +4764,41 @@ fn validate_idempotent_receipt(
             .and_then(serde_json::Value::as_str)
             != Some(request_hash)
     {
-        return Err(MemoriaError::Validation(
+        return Err(MemoriaError::Conflict(
             "idempotency_key was already used for another payload or an inactive receipt".into(),
         ));
     }
     Ok(memory)
+}
+
+fn correction_receipt(
+    owner: &str,
+    branch: &str,
+    original: &str,
+    subject: &str,
+    content: &str,
+    key: &str,
+    omit_structured_content: bool,
+) -> Result<(String, String), MemoriaError> {
+    // Validate the same public key alphabet without sharing the store's identity
+    // namespace. IDs remain canonical 32-character hex, including for cursors.
+    idempotent_memory_id(owner, Some(branch), key)?;
+    use sha2::{Digest, Sha256};
+    let identity = serde_json::json!(["memoria.correct.v1", owner, branch, original, key]);
+    let digest = Sha256::digest(serde_json::to_vec(&identity)?);
+    let mut receipt = [0_u8; 16];
+    receipt.copy_from_slice(&digest[..16]);
+    // A false flag is absent from the hash so receipts written before this
+    // field still replay. A true flag is part of the payload.
+    let payload = if omit_structured_content {
+        serde_json::json!([original, subject, content, "omit_structured_content"])
+    } else {
+        serde_json::json!([original, subject, content])
+    };
+    Ok((
+        format!("{:032x}", u128::from_be_bytes(receipt)),
+        format!("{:x}", Sha256::digest(serde_json::to_vec(&payload)?)),
+    ))
 }
 
 #[cfg(test)]
@@ -4000,6 +4822,60 @@ mod idempotency_tests {
             assert!(idempotent_memory_id("owner-a", None, key).is_err());
         }
         assert!(idempotent_memory_id("owner-a", None, &"x".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn text_correction_hash_stays_stable_until_structured_content_is_omitted() {
+        let plain = super::correction_receipt(
+            "owner", "main", "original", "subject", "content", "key", false,
+        )
+        .unwrap();
+        let replay = super::correction_receipt(
+            "owner", "main", "original", "subject", "content", "key", false,
+        )
+        .unwrap();
+        assert_eq!(plain, replay);
+        let omitted = super::correction_receipt(
+            "owner", "main", "original", "subject", "content", "key", true,
+        )
+        .unwrap();
+        assert_eq!(plain.0, omitted.0);
+        assert_ne!(plain.1, omitted.1);
+        let changed =
+            super::correction_receipt("owner", "main", "original", "subject", "other", "key", true)
+                .unwrap();
+        assert_eq!(omitted.0, changed.0);
+        assert_ne!(omitted.1, changed.1);
+    }
+
+    #[test]
+    fn omission_removes_only_the_structured_copy() {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "structured_content".into(),
+            serde_json::json!({"subject": "A"}),
+        );
+        metadata.insert(
+            "business_memory_type".into(),
+            serde_json::json!("factual_memory"),
+        );
+        metadata.insert("source_session_id".into(), serde_json::json!("session-1"));
+        let kept = super::without_structured_content(Some(metadata.clone()), false).unwrap();
+        assert!(kept.contains_key("structured_content"));
+        let revised = super::without_structured_content(Some(metadata), true).unwrap();
+        assert!(!revised.contains_key("structured_content"));
+        assert_eq!(
+            revised
+                .get("business_memory_type")
+                .and_then(|value| value.as_str()),
+            Some("factual_memory")
+        );
+        assert_eq!(
+            revised
+                .get("source_session_id")
+                .and_then(|value| value.as_str()),
+            Some("session-1")
+        );
     }
 }
 
@@ -4081,5 +4957,28 @@ mod observe_identifier_length_tests {
                 "{field}: {error:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod batch_confidence_tests {
+    use super::resolved_batch_confidence;
+    use memoria_core::TrustTier;
+
+    #[test]
+    fn legal_score_is_kept_and_illegal_score_uses_the_tier_default() {
+        let tier = TrustTier::T1Verified;
+        let default = tier.initial_confidence();
+        assert_eq!(resolved_batch_confidence(Some(0.25), &tier), 0.25);
+        assert_eq!(resolved_batch_confidence(Some(0.0), &tier), 0.0);
+        assert_eq!(resolved_batch_confidence(Some(1.0), &tier), 1.0);
+        assert_eq!(resolved_batch_confidence(None, &tier), default);
+        assert_eq!(resolved_batch_confidence(Some(1.1), &tier), default);
+        assert_eq!(resolved_batch_confidence(Some(-0.01), &tier), default);
+        assert_eq!(resolved_batch_confidence(Some(f64::NAN), &tier), default);
+        assert_eq!(
+            resolved_batch_confidence(Some(f64::INFINITY), &tier),
+            default
+        );
     }
 }

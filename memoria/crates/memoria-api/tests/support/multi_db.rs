@@ -119,9 +119,33 @@ pub async fn spawn_api_server(
     instance_id: Option<String>,
     init_auth_pool: bool,
 ) -> ApiTestServer {
+    spawn_api_server_with_sql(
+        db_name_prefix,
+        embedding_dim,
+        master_key,
+        embedder,
+        llm,
+        instance_id,
+        init_auth_pool,
+        None,
+    )
+    .await
+}
+
+pub async fn spawn_api_server_with_sql(
+    db_name_prefix: &str,
+    embedding_dim: usize,
+    master_key: String,
+    embedder: Option<Arc<dyn EmbeddingProvider>>,
+    llm: Option<Arc<LlmClient>>,
+    instance_id: Option<String>,
+    init_auth_pool: bool,
+    memory_sql: Option<Arc<memoria_storage::readonly_sql::MemorySqlGateway>>,
+) -> ApiTestServer {
     let context =
         MultiDbTestContext::new(&db_url(), db_name_prefix, embedding_dim, embedder, llm).await;
     let mut state = memoria_api::AppState::new(context.service(), context.git(), master_key);
+    state.memory_sql = memory_sql;
     if let Some(instance_id) = instance_id {
         state = state.with_instance_id(instance_id);
     }

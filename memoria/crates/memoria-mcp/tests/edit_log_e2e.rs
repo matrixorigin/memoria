@@ -145,7 +145,7 @@ async fn cleanup(pool: &MySqlPool, user_id: &str, db_name: &str) {
         .await;
     let prefix = safety_snapshot_prefix(db_name);
     let rows: Vec<(String,)> =
-        sqlx::query_as("SELECT sname FROM mo_catalog.mo_snapshots WHERE prefix_eq(sname, ?)")
+        sqlx::query_as("SELECT sname FROM mo_catalog.mo_snapshots WHERE prefix_eq(sname, CAST(? AS VARCHAR))")
             .bind(prefix)
             .fetch_all(pool)
             .await
@@ -492,10 +492,12 @@ async fn test_store_batch_all_fields() {
             None,
             None,
             None,
+            None,
         ),
         (
             "batch beta".to_string(),
             memoria_core::MemoryType::Procedural,
+            None,
             None,
             None,
             None,
@@ -1074,10 +1076,12 @@ async fn test_edit_id_globally_unique() {
                 None,
                 None,
                 None,
+                None,
             ),
             (
                 "batch2".into(),
                 memoria_core::MemoryType::Semantic,
+                None,
                 None,
                 None,
                 None,

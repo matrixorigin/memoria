@@ -332,6 +332,7 @@ async fn test_service_batch_store_subject_ids() {
                     None,
                     Some(subject_a.to_string()),
                     None,
+                    None,
                 ),
                 (
                     "batch bob profile".to_string(),
@@ -339,6 +340,7 @@ async fn test_service_batch_store_subject_ids() {
                     None,
                     None,
                     Some(subject_b.to_string()),
+                    None,
                     None,
                 ),
             ],
