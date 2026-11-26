@@ -1,10 +1,10 @@
 """Branch apply responses must preserve memory IDs without coercing malformed receipts."""
 
 import pytest
+from pytest_httpx import HTTPXMock
 
-from memoria import MemoriaResponseError
+from memoria import AsyncMemoriaClient, MemoriaClient, MemoriaResponseError
 from memoria.models import ApplyResult
-
 
 _FIELDS = (
     "applied_adds",
@@ -52,3 +52,19 @@ def test_apply_receipt_accepts_complete_empty_result() -> None:
     receipt = {name: [] for name in _FIELDS}
     result = ApplyResult.from_dict(receipt)
     assert all(getattr(result, field_name) == [] for field_name in _FIELDS)
+
+
+def test_sync_apply_rejects_incomplete_success_receipt(
+    sync_client: MemoriaClient, httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(method="POST", json={"applied_adds": ["memory-1"]})
+    with pytest.raises(MemoriaResponseError, match="applied_updates"):
+        sync_client.branches.apply("feature", adds=["memory-1"])
+
+
+async def test_async_apply_rejects_incomplete_success_receipt(
+    async_client: AsyncMemoriaClient, httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(method="POST", json={"applied_adds": ["memory-1"]})
+    with pytest.raises(MemoriaResponseError, match="applied_updates"):
+        await async_client.branches.apply("feature", adds=["memory-1"])
