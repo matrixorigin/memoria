@@ -27,9 +27,21 @@ fn db_err(e: sqlx::Error) -> MemoriaError {
     MemoriaError::Database(e.to_string())
 }
 
-/// Convert memoria_git errors to MemoriaError
-fn git_err(e: impl std::fmt::Display) -> MemoriaError {
-    MemoriaError::Internal(e.to_string())
+/// Convert memoria_git errors to MemoriaError without exposing backend-only
+/// tenant details to API clients.
+fn git_err(e: MemoriaError) -> MemoriaError {
+    match e {
+        MemoriaError::Database(message)
+            if message
+                .to_ascii_lowercase()
+                .contains("only sys tenant can create tenant level snapshot for other tenant") =>
+        {
+            MemoriaError::Blocked(
+                "Snapshots are not available for this tenant. Contact your administrator.".into(),
+            )
+        }
+        other => MemoriaError::Internal(other.to_string()),
+    }
 }
 
 fn validate_identifier(name: &str) -> Result<&str, MemoriaError> {
@@ -2580,6 +2592,20 @@ fn parse_apply_updates(args: &Value) -> Result<Vec<memoria_git::ApplyUpdatePair>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn snapshot_tenant_permission_error_is_blocked_without_database_details() {
+        let error = super::git_err(memoria_core::MemoriaError::Database(
+            "error returned from database: only sys tenant can create tenant level snapshot for other tenant"
+                .into(),
+        ));
+
+        assert!(matches!(
+            error,
+            memoria_core::MemoriaError::Blocked(message)
+                if message == "Snapshots are not available for this tenant. Contact your administrator."
+        ));
+    }
+
     #[tokio::test]
     async fn snapshot_delete_rejects_blank_prefix_before_storage() {
         use std::sync::Arc;
