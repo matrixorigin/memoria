@@ -37,6 +37,21 @@ def assert_branch_request(
         assert dict(request.url.params) == {"limit": "2", "cursor": "next"}
     else:
         assert not request.url.query
+    if suffix == b"/apply":
+        # Keep the path-encoding fixture faithful to the API's required receipt.
+        return httpx.Response(
+            200,
+            json={
+                "applied_adds": ["memory-1"],
+                "applied_updates": [],
+                "applied_removes": [],
+                "applied_conflicts": [],
+                "skipped_adds": [],
+                "skipped_updates": [],
+                "skipped_removes": [],
+                "skipped_conflicts": [],
+            },
+        )
     return httpx.Response(200, json={})
 
 
