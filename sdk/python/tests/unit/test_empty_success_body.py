@@ -85,3 +85,50 @@ def test_valid_object_bodies_still_parse(sync_client, httpx_mock):
     assert sync_client.memories.store_batch([{"content": "x"}])[0].memory_id == "mem_abc123"
     httpx_mock.add_response(json=BRANCH_STUB)
     assert sync_client.branches.create("experiment-1").name == "experiment-1"
+
+
+MALFORMED_RETRIEVE_ENVELOPES = [
+    {},
+    {"error": "upstream failed"},
+    {"results": {}},
+    {"results": ""},
+    {"results": None},
+    {"items": {}},
+    {"items": ""},
+    {"items": None},
+]
+
+
+@pytest.mark.parametrize("method", ["retrieve", "search"])
+@pytest.mark.parametrize("payload", MALFORMED_RETRIEVE_ENVELOPES)
+def test_retrieve_rejects_malformed_envelopes_sync(
+    sync_client, httpx_mock, method, payload
+):
+    httpx_mock.add_response(json=payload)
+    with pytest.raises(MemoriaResponseError, match="results or items array"):
+        getattr(sync_client.memories, method)(query="remember")
+
+
+@pytest.mark.parametrize("method", ["retrieve", "search"])
+@pytest.mark.parametrize("payload", MALFORMED_RETRIEVE_ENVELOPES)
+async def test_retrieve_rejects_malformed_envelopes_async(
+    async_client, httpx_mock, method, payload
+):
+    httpx_mock.add_response(json=payload)
+    with pytest.raises(MemoriaResponseError, match="results or items array"):
+        await getattr(async_client.memories, method)(query="remember")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [[], {"results": []}, {"items": []}, {"results": [], "items": {}}],
+)
+def test_retrieve_preserves_valid_empty_envelopes(sync_client, httpx_mock, payload):
+    httpx_mock.add_response(json=payload)
+    assert sync_client.memories.retrieve(query="remember").items == []
+
+
+def test_retrieve_preserves_items_compatibility_envelope(sync_client, httpx_mock):
+    httpx_mock.add_response(json={"items": [MEMORY_STUB]})
+    result = sync_client.memories.retrieve(query="remember")
+    assert [item.memory_id for item in result.items] == [MEMORY_STUB["memory_id"]]
