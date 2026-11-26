@@ -124,7 +124,16 @@ class RetrieveResult:
         if isinstance(d, list):
             return cls(items=[Memory.from_dict(m) for m in d])
         d = _require_object(d, "retrieve")
-        results = d.get("results", d.get("items", []))
+        if "results" in d:
+            results = d["results"]
+        elif "items" in d:
+            results = d["items"]
+        else:
+            results = None
+        if not isinstance(results, list):
+            raise MemoriaResponseError(
+                "Invalid retrieve response: expected a results or items array"
+            )
         return cls(
             items=[Memory.from_dict(m) for m in results],
             explain=d.get("explain"),
