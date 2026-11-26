@@ -266,9 +266,17 @@ class GovernanceResult:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> GovernanceResult:
         d = _require_object(d, "governance")
+        skipped = d.get("skipped", False)
+        if not isinstance(skipped, bool):
+            raise MemoriaResponseError("Invalid governance response: skipped must be a boolean")
+        remaining = d.get("cooldown_remaining_s")
+        if (skipped or remaining is not None) and (type(remaining) is not int or remaining < 0):
+            raise MemoriaResponseError(
+                "Invalid governance response: cooldown_remaining_s must be a non-negative integer"
+            )
         return cls(
-            skipped=bool(d.get("skipped", False)),
-            cooldown_remaining_s=d.get("cooldown_remaining_s"),
+            skipped=skipped,
+            cooldown_remaining_s=remaining,
             quarantined=int(d.get("quarantined", 0)),
             cleaned_stale=int(d.get("cleaned_stale", 0)),
             orphan_graph_cleaned=int(d.get("orphan_graph_cleaned", 0)),
