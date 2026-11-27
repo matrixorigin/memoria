@@ -38,12 +38,16 @@ def _strip_none(d: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
 
 
-def _parse_memory_list(data: Any) -> builtins.list[Memory]:
+def _parse_memory_list(data: Any, expected_count: int) -> builtins.list[Memory]:
     """Parse a batch-store response, which must be a JSON array of memories."""
     if not isinstance(data, list):
         raise MemoriaResponseError(
             "Invalid store_batch response: expected a JSON array, got "
             + ("an empty body" if data is None else type(data).__name__)
+        )
+    if len(data) != expected_count:
+        raise MemoriaResponseError(
+            f"Invalid store_batch response: expected {expected_count} memories, got {len(data)}"
         )
     return [Memory.from_dict(m) for m in data]
 
@@ -401,7 +405,8 @@ class MemoriesResource:
         branch: str | None = None,
         subject_id: str | None = None,
     ) -> list[Memory]:
-        if len(items) > 100:
+        expected_count = len(items)
+        if expected_count > 100:
             raise MemoriaValidationError("store_batch: items must not exceed 100")
         # Server field name is "memories", not "items"
         body: dict[str, Any] = {"memories": items}
@@ -410,7 +415,7 @@ class MemoriesResource:
         if subject_id is not None:
             body["subject_id"] = subject_id
         data = self._client._request("POST", "/v1/memories/batch", json=body)
-        return _parse_memory_list(data)
+        return _parse_memory_list(data, expected_count)
 
     def retrieve(
         self,
@@ -740,7 +745,8 @@ class AsyncMemoriesResource:
         branch: str | None = None,
         subject_id: str | None = None,
     ) -> list[Memory]:
-        if len(items) > 100:
+        expected_count = len(items)
+        if expected_count > 100:
             raise MemoriaValidationError("store_batch: items must not exceed 100")
         # Server field name is "memories", not "items"
         body: dict[str, Any] = {"memories": items}
@@ -749,7 +755,7 @@ class AsyncMemoriesResource:
         if subject_id is not None:
             body["subject_id"] = subject_id
         data = await self._client._arequest("POST", "/v1/memories/batch", json=body)
-        return _parse_memory_list(data)
+        return _parse_memory_list(data, expected_count)
 
     async def retrieve(
         self,
