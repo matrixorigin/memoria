@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from memoria.exceptions import MemoriaValidationError
+from memoria.exceptions import MemoriaResponseError, MemoriaValidationError
 from memoria.resources.memories import AsyncMemoriesResource, MemoriesResource
 
 
@@ -16,7 +16,10 @@ class _RecordingTransport:
 
     def _request(self, method: str, path: str, *, json: dict[str, Any]) -> list[dict[str, Any]]:
         self.calls.append((method, path, json))
-        return [{"memory_id": "m1", "content": "saved"}]
+        return [
+            {"memory_id": f"m{i}", "content": item["content"]}
+            for i, item in enumerate(json["memories"], start=1)
+        ]
 
     async def _arequest(
         self, method: str, path: str, *, json: dict[str, Any]
@@ -73,3 +76,24 @@ async def test_batch_size_limit_still_rejected_before_request(asynchronous: bool
         else:
             resource.store_batch([{"content": "one"}] * 101, subject_id="owner")
     assert transport.calls == []
+
+
+@pytest.mark.parametrize("returned", [0, 1, 3])
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+async def test_batch_rejects_incomplete_or_extra_results(
+    returned, asynchronous, sync_client, async_client, httpx_mock
+):
+    items = [{"content": "first"}, {"content": "second"}]
+    rows = [{"memory_id": str(i), "content": "saved"} for i in range(returned)]
+    httpx_mock.add_response(status_code=201, json=rows)
+    with pytest.raises(MemoriaResponseError, match="store_batch"):
+        if asynchronous:
+            await async_client.memories.store_batch(items)
+        else:
+            sync_client.memories.store_batch(items)
+    assert len(httpx_mock.get_requests()) == 1
+
+
+async def test_empty_batch_accepts_empty_receipt(async_client, httpx_mock):
+    httpx_mock.add_response(status_code=201, json=[])
+    assert await async_client.memories.store_batch([]) == []
