@@ -6,7 +6,7 @@ import builtins
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import quote
 
-from ..exceptions import MemoriaConnectionError
+from ..exceptions import MemoriaConnectionError, MemoriaResponseError
 from ..models import ApplyResult, Branch
 
 if TYPE_CHECKING:
@@ -37,6 +37,18 @@ def _branch_creation_response(data: Any, name: str) -> Branch:
     raise MemoriaConnectionError("Invalid branch creation response")
 
 
+def _parse_branch_list(data: Any) -> list[Branch]:
+    if isinstance(data, dict):
+        if "branches" not in data:
+            raise MemoriaResponseError("Invalid branch list: missing branches field")
+        data = data["branches"]
+    if data is None:  # No content or a legacy null list.
+        return []
+    if not isinstance(data, list):
+        raise MemoriaResponseError("Invalid branch list: expected an array")
+    return [Branch.from_dict(item) for item in data]
+
+
 class BranchesResource:
     def __init__(self, client: _HttpTransport) -> None:
         self._client = client
@@ -47,12 +59,7 @@ class BranchesResource:
 
     def list(self) -> list[Branch]:
         data = self._client._request("GET", "/v1/branches")
-        # Server returns {"branches": [...], "result": "..."}, not a plain list
-        if isinstance(data, dict):
-            items = data.get("branches", [])
-        else:
-            items = data
-        return [Branch.from_dict(b) for b in (items if items is not None else [])]
+        return _parse_branch_list(data)
 
     def checkout(self, name: str) -> None:
         self._client._request("POST", _branch_path(name, "/checkout"), json={})
@@ -139,12 +146,7 @@ class AsyncBranchesResource:
 
     async def list(self) -> list[Branch]:
         data = await self._client._arequest("GET", "/v1/branches")
-        # Server returns {"branches": [...], "result": "..."}, not a plain list
-        if isinstance(data, dict):
-            items = data.get("branches", [])
-        else:
-            items = data
-        return [Branch.from_dict(b) for b in (items if items is not None else [])]
+        return _parse_branch_list(data)
 
     async def checkout(self, name: str) -> None:
         await self._client._arequest("POST", _branch_path(name, "/checkout"), json={})
