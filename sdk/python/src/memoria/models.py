@@ -75,13 +75,16 @@ class Memory:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Memory:
         d = _require_object(d, "memory")
+        is_active = d.get("is_active", True)
+        if not isinstance(is_active, bool):
+            raise MemoriaResponseError("Invalid memory response: is_active must be a boolean")
         return cls(
             memory_id=d["memory_id"],
             content=d["content"],
             memory_type=d.get("memory_type", "semantic"),
             trust_tier=d.get("trust_tier", "T3"),
             initial_confidence=float(d.get("initial_confidence", 0.65)),
-            is_active=bool(d.get("is_active", True)),
+            is_active=is_active,
             user_id=d.get("user_id", ""),
             author_id=d.get("author_id"),
             subject_id=d.get("subject_id"),
