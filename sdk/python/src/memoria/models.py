@@ -178,9 +178,12 @@ class Branch:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Branch:
         d = _require_object(d, "branch")
+        active = d.get("active", False)
+        if not isinstance(active, bool):
+            raise MemoriaResponseError("Invalid branch response: active must be a boolean")
         return cls(
             name=d["name"],
-            active=bool(d.get("active", False)),
+            active=active,
             created_at=_parse_dt(d.get("created_at")),
         )
 
