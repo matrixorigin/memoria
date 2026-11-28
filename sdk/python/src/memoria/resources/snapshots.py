@@ -6,7 +6,7 @@ import builtins
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
-from ..exceptions import MemoriaConnectionError, MemoriaValidationError
+from ..exceptions import MemoriaConnectionError, MemoriaResponseError, MemoriaValidationError
 from ..models import Snapshot
 
 if TYPE_CHECKING:
@@ -30,6 +30,16 @@ def _validate_delete_prefix(prefix: str | None) -> None:
     # therefore matches every visible snapshot instead of acting as a no-op.
     if prefix is not None and not prefix.strip():
         raise MemoriaValidationError("delete: prefix must not be empty")
+
+
+def _parse_created_snapshot(data: Any) -> Snapshot:
+    if isinstance(data, dict):
+        name = data.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise MemoriaResponseError(
+                "Invalid snapshot creation response: expected a non-blank name"
+            )
+    return Snapshot.from_dict(data)
 
 
 def _parse_snapshot_list(data: Any) -> builtins.list[Snapshot]:
@@ -72,7 +82,7 @@ class SnapshotsResource:
     def create(self, name: str, *, description: str | None = None) -> Snapshot:
         body = _strip_none({"name": name, "description": description})
         data = self._client._request("POST", "/v1/snapshots", json=body)
-        return Snapshot.from_dict(data)
+        return _parse_created_snapshot(data)
 
     def list(self, *, limit: int = 20, offset: int = 0) -> list[Snapshot]:
         params = {"limit": limit, "offset": offset}
@@ -130,7 +140,7 @@ class AsyncSnapshotsResource:
     async def create(self, name: str, *, description: str | None = None) -> Snapshot:
         body = _strip_none({"name": name, "description": description})
         data = await self._client._arequest("POST", "/v1/snapshots", json=body)
-        return Snapshot.from_dict(data)
+        return _parse_created_snapshot(data)
 
     async def list(self, *, limit: int = 20, offset: int = 0) -> list[Snapshot]:
         params = {"limit": limit, "offset": offset}
