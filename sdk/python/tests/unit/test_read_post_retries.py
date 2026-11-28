@@ -25,7 +25,7 @@ def invoke(request, monkeypatch):
 
     monkeypatch.setattr(asyncio, "sleep", sleep)
 
-    def call(handler, operation, kwargs, max_retries=2):
+    def call(handler, operation, kwargs, max_retries=2, *, resource="memories"):
         options = dict(base_url=BASE_URL, api_key=API_KEY, max_retries=max_retries)
         if request.param == "sync":
             with MemoriaClient(**options) as client:
@@ -33,7 +33,7 @@ def invoke(request, monkeypatch):
                 client._http = httpx.Client(
                     transport=httpx.MockTransport(handler), headers=client._headers
                 )
-                return getattr(client.memories, operation)(**kwargs)
+                return getattr(getattr(client, resource), operation)(**kwargs)
 
         async def run():
             async with AsyncMemoriaClient(**options) as client:
@@ -41,7 +41,7 @@ def invoke(request, monkeypatch):
                 client._ahttp = httpx.AsyncClient(
                     transport=httpx.MockTransport(handler), headers=client._headers
                 )
-                return await getattr(client.memories, operation)(**kwargs)
+                return await getattr(getattr(client, resource), operation)(**kwargs)
 
         return asyncio.run(run())
 
@@ -146,3 +146,30 @@ def test_ambiguous_write_failure_is_not_retried(invoke, operation, kwargs, fault
         call(handler, operation, kwargs)
     assert len(requests) == 1
     assert delays == []
+
+
+@pytest.mark.parametrize("dry_run", [{}, {"limit": 2}, None])
+def test_pick_retries_only_previews(invoke, dry_run):
+    call, delays = invoke
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        if len(bodies) == 1:
+            return httpx.Response(503, json={"detail": "temporarily unavailable"})
+        return httpx.Response(200, json={"dry_run": True})
+
+    kwargs = {"name": "topic", "selector": {"type": "key_list", "keys": ["m1"]}}
+    if dry_run is None:
+        with pytest.raises(MemoriaServerError):
+            call(handler, "pick", kwargs, resource="branches")
+        assert len(bodies) == 1
+        assert "dry_run" not in bodies[0]
+        assert delays == []
+    else:
+        kwargs["dry_run"] = dry_run
+        assert call(handler, "pick", kwargs, resource="branches") == {"dry_run": True}
+        assert len(bodies) == 2
+        assert bodies[0] == bodies[1]
+        assert bodies[0]["dry_run"] == dry_run
+        assert delays == [0.5]
