@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pytest_httpx import HTTPXMock
 
-from memoria import AsyncMemoriaClient, MemoriaClient, MemoriaValidationError
+from memoria import AsyncMemoriaClient, MemoriaClient, MemoriaResponseError, MemoriaValidationError
 from memoria.models import Snapshot
 from tests.conftest import API_KEY, BASE_URL, SNAPSHOT_STUB
 
@@ -17,7 +17,7 @@ def client() -> MemoriaClient:
 
 def test_create_snapshot(httpx_mock: HTTPXMock, client: MemoriaClient) -> None:
     httpx_mock.add_response(json=SNAPSHOT_STUB)
-    snap = client.snapshots.create(name="snap-1", description="test")
+    snap = client.snapshots.create(name="requested", description="test")
     assert isinstance(snap, Snapshot)
     assert snap.name == "snap-1"
 
@@ -84,3 +84,22 @@ async def test_async_delete_empty_prefix_raises_without_request(
         with pytest.raises(MemoriaValidationError, match="prefix must not be empty"):
             await client.snapshots.delete(prefix=prefix)
     assert httpx_mock.get_requests() == []
+
+
+@pytest.mark.parametrize("payload", [{}, {"name": None}, {"name": 42}, {"name": "  "}])
+def test_create_requires_snapshot_name(
+    httpx_mock: HTTPXMock, client: MemoriaClient, payload: dict
+) -> None:
+    httpx_mock.add_response(status_code=201, json=payload)
+    with pytest.raises(MemoriaResponseError):
+        client.snapshots.create("requested")
+    assert len(httpx_mock.get_requests()) == 1
+
+
+@pytest.mark.parametrize("payload", [{}, {"name": None}, {"name": 42}, {"name": "  "}])
+async def test_async_create_requires_snapshot_name(httpx_mock: HTTPXMock, payload: dict) -> None:
+    httpx_mock.add_response(status_code=201, json=payload)
+    async with AsyncMemoriaClient(base_url=BASE_URL, api_key=API_KEY) as client:
+        with pytest.raises(MemoriaResponseError):
+            await client.snapshots.create("requested")
+    assert len(httpx_mock.get_requests()) == 1
