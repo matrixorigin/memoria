@@ -16,8 +16,12 @@ function readArg(name, fallback = "") {
   return fallback;
 }
 
-function asObject(value) {
-  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+function configObject(value, field) {
+  if (value === undefined) return {};
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    fail(`invalid config: ${field} must be an object`);
+  }
+  return value;
 }
 
 function normalizeUrl(value) {
@@ -93,15 +97,17 @@ if (fs.existsSync(configFile)) {
   fs.mkdirSync(path.dirname(configFile), { recursive: true });
 }
 
-const root = asObject(data);
-const plugins = asObject(root.plugins);
-const entries = asObject(plugins.entries);
-const slots = asObject(plugins.slots);
-const allow = Array.isArray(plugins.allow)
-  ? plugins.allow.filter((entry) => typeof entry === "string" && entry.trim())
-  : [];
-const pluginEntry = asObject(entries[pluginId]);
-const pluginConfig = asObject(pluginEntry.config);
+const root = configObject(data, "root");
+const plugins = configObject(root.plugins, "plugins");
+const entries = configObject(plugins.entries, "plugins.entries");
+const slots = configObject(plugins.slots, "plugins.slots");
+const allow = plugins.allow === undefined ? [] : plugins.allow;
+if (!Array.isArray(allow) || !allow.every((entry) => typeof entry === "string" && entry.trim())) {
+  fail("invalid config: plugins.allow must be an array of non-empty strings");
+}
+const entryPath = `plugins.entries.${pluginId}`;
+const pluginEntry = configObject(Object.hasOwn(entries, pluginId) ? entries[pluginId] : undefined, entryPath);
+const pluginConfig = configObject(pluginEntry.config, `${entryPath}.config`);
 
 if (mode === "cloud") {
   if (!apiUrl) {
@@ -178,13 +184,12 @@ if (defaultUserId) {
 
 pluginEntry.enabled = true;
 pluginEntry.config = pluginConfig;
-entries[pluginId] = pluginEntry;
 slots.memory = pluginId;
 if (!allow.includes(pluginId)) {
   allow.push(pluginId);
 }
 plugins.allow = allow;
-plugins.entries = entries;
+plugins.entries = { ...entries, [pluginId]: pluginEntry };
 plugins.slots = slots;
 root.plugins = plugins;
 
