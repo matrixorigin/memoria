@@ -125,7 +125,9 @@ class BranchesResource:
         )
         return cast(
             dict[str, Any],
-            self._client._request("POST", _branch_path(name, "/pick"), json=body),
+            self._client._request(
+                "POST", _branch_path(name, "/pick"), json=body, idempotent=dry_run is not None
+            ),
         )
 
 
@@ -216,6 +218,8 @@ class AsyncBranchesResource:
         )
         return cast(
             dict[str, Any],
-            await self._client._arequest("POST", _branch_path(name, "/pick"), json=body),
+            await self._client._arequest(
+                "POST", _branch_path(name, "/pick"), json=body, idempotent=dry_run is not None
+            ),
         )
 
